@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Query Apple's on-device or Cloud/Cloud Pro models.
+
+The on-device model is reached via the `fm` CLI. Cloud and Cloud Pro have no
+public CLI/API yet, so this shells out to a saved Shortcut (Receive input ->
+Use <model> model, bound to Shortcut Input -> Stop and Output Response) via
+`shortcuts run`, then strips the RTF the action returns.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+MODEL_SHORTCUTS = {
+    "cloud-pro": "AppleAI",
+}
+
+
+def respond(prompt: str, model: str, shortcut_override: str | None) -> str:
+    if model == "on-device":
+        result = subprocess.run(
+            ["fm", "respond", "--no-stream", prompt],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout.strip()
+
+    shortcut_name = shortcut_override or MODEL_SHORTCUTS.get(model)
+    if shortcut_name is None:
+        raise SystemExit(
+            f"No shortcut configured for model '{model}'. "
+            f"Create a 'Use Model' shortcut set to that model, bound to "
+            f"Shortcut Input, and pass --shortcut <name>."
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "input.txt")
+        out_path = os.path.join(tmp, "output.rtf")
+        with open(in_path, "w") as f:
+            f.write(prompt)
+
+        try:
+            subprocess.run(
+                ["shortcuts", "run", shortcut_name, "-i", in_path, "-o", out_path],
+                capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.stdout or "").strip()
+            raise SystemExit(
+                f"Shortcut '{shortcut_name}' failed: {detail}\n"
+                f"Check it exists ('shortcuts list') and its 'Use Model' "
+                f"action is bound to Shortcut Input."
+            )
+
+        if not os.path.exists(out_path):
+            raise SystemExit(f"Shortcut '{shortcut_name}' produced no output.")
+
+        text = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", out_path],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return text.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="fm-pcc", description="Query Apple's on-device or Cloud/Cloud Pro models."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    respond_p = sub.add_parser("respond", help="Generate a response to a prompt")
+    respond_p.add_argument(
+        "prompt", nargs="?", help="Prompt for the model (reads stdin if omitted)"
+    )
+    respond_p.add_argument(
+        "-m", "--model", default="cloud-pro",
+        choices=["on-device", "cloud-pro"],
+        help="Model to use (default: cloud-pro)",
+    )
+    respond_p.add_argument(
+        "--shortcut", help="Override the Shortcuts name to invoke"
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "respond":
+        prompt = args.prompt or sys.stdin.read().strip()
+        if not prompt:
+            parser.error("no prompt given (pass as argument or pipe via stdin)")
+        print(respond(prompt, args.model, args.shortcut))
+
+
+if __name__ == "__main__":
+    main()
