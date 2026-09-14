@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fm-pcc — chat with Apple's Foundation Models from your terminal</title>
+<meta name="description" content="A terminal chat client for Apple's Foundation Models. On-device or Cloud Pro, one keystroke apart.">
+<meta property="og:title" content="fm-pcc">
+<meta property="og:description" content="A terminal chat client for Apple's Foundation Models. On-device or Cloud Pro, one keystroke apart.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2314181C'/%3E%3Ctext x='4' y='17' font-family='monospace' font-size='14' fill='%23F0B429'%3E%3E_%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Source+Serif+4:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="nav">
+    <span class="wordmark">fm-pcc</span>
+    <a class="navlink" href="https://github.com/justwaters/fm-pcc" target="_blank" rel="noopener">View on GitHub <span class="ext">↗</span></a>
+  </header>
+
+  <main>
+
+    <section class="hero">
+      <h1>Chat with Apple's models,<br>right where you already live.</h1>
+      <p class="dek">
+        fm-pcc is a terminal chat client for Apple's Foundation Models — the
+        on-device intelligence behind Apple Intelligence, plus Apple's cloud
+        reasoning tier, one keystroke apart.
+      </p>
+
+      <div class="terminal" id="terminal">
+        <div class="terminal-bar">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          <span class="terminal-title">fm-pcc — zsh</span>
+        </div>
+        <div class="terminal-body" id="terminal-body" aria-live="polite">
+          <!-- filled by script.js -->
+        </div>
+        <div class="toggle-row">
+          <button class="toggle active" data-model="on-device" id="toggle-device">
+            <span class="swatch"></span>on-device
+          </button>
+          <button class="toggle" data-model="cloud-pro" id="toggle-cloud">
+            <span class="swatch"></span>cloud pro
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>The catch</h2>
+      <p>
+        Apple's own <code>fm</code> CLI only talks to the model running on
+        your Mac. Cloud Pro — the bigger, cloud-hosted tier — has no public
+        API yet. So fm-pcc asks nicely: it drives an Apple Shortcut that
+        already knows how to reach it, the same kind Siri and Writing Tools
+        use, and reads the answer back over stdout.
+      </p>
+      <p class="aside">
+        It isn't a private API or a jailbreak — just Shortcuts, scripted
+        from the command line.
+      </p>
+    </section>
+
+    <section class="block">
+      <h2>In your terminal</h2>
+      <pre class="code"><code><span class="cmd">./fm-pcc</span>                          <span class="comment"># open the chat — starts on-device</span>
+<span class="cmd">./fm-pcc --model cloud-pro</span>        <span class="comment"># open the chat on cloud pro instead</span>
+<span class="cmd">./fm-pcc respond "what is swift?"</span> <span class="comment"># one-shot, no chat window</span></code></pre>
+    </section>
+
+    <section class="block">
+      <h2>While you're in the chat</h2>
+      <dl class="keys">
+        <div class="key-row"><dt>Ctrl+T</dt><dd>switch between on-device and cloud pro</dd></div>
+        <div class="key-row"><dt>Ctrl+R</dt><dd>start a new conversation</dd></div>
+        <div class="key-row"><dt>Enter</dt><dd>send your message</dd></div>
+      </dl>
+    </section>
+
+    <section class="block">
+      <h2>Get it</h2>
+      <pre class="code"><code><span class="cmd">git clone https://github.com/justwaters/fm-pcc</span>
+<span class="cmd">cd fm-pcc</span>
+<span class="cmd">./fm-pcc</span></code></pre>
+      <p class="aside">
+        Needs macOS 27, <a href="https://docs.astral.sh/uv/" target="_blank" rel="noopener">uv</a>,
+        and a licensed <code>fm</code> CLI — run <code>fm license</code> once
+        to agree to Apple's terms.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    <span class="wordmark">fm-pcc</span>
+    <a class="navlink" href="https://github.com/justwaters/fm-pcc" target="_blank" rel="noopener">Source on GitHub <span class="ext">↗</span></a>
+  </footer>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
