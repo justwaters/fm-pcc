@@ -61,6 +61,12 @@
         already knows how to reach it, the same kind Siri and Writing Tools
         use, and reads the answer back over stdout.
       </p>
+      <p>
+        The first time you actually reach for Cloud Pro, fm-pcc opens that
+        shortcut's iCloud link for you and you tap <strong>Add
+        Shortcut</strong> once. After that, it's just there. On-device chat
+        needs none of this.
+      </p>
       <p class="aside">
         It isn't a private API or a jailbreak — just Shortcuts, scripted
         from the command line.
@@ -68,10 +74,22 @@
     </section>
 
     <section class="block">
+      <h2>Get it</h2>
+      <pre class="code"><code><span class="cmd">uv tool install git+https://github.com/justwaters/fm-pcc</span>
+<span class="cmd">fm-pcc</span></code></pre>
+      <p class="aside">
+        Installs a real <code>fm-pcc</code> command on your <code>PATH</code>
+        — needs macOS 27, <a href="https://docs.astral.sh/uv/" target="_blank" rel="noopener">uv</a>,
+        and a licensed <code>fm</code> CLI (run <code>fm license</code> once
+        to agree to Apple's terms).
+      </p>
+    </section>
+
+    <section class="block">
       <h2>In your terminal</h2>
-      <pre class="code"><code><span class="cmd">./fm-pcc</span>                          <span class="comment"># open the chat — starts on-device</span>
-<span class="cmd">./fm-pcc --model cloud-pro</span>        <span class="comment"># open the chat on cloud pro instead</span>
-<span class="cmd">./fm-pcc respond "what is swift?"</span> <span class="comment"># one-shot, no chat window</span></code></pre>
+      <pre class="code"><code><span class="cmd">fm-pcc</span>                          <span class="comment"># open the chat — starts on-device</span>
+<span class="cmd">fm-pcc --model cloud-pro</span>        <span class="comment"># open the chat on cloud pro instead</span>
+<span class="cmd">fm-pcc respond "what is swift?"</span> <span class="comment"># one-shot, no chat window</span></code></pre>
     </section>
 
     <section class="block">
@@ -81,18 +99,6 @@
         <div class="key-row"><dt>Ctrl+R</dt><dd>start a new conversation</dd></div>
         <div class="key-row"><dt>Enter</dt><dd>send your message</dd></div>
       </dl>
-    </section>
-
-    <section class="block">
-      <h2>Get it</h2>
-      <pre class="code"><code><span class="cmd">git clone https://github.com/justwaters/fm-pcc</span>
-<span class="cmd">cd fm-pcc</span>
-<span class="cmd">./fm-pcc</span></code></pre>
-      <p class="aside">
-        Needs macOS 27, <a href="https://docs.astral.sh/uv/" target="_blank" rel="noopener">uv</a>,
-        and a licensed <code>fm</code> CLI — run <code>fm license</code> once
-        to agree to Apple's terms.
-      </p>
     </section>
 
   </main>
