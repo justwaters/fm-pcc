@@ -21,27 +21,38 @@ for Cloud Pro by driving a Shortcuts "Use Model" action instead.
 
 - macOS 27 with Apple Intelligence enabled, and the `fm` CLI licensed
   (`fm license`).
-- [`uv`](https://docs.astral.sh/uv/) — the script declares its own
-  dependencies and `uv run --script` installs them on first use.
-- A saved Shortcut named `AppleAI` (or pass `--shortcut <name>`) shaped like:
+- [`uv`](https://docs.astral.sh/uv/), used both to install `fm-pcc` and to
+  run it.
+- A saved Shortcut named `AppleAI` (or pass `--shortcut <name>`), shaped
+  like a "Use Model" action set to **Cloud Pro**, bound to Shortcut Input,
+  followed by "Stop and Output" set to the action's response. You don't
+  need to build this yourself — see below.
 
-  ```
-  Receive [Apps and 18 more] from Nowhere  (if no input: Continue)
-  Use Cloud Pro model                       (Request: Shortcut Input)
-  Stop and Output Response
-  ```
+## Install
 
-  Build this once in the Shortcuts app: add a "Use Model" action, pick
-  **Cloud Pro** from its model dropdown, drag **Shortcut Input** into the
-  Request field, then add "Stop and Output" set to the action's response.
+```
+uv tool install git+https://github.com/justwaters/fm-pcc
+```
+
+This puts a `fm-pcc` command on your `PATH` (run `uv tool update-shell`
+once if a fresh shell can't find it), so it works from any directory.
+
+The first time you actually use Cloud Pro, if the `AppleAI` shortcut isn't
+installed yet, `fm-pcc` opens its
+[iCloud share link](https://www.icloud.com/shortcuts/13ea99c480a245d5a8a8de6cca0fb397)
+for you — tap **Add Shortcut** in the sheet that appears, and it'll pick up
+from there. On-device chat works with no setup at all.
+
+For local development, install from a checkout instead:
+`uv tool install -e .`
 
 ## Usage
 
 ```
-./fm-pcc                              # launch the chat TUI (starts on-device)
-./fm-pcc --model cloud-pro            # start the TUI on Cloud Pro instead
-./fm-pcc respond "What is Swift?"     # one-shot, non-interactive (default: cloud-pro)
-./fm-pcc respond -m on-device "..."   # one-shot on-device
+fm-pcc                              # launch the chat TUI (starts on-device)
+fm-pcc --model cloud-pro            # start the TUI on Cloud Pro instead
+fm-pcc respond "What is Swift?"     # one-shot, non-interactive (default: cloud-pro)
+fm-pcc respond -m on-device "..."   # one-shot on-device
 ```
 
 ### Keybindings (TUI)

@@ -1,8 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["textual>=0.60"]
-# ///
 """Chat TUI for Apple's on-device and Cloud Pro Foundation Models.
 
 On-device goes through the `fm` CLI, using its own --resume/--save-transcript
@@ -11,14 +6,21 @@ shells out to a saved Shortcut (Receive input -> Use Cloud Pro model, bound to
 Shortcut Input -> Stop and Output Response) via `shortcuts run`, stripping the
 RTF it returns. Shortcuts has no scriptable session concept, so multi-turn
 context there is approximated by re-sending prior turns as plain text.
+
+The first time Cloud Pro is actually used, if the bridge shortcut isn't
+installed yet, this opens its iCloud share link so the person can add it
+through the normal Shortcuts "Add Shortcut" confirmation -- there's no way
+(or business) silently writing into the Shortcuts library without that.
 """
 import argparse
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
+from typing import Callable
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -31,13 +33,57 @@ MODEL_LABELS = {
     "cloud-pro": "Cloud Pro",
 }
 CLOUD_PRO_SHORTCUT = "AppleAI"
+CLOUD_PRO_SHORTCUT_URL = "https://www.icloud.com/shortcuts/13ea99c480a245d5a8a8de6cca0fb397"
+
+
+def _installed_shortcuts() -> set[str]:
+    result = subprocess.run(["shortcuts", "list"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def ensure_shortcut_installed(
+    name: str,
+    url: str,
+    on_status: Callable[[str], None],
+    timeout: float = 90.0,
+) -> bool:
+    """Make sure `name` is installed, prompting the Shortcuts add-flow if not."""
+    if name in _installed_shortcuts():
+        return True
+
+    on_status(f"'{name}' shortcut not found — it's needed for Cloud Pro.")
+    on_status("Opening the install prompt in Shortcuts (tap “Add Shortcut”)…")
+    subprocess.run(["open", url])
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if name in _installed_shortcuts():
+            on_status(f"'{name}' installed.")
+            return True
+        time.sleep(1.5)
+
+    on_status(
+        f"Still waiting on '{name}'. On-device chat works without it — "
+        f"try Cloud Pro again once you've added it."
+    )
+    return False
 
 
 class Backend:
     """Talks to fm (on-device) and Shortcuts (Cloud Pro)."""
 
-    def __init__(self, shortcut: str = CLOUD_PRO_SHORTCUT):
+    def __init__(
+        self,
+        shortcut: str = CLOUD_PRO_SHORTCUT,
+        shortcut_url: str = CLOUD_PRO_SHORTCUT_URL,
+        on_status: Callable[[str], None] = print,
+    ):
         self.shortcut = shortcut
+        self.shortcut_url = shortcut_url
+        self.on_status = on_status
+        self._shortcut_ready = False
         self._transcript_path: str | None = None
         self._cloud_history: list[tuple[str, str]] = []
 
@@ -67,6 +113,11 @@ class Backend:
         return result.stdout.strip()
 
     def _respond_cloud_pro(self, prompt: str) -> str:
+        if not self._shortcut_ready:
+            self._shortcut_ready = ensure_shortcut_installed(
+                self.shortcut, self.shortcut_url, self.on_status
+            )
+
         full_prompt = prompt
         if self._cloud_history:
             context = "\n\n".join(
@@ -133,7 +184,12 @@ class ChatApp(App):
 
     def __init__(self, initial_model: str = "on-device", shortcut: str = CLOUD_PRO_SHORTCUT):
         super().__init__()
-        self.backend = Backend(shortcut)
+        self.backend = Backend(
+            shortcut,
+            on_status=lambda msg: self.call_from_thread(
+                self._add_message, Message("system", msg)
+            ),
+        )
         self.model = initial_model
 
     def compose(self) -> ComposeResult:
