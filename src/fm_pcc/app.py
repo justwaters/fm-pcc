@@ -33,6 +33,8 @@ from textual.reactive import reactive
 from textual.widgets import Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from . import __version__
+
 MODEL_LABELS = {
     "on-device": "on-device",
     "cloud-pro": "cloud pro",
@@ -206,27 +208,6 @@ def diff_preview(original: str, updated: str) -> str:
         updated.splitlines(keepends=True),
     )
     return "".join(diff)
-
-
-def app_version() -> str:
-    """0.<commit count>, computed live from git history -- no manual bumping.
-
-    Only resolves when running from a git checkout (e.g. `uv tool install
-    -e .`); a real published install has no .git alongside it, so this
-    falls back to a static placeholder there.
-    """
-    try:
-        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        result = subprocess.run(
-            ["git", "-C", repo_dir, "rev-list", "--count", "HEAD"],
-            capture_output=True, text=True, timeout=2,
-        )
-        count = result.stdout.strip()
-        if result.returncode == 0 and count.isdigit():
-            return f"0.{count}"
-    except OSError:
-        pass
-    return "0.x"
 
 
 def _gradient(text: str, start: str, end: str) -> Text:
@@ -444,7 +425,7 @@ class ChatApp(App):
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
             _gradient(
-                f" fm-pcc v{app_version()} — Apple Foundation Models Chat",
+                f" fm-pcc v{__version__} — Apple Foundation Models Chat",
                 "#f0b429", "#38d9c9",
             )
         )
@@ -453,6 +434,8 @@ class ChatApp(App):
 
     def watch_model(self, _value: str) -> None:
         self._update_chrome()
+
+    NORMAL_INPUT_COLOR = "#e7e5dd"
 
     def _update_chrome(self) -> None:
         accent = MODEL_COLORS[self.model]
@@ -464,15 +447,16 @@ class ChatApp(App):
         )
         self.query_one("#inputbar").styles.border = ("round", accent)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
+        self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR
 
     def _flash_input(self) -> None:
-        # Pure saturated yellow with a heavier border weight -- on-device's
-        # accent is already amber, so a subtle color-only shift near that
-        # hue is nearly invisible; this needs to pop regardless of model.
+        # The completed command *text* flashes pure yellow -- on-device's own
+        # accent is already amber, so a border-only shift near that hue barely
+        # registers, and the point is to draw the eye to what was just typed.
         glow = "#ffff00"
-        self.query_one("#inputbar").styles.border = ("heavy", glow)
+        self.query_one(Input).styles.color = glow
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {glow}"))
-        self.set_timer(0.4, self._update_chrome)
+        self.set_timer(0.5, self._update_chrome)
 
     def action_toggle_model(self) -> None:
         self.model = "cloud-pro" if self.model == "on-device" else "on-device"
