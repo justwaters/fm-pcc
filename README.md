@@ -77,6 +77,7 @@ Slash commands, same spirit as `fm chat`:
 | `/model`                    | Open a menu to pick a model (`↑`/`↓`, `Enter`/`Tab`)   |
 | `/model <name>`             | Switch directly (`on-device`, `cloud`, `cloud-pro`)    |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
+| `/task <description>`       | Pick a file and section for you, then propose an edit  |
 | `/apply`                    | Write the pending proposed edit                        |
 | `/discard`                  | Discard the pending proposed edit                      |
 | `/clear`                    | Start a new conversation                               |
@@ -91,6 +92,18 @@ asking the model to reproduce file content verbatim, which the on-device
 model is unreliable at for anything spanning more than one line. Neither
 cloud tier has equivalent schema control via Shortcuts, so editing isn't
 available there yet.
+
+`/task <description>` automates the "which file, which part" steps ahead
+of `/edit`: it lists the files in the current directory, asks Cloud Pro to
+pick the one most relevant to your description, deterministically splits
+that file into sections (real top-level blocks for brace languages like
+CSS/JS, fixed-size chunks otherwise — not model-summarized, since that's a
+mechanical task a parser gets right for free), asks Cloud Pro which
+section is relevant, then runs the same on-device `/edit` machinery scoped
+to just that section. Same review step at the end — nothing is written
+until `/apply`. It's one pass (file → section → edit → review) rather than
+an autonomous multi-file loop; chaining several of these automatically for
+a larger task is a natural next step, not yet built.
 
 ### Keybindings (TUI)
 

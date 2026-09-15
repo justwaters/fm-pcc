@@ -119,7 +119,9 @@ _EDIT_SCHEMA_ARGS = [
 ]
 
 
-def propose_edit(path: str, instructions: str, cwd: str) -> dict:
+def propose_edit(
+    path: str, instructions: str, cwd: str, line_range: tuple[int, int] | None = None
+) -> dict:
     """Ask the on-device model for a line-anchored edit to `path`.
 
     Guided generation on a small on-device model is unreliable at copying
@@ -130,6 +132,10 @@ def propose_edit(path: str, instructions: str, cwd: str) -> dict:
     We do the actual line lookup ourselves, so there's no verbatim-matching
     step to fail. On-device only for now -- Cloud Pro (via Shortcuts) has no
     schema control to constrain output the same way.
+
+    `line_range` (1-based, inclusive) restricts both what's shown to the
+    model and where it's allowed to anchor, so a large file can be edited a
+    section at a time without the whole thing needing to fit in context.
     """
     full_path = os.path.expanduser(path)
     if not os.path.isabs(full_path):
@@ -143,14 +149,16 @@ def propose_edit(path: str, instructions: str, cwd: str) -> dict:
     with open(full_path, "r", errors="replace") as f:
         original = f.read()
 
-    if len(original) > MAX_FILE_CHARS:
-        raise EditError(
-            f"{label} is too large to edit on-device "
-            f"(over {MAX_FILE_CHARS} characters)"
-        )
-
     lines = original.splitlines()
-    numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+    lo, hi = line_range if line_range else (1, len(lines))
+    excerpt_lines = lines[lo - 1 : hi]
+    numbered = "\n".join(f"{lo + i}: {line}" for i, line in enumerate(excerpt_lines))
+
+    if len(numbered) > MAX_FILE_CHARS:
+        raise EditError(
+            f"{label}{f' (lines {lo}-{hi})' if line_range else ''} is too "
+            f"large to edit on-device (over {MAX_FILE_CHARS} characters)"
+        )
 
     schema = subprocess.run(
         ["fm", *_EDIT_SCHEMA_ARGS], capture_output=True, text=True, check=True
@@ -189,7 +197,7 @@ def propose_edit(path: str, instructions: str, cwd: str) -> dict:
     new_lines = proposal.get("new_lines") or ""
     summary = proposal.get("summary") or "(no summary)"
 
-    if not isinstance(anchor, int) or not (1 <= anchor <= max(len(lines), 1)):
+    if not isinstance(anchor, int) or not (lo <= anchor <= max(hi, lo)):
         raise EditError(f"model picked an out-of-range line ({anchor!r})")
 
     # When inserting after a line (e.g. after a `def` line), new lines belong
@@ -223,6 +231,101 @@ def diff_preview(original: str, updated: str) -> str:
         updated.splitlines(keepends=True),
     )
     return "".join(diff)
+
+
+_BRACE_LANGUAGES = {".css", ".js", ".jsx", ".ts", ".tsx", ".json", ".java", ".c", ".cpp", ".swift"}
+_SECTION_CHUNK_LINES = 40
+
+
+def split_sections(content: str, filename: str) -> list[dict]:
+    """Split a file into named, 1-based-inclusive line-range sections.
+
+    This is deliberately not model-driven: brace-delimited languages have
+    unambiguous top-level block boundaries a few lines of Python can find
+    reliably, which is exactly the kind of mechanical task a small model is
+    bad at (see propose_edit's own docstring). Anything else falls back to
+    fixed-size chunks -- cruder, but still gives the picker something
+    bounded to choose between.
+    """
+    lines = content.splitlines()
+    if not lines:
+        return [{"name": "(empty file)", "start": 1, "end": 1}]
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in _BRACE_LANGUAGES:
+        sections = _split_top_level_braces(lines)
+        if sections:
+            return sections
+
+    return [
+        {
+            "name": f"lines {i + 1}-{min(i + _SECTION_CHUNK_LINES, len(lines))}",
+            "start": i + 1,
+            "end": min(i + _SECTION_CHUNK_LINES, len(lines)),
+        }
+        for i in range(0, len(lines), _SECTION_CHUNK_LINES)
+    ]
+
+
+def _split_top_level_braces(lines: list[str]) -> list[dict]:
+    sections = []
+    depth = 0
+    start = None
+    for i, line in enumerate(lines):
+        if depth == 0 and start is None and line.strip():
+            start = i
+        depth += line.count("{") - line.count("}")
+        if depth <= 0 and start is not None:
+            sections.append(
+                {"name": lines[start].strip()[:48], "start": start + 1, "end": i + 1}
+            )
+            start = None
+            depth = 0
+    if start is not None:
+        sections.append({"name": lines[start].strip()[:48], "start": start + 1, "end": len(lines)})
+    return sections
+
+
+def pick_file(task: str, candidates: list[str], cwd: str, backend: "Backend", model: str) -> str:
+    """Ask a cloud model which candidate file is most relevant to `task`."""
+    listing = []
+    for name in candidates:
+        try:
+            with open(os.path.join(cwd, name), "r", errors="replace") as f:
+                content = f.read(MAX_FILE_CHARS)
+        except OSError:
+            content = "(unreadable)"
+        listing.append(f"--- {name} ---\n{content}")
+
+    prompt = (
+        f"Task: {task}\n\nHere are the files in this directory:\n\n"
+        + "\n\n".join(listing)
+        + "\n\nWhich ONE file should be edited first to make progress on "
+        "this task? Reply with just the exact filename, nothing else."
+    )
+    reply = backend.classify(prompt, model).strip().strip("`'\" .")
+    for name in candidates:
+        if name.lower() == reply.lower() or name.lower() in reply.lower():
+            return name
+    raise EditError(f"couldn't tell which file to edit from the model's reply: {reply!r}")
+
+
+def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
+    """Ask a cloud model which (deterministically-split) section to edit."""
+    listing = "\n".join(
+        f"{i}: {s['name']} (lines {s['start']}-{s['end']})" for i, s in enumerate(sections)
+    )
+    prompt = (
+        f"Task: {task}\n\n{filename} has these sections:\n{listing}\n\n"
+        f"Which section number is most relevant to this task? "
+        f"Reply with just the number, nothing else."
+    )
+    reply = backend.classify(prompt, model).strip()
+    match = re.search(r"\d+", reply)
+    index = int(match.group()) if match else -1
+    if not (0 <= index < len(sections)):
+        raise EditError(f"couldn't tell which section to edit from the model's reply: {reply!r}")
+    return sections[index]
 
 
 def _gradient(text: str, start: str, end: str) -> Text:
@@ -319,24 +422,22 @@ class Backend:
             raise RuntimeError(result.stderr.strip() or "fm respond failed")
         return result.stdout.strip()
 
-    def _respond_cloud(self, prompt: str, model: str) -> str:
-        shortcut = self.shortcut_name(model)
+    def _ensure_ready(self, model: str) -> None:
         if not self._shortcut_ready.get(model):
             self._shortcut_ready[model] = ensure_shortcut_installed(
-                shortcut, CLOUD_SHORTCUTS[model]["url"], self.on_status
+                self.shortcut_name(model), CLOUD_SHORTCUTS[model]["url"], self.on_status
             )
 
-        history = self._cloud_history[model]
-        full_prompt = prompt
-        if history:
-            context = "\n\n".join(f"User: {u}\nAssistant: {a}" for u, a in history)
-            full_prompt = f"{context}\n\nUser: {prompt}"
+    def _run_shortcut(self, model: str, prompt: str) -> str:
+        """Raw one-shot Shortcuts call -- no chat history involved."""
+        shortcut = self.shortcut_name(model)
+        self._ensure_ready(model)
 
         with tempfile.TemporaryDirectory() as tmp:
             in_path = os.path.join(tmp, "input.txt")
             out_path = os.path.join(tmp, "output.rtf")
             with open(in_path, "w") as f:
-                f.write(full_prompt)
+                f.write(prompt)
 
             result = subprocess.run(
                 ["shortcuts", "run", shortcut, "-i", in_path, "-o", out_path],
@@ -352,11 +453,31 @@ class Backend:
             if not os.path.exists(out_path):
                 raise RuntimeError(f"Shortcut '{shortcut}' produced no output.")
 
-            text = subprocess.run(
+            return subprocess.run(
                 ["textutil", "-convert", "txt", "-stdout", out_path],
                 capture_output=True, text=True, check=True,
             ).stdout.strip()
 
+    def classify(self, prompt: str, model: str) -> str:
+        """One-shot, history-free call for routing/classification, not chat."""
+        if model == "on-device":
+            result = subprocess.run(
+                ["fm", "respond", "--no-stream", "--greedy", prompt],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "fm respond failed")
+            return result.stdout.strip()
+        return self._run_shortcut(model, prompt)
+
+    def _respond_cloud(self, prompt: str, model: str) -> str:
+        history = self._cloud_history[model]
+        full_prompt = prompt
+        if history:
+            context = "\n\n".join(f"User: {u}\nAssistant: {a}" for u, a in history)
+            full_prompt = f"{context}\n\nUser: {prompt}"
+
+        text = self._run_shortcut(model, full_prompt)
         history.append((prompt, text))
         return text
 
@@ -523,6 +644,7 @@ class ChatApp(App):
         "help": "show this help",
         "model": "open a menu to switch models, or /model <name> directly",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
+        "task": "pick a file+section for you, then propose an edit: /task <description>",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -564,6 +686,12 @@ class ChatApp(App):
             self.query_one(Input).disabled = True
             self._thinking = self._add_message(Message("thinking", ""))
             self._propose_edit(path, instructions)
+        elif name == "task":
+            if not arg:
+                self._add_message(Message("system", "usage: /task <description>"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_task(arg)
         elif name == "apply":
             self._apply_pending_edit()
         elif name == "discard":
@@ -591,6 +719,57 @@ class ChatApp(App):
             return
         diff = diff_preview(proposal["original"], proposal["updated"])
         self.call_from_thread(self._show_edit_proposal, proposal, diff)
+
+    @work(thread=True)
+    def _run_task(self, task: str) -> None:
+        cwd = os.getcwd()
+        try:
+            candidates = sorted(
+                f for f in os.listdir(cwd)
+                if os.path.isfile(os.path.join(cwd, f)) and not f.startswith(".")
+            )
+            if not candidates:
+                raise EditError("no files in the current directory")
+
+            self.call_from_thread(
+                self._task_progress, f"looking at {len(candidates)} files to find the right one…"
+            )
+            filename = pick_file(task, candidates, cwd, self.backend, "cloud-pro")
+
+            self.call_from_thread(
+                self._task_progress, f"picked {filename} — splitting into sections…"
+            )
+            with open(os.path.join(cwd, filename), "r", errors="replace") as f:
+                content = f.read()
+            sections = split_sections(content, filename)
+
+            self.call_from_thread(
+                self._task_progress, f"picking which of {len(sections)} sections to edit…"
+            )
+            section = pick_section(task, filename, sections, self.backend, "cloud-pro")
+
+            where = (
+                section["name"]
+                if section["name"].startswith("lines ")
+                else f"{section['name']} (lines {section['start']}-{section['end']})"
+            )
+            self.call_from_thread(
+                self._task_progress, f"drafting an edit to {filename}, {where}…"
+            )
+            proposal = propose_edit(
+                filename, task, cwd, line_range=(section["start"], section["end"])
+            )
+        except EditError as e:
+            self.call_from_thread(self._finish_turn, None, str(e))
+            return
+        except Exception as e:
+            self.call_from_thread(self._finish_turn, None, f"task failed: {e}")
+            return
+        diff = diff_preview(proposal["original"], proposal["updated"])
+        self.call_from_thread(self._show_edit_proposal, proposal, diff)
+
+    def _task_progress(self, text: str) -> None:
+        self._add_message(Message("system", text))
 
     def _show_edit_proposal(self, proposal: dict, diff: str) -> None:
         if self._thinking is not None:
