@@ -573,8 +573,10 @@ class ChatApp(App):
         self._update_palette(event.value)
 
     def _update_palette(self, value: str) -> None:
+        command_name = value[1:].split(" ", 1)[0].lower() if value.startswith("/") else ""
+        is_complete = command_name in self.COMMANDS or command_name in self.COMMAND_ALIASES
         self.query_one(Input).styles.color = (
-            "#ffff00" if value.startswith("/") else self.NORMAL_INPUT_COLOR
+            "#ffff00" if is_complete else self.NORMAL_INPUT_COLOR
         )
 
         palette = self.query_one("#palette", OptionList)
