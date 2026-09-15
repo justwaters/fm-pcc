@@ -37,14 +37,29 @@ from . import __version__
 
 MODEL_LABELS = {
     "on-device": "on-device",
+    "cloud": "cloud",
     "cloud-pro": "cloud pro",
 }
 MODEL_COLORS = {
     "on-device": "#f0b429",
+    "cloud": "#20c997",
     "cloud-pro": "#38d9c9",
 }
-CLOUD_PRO_SHORTCUT = "AppleAI"
-CLOUD_PRO_SHORTCUT_URL = "https://www.icloud.com/shortcuts/13ea99c480a245d5a8a8de6cca0fb397"
+MODEL_ORDER = ["on-device", "cloud", "cloud-pro"]
+
+# Each of these is a "Use Model" Shortcut (Receive input -> Use <tier> model,
+# bound to Shortcut Input -> Stop and Output Response) sharing the same
+# shape, just pointed at a different model tier.
+CLOUD_SHORTCUTS = {
+    "cloud": {
+        "name": "PCC-Cloud",
+        "url": "https://www.icloud.com/shortcuts/9f4e45968b974ef7ad8d29eb06f98a9b",
+    },
+    "cloud-pro": {
+        "name": "PCC-CloudPro",
+        "url": "https://www.icloud.com/shortcuts/7f7f8e41dfee459a89c28ca0b8c60984",
+    },
+}
 
 _FILE_REF_RE = re.compile(r"@(\S+)")
 MAX_FILE_CHARS = 8000
@@ -242,8 +257,7 @@ def ensure_shortcut_installed(
     if name in _installed_shortcuts():
         return True
 
-    on_status(f"'{name}' shortcut not found — it's needed for Cloud Pro.")
-    on_status("Opening the install prompt in Shortcuts (tap “Add Shortcut”)…")
+    on_status(f"'{name}' shortcut not found — opening its install link…")
     subprocess.run(["open", url])
 
     deadline = time.monotonic() + timeout
@@ -255,35 +269,39 @@ def ensure_shortcut_installed(
 
     on_status(
         f"Still waiting on '{name}'. On-device chat works without it — "
-        f"try Cloud Pro again once you've added it."
+        f"try again once you've added it."
     )
     return False
 
 
 class Backend:
-    """Talks to fm (on-device) and Shortcuts (Cloud Pro)."""
+    """Talks to fm (on-device) and Shortcuts (cloud, cloud pro)."""
 
     def __init__(
         self,
-        shortcut: str = CLOUD_PRO_SHORTCUT,
-        shortcut_url: str = CLOUD_PRO_SHORTCUT_URL,
+        shortcut_overrides: dict[str, str] | None = None,
         on_status: Callable[[str], None] = print,
     ):
-        self.shortcut = shortcut
-        self.shortcut_url = shortcut_url
         self.on_status = on_status
-        self._shortcut_ready = False
+        self._shortcut_overrides = shortcut_overrides or {}
+        self._shortcut_ready: dict[str, bool] = {}
         self._transcript_path: str | None = None
-        self._cloud_history: list[tuple[str, str]] = []
+        self._cloud_history: dict[str, list[tuple[str, str]]] = {
+            model: [] for model in CLOUD_SHORTCUTS
+        }
+
+    def shortcut_name(self, model: str) -> str:
+        return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
 
     def reset(self) -> None:
         self._transcript_path = None
-        self._cloud_history.clear()
+        for history in self._cloud_history.values():
+            history.clear()
 
     def respond(self, prompt: str, model: str) -> str:
         if model == "on-device":
             return self._respond_on_device(prompt)
-        return self._respond_cloud_pro(prompt)
+        return self._respond_cloud(prompt, model)
 
     def _respond_on_device(self, prompt: str) -> str:
         if self._transcript_path is None:
@@ -301,17 +319,17 @@ class Backend:
             raise RuntimeError(result.stderr.strip() or "fm respond failed")
         return result.stdout.strip()
 
-    def _respond_cloud_pro(self, prompt: str) -> str:
-        if not self._shortcut_ready:
-            self._shortcut_ready = ensure_shortcut_installed(
-                self.shortcut, self.shortcut_url, self.on_status
+    def _respond_cloud(self, prompt: str, model: str) -> str:
+        shortcut = self.shortcut_name(model)
+        if not self._shortcut_ready.get(model):
+            self._shortcut_ready[model] = ensure_shortcut_installed(
+                shortcut, CLOUD_SHORTCUTS[model]["url"], self.on_status
             )
 
+        history = self._cloud_history[model]
         full_prompt = prompt
-        if self._cloud_history:
-            context = "\n\n".join(
-                f"User: {u}\nAssistant: {a}" for u, a in self._cloud_history
-            )
+        if history:
+            context = "\n\n".join(f"User: {u}\nAssistant: {a}" for u, a in history)
             full_prompt = f"{context}\n\nUser: {prompt}"
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -321,25 +339,25 @@ class Backend:
                 f.write(full_prompt)
 
             result = subprocess.run(
-                ["shortcuts", "run", self.shortcut, "-i", in_path, "-o", out_path],
+                ["shortcuts", "run", shortcut, "-i", in_path, "-o", out_path],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
                 raise RuntimeError(
-                    f"Shortcut '{self.shortcut}' failed: {detail}\n"
+                    f"Shortcut '{shortcut}' failed: {detail}\n"
                     f"Check it exists ('shortcuts list') and its 'Use Model' "
                     f"action is bound to Shortcut Input."
                 )
             if not os.path.exists(out_path):
-                raise RuntimeError(f"Shortcut '{self.shortcut}' produced no output.")
+                raise RuntimeError(f"Shortcut '{shortcut}' produced no output.")
 
             text = subprocess.run(
                 ["textutil", "-convert", "txt", "-stdout", out_path],
                 capture_output=True, text=True, check=True,
             ).stdout.strip()
 
-        self._cloud_history.append((prompt, text))
+        history.append((prompt, text))
         return text
 
 
@@ -399,10 +417,14 @@ class ChatApp(App):
 
     model: reactive[str] = reactive("on-device")
 
-    def __init__(self, initial_model: str = "on-device", shortcut: str = CLOUD_PRO_SHORTCUT):
+    def __init__(
+        self,
+        initial_model: str = "on-device",
+        shortcut_overrides: dict[str, str] | None = None,
+    ):
         super().__init__()
         self.backend = Backend(
-            shortcut,
+            shortcut_overrides,
             on_status=lambda msg: self.call_from_thread(
                 self._add_message, Message("system", msg)
             ),
@@ -411,6 +433,7 @@ class ChatApp(App):
         self.turn = 0
         self._thinking: MessageWidget | None = None
         self._pending_edit: dict | None = None
+        self._model_picker_active = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -450,8 +473,33 @@ class ChatApp(App):
         self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR
 
     def action_toggle_model(self) -> None:
-        self.model = "cloud-pro" if self.model == "on-device" else "on-device"
+        next_index = (MODEL_ORDER.index(self.model) + 1) % len(MODEL_ORDER)
+        self._select_model(MODEL_ORDER[next_index])
+
+    def _select_model(self, model: str) -> None:
+        if model == self.model:
+            return
+        self.model = model
         self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
+
+    def _open_model_picker(self) -> None:
+        palette = self.query_one("#palette", OptionList)
+        palette.clear_options()
+        for key in MODEL_ORDER:
+            marker = "● " if key == self.model else "○ "
+            palette.add_option(Option(f"{marker}{MODEL_LABELS[key]}", id=key))
+        palette.highlighted = MODEL_ORDER.index(self.model)
+        palette.display = True
+        palette.focus()
+        self._model_picker_active = True
+        self.query_one(Input).disabled = True
+
+    def _close_model_picker(self) -> None:
+        self._model_picker_active = False
+        self.query_one("#palette", OptionList).display = False
+        input_widget = self.query_one(Input)
+        input_widget.disabled = False
+        input_widget.focus()
 
     def action_reset(self) -> None:
         self.backend.reset()
@@ -469,7 +517,7 @@ class ChatApp(App):
 
     COMMANDS = {
         "help": "show this help",
-        "model": "show, or switch, the active model (on-device, cloud-pro)",
+        "model": "open a menu to switch models, or /model <name> directly",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
@@ -486,7 +534,7 @@ class ChatApp(App):
         if name == "help":
             commands = "\n".join(f"  /{cmd:<7} {desc}" for cmd, desc in self.COMMANDS.items())
             shortcuts = (
-                "  ctrl+t  toggle on-device / cloud pro\n"
+                "  ctrl+t  cycle on-device / cloud / cloud pro\n"
                 "  ctrl+r  start a new conversation\n"
                 "  enter   send your message"
             )
@@ -495,13 +543,13 @@ class ChatApp(App):
             )
         elif name == "model":
             if not arg:
-                self._add_message(Message("system", f"model: {MODEL_LABELS[self.model]}"))
+                self._open_model_picker()
             elif arg in MODEL_LABELS:
-                self.model = arg
-                self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
+                self._select_model(arg)
             else:
+                choices = ", ".join(MODEL_ORDER)
                 self._add_message(
-                    Message("system", f"unknown model '{arg}' — try on-device or cloud-pro")
+                    Message("system", f"unknown model '{arg}' — try one of: {choices}")
                 )
         elif name == "edit":
             edit_parts = arg.split(maxsplit=1)
@@ -573,6 +621,12 @@ class ChatApp(App):
         self._update_palette(event.value)
 
     def _update_palette(self, value: str) -> None:
+        if self._model_picker_active:
+            # A deferred Input.Changed (e.g. from clearing the input after
+            # submit) can arrive after the picker has already opened -- don't
+            # let ordinary slash-filter logic clobber it.
+            return
+
         command_name = value[1:].split(" ", 1)[0].lower() if value.startswith("/") else ""
         is_complete = command_name in self.COMMANDS or command_name in self.COMMAND_ALIASES
         self.query_one(Input).styles.color = (
@@ -592,8 +646,31 @@ class ChatApp(App):
                 return
         palette.display = False
 
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if not self._model_picker_active:
+            return
+        self._select_model(event.option.id)
+        self._close_model_picker()
+
     def on_key(self, event: events.Key) -> None:
         palette = self.query_one("#palette", OptionList)
+
+        if self._model_picker_active:
+            # Up/down/enter are OptionList's own bindings (it has real focus
+            # while the picker is open) -- selection comes through
+            # on_option_list_option_selected. Only handle what it doesn't.
+            if event.key == "tab" and palette.highlighted is not None:
+                option = palette.get_option_at_index(palette.highlighted)
+                self._select_model(option.id)
+                self._close_model_picker()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "escape":
+                self._close_model_picker()
+                event.prevent_default()
+                event.stop()
+            return
+
         if not palette.display:
             return
         if event.key == "down":
@@ -666,24 +743,42 @@ class ChatApp(App):
         input_widget.focus()
 
 
+def _add_shortcut_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--shortcut-cloud", metavar="NAME",
+        help=f"Override the Shortcuts name for cloud (default: {CLOUD_SHORTCUTS['cloud']['name']})",
+    )
+    parser.add_argument(
+        "--shortcut-cloud-pro", metavar="NAME",
+        help=f"Override the Shortcuts name for cloud pro (default: {CLOUD_SHORTCUTS['cloud-pro']['name']})",
+    )
+
+
+def _shortcut_overrides(args: argparse.Namespace) -> dict[str, str]:
+    overrides = {}
+    if args.shortcut_cloud:
+        overrides["cloud"] = args.shortcut_cloud
+    if args.shortcut_cloud_pro:
+        overrides["cloud-pro"] = args.shortcut_cloud_pro
+    return overrides
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="fm-pcc", description="Chat with Apple's on-device or Cloud Pro models."
+        prog="fm-pcc", description="Chat with Apple's on-device, cloud, or cloud pro models."
     )
     sub = parser.add_subparsers(dest="command")
 
     respond_p = sub.add_parser("respond", help="Non-interactive one-shot response")
     respond_p.add_argument("prompt", nargs="?", help="Prompt (reads stdin if omitted)")
-    respond_p.add_argument(
-        "-m", "--model", default="cloud-pro", choices=["on-device", "cloud-pro"]
-    )
-    respond_p.add_argument("--shortcut", default=CLOUD_PRO_SHORTCUT)
+    respond_p.add_argument("-m", "--model", default="cloud-pro", choices=MODEL_ORDER)
+    _add_shortcut_args(respond_p)
 
     parser.add_argument(
-        "-m", "--model", default="on-device", choices=["on-device", "cloud-pro"],
+        "-m", "--model", default="on-device", choices=MODEL_ORDER,
         help="Starting model for the chat TUI (default: on-device)",
     )
-    parser.add_argument("--shortcut", default=CLOUD_PRO_SHORTCUT)
+    _add_shortcut_args(parser)
 
     args = parser.parse_args()
 
@@ -694,11 +789,11 @@ def main() -> None:
         expanded, attachments = expand_file_references(prompt, os.getcwd())
         if attachments:
             print(f"[attached: {', '.join(attachments)}]", file=sys.stderr)
-        backend = Backend(args.shortcut)
+        backend = Backend(_shortcut_overrides(args))
         print(backend.respond(expanded, args.model))
         return
 
-    ChatApp(initial_model=args.model, shortcut=args.shortcut).run()
+    ChatApp(initial_model=args.model, shortcut_overrides=_shortcut_overrides(args)).run()
 
 
 if __name__ == "__main__":
