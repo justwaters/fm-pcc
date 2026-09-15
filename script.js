@@ -1,7 +1,11 @@
 (() => {
   const body = document.getElementById("terminal-body");
+  const subtitle = document.getElementById("terminal-subtitle");
+  const status = document.getElementById("terminal-status");
   const root = document.documentElement;
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const labels = { "on-device": "on-device", "cloud-pro": "cloud pro" };
 
   const exchanges = {
     "on-device": {
@@ -17,10 +21,13 @@
   };
 
   let renderToken = 0;
+  let turn = 1;
 
   function render(model, { animate }) {
     const { question, answer, accent } = exchanges[model];
     root.style.setProperty("--accent", accent);
+    subtitle.textContent = `model: ${labels[model]} · /help for help`;
+    status.textContent = `${labels[model]} · turn ${turn}`;
 
     const you = document.createElement("div");
     you.className = "you";
@@ -60,6 +67,7 @@
       if (btn.classList.contains("active")) return;
       document.querySelectorAll(".toggle").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
+      turn += 1;
       render(btn.dataset.model, { animate: true });
     });
   });

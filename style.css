@@ -7,6 +7,8 @@
   --on-device: #f0b429;
   --cloud-pro: #38d9c9;
   --accent: var(--on-device);
+  --diff-add: #3fb950;
+  --diff-remove: #f85149;
 
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --serif: "Source Serif 4", Georgia, serif;
@@ -156,14 +158,35 @@ code {
   font-size: 0.92rem;
   line-height: 1.75;
   padding: 1.25rem 1.1rem;
-  min-height: 9.5rem;
+}
+
+.banner {
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+  background-image: linear-gradient(90deg, var(--on-device), var(--cloud-pro));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.terminal-subtitle,
+.terminal-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.terminal-subtitle { margin-bottom: 1rem; }
+.terminal-status { margin-top: 0.5rem; }
+
+.terminal-convo {
+  min-height: 5rem;
   white-space: pre-wrap;
 }
 
-.terminal-body .you { color: var(--muted); }
-.terminal-body .fm { color: var(--accent); transition: color 0.2s ease; }
+.terminal-convo .you { color: var(--muted); }
+.terminal-convo .fm { color: var(--accent); transition: color 0.2s ease; }
 
-.terminal-body .cursor {
+.terminal-convo .cursor {
   display: inline-block;
   width: 0.55em;
   height: 1em;
@@ -267,6 +290,10 @@ code {
 
 .code .cmd { color: var(--text); }
 .code .comment { color: var(--muted); }
+.code .fm-line { color: var(--on-device); }
+.code .ctx { color: var(--text); }
+.code .add { color: var(--diff-add); }
+.code .remove { color: var(--diff-remove); }
 
 .keys {
   margin: 0;

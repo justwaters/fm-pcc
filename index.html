@@ -38,8 +38,13 @@
           <span class="dot"></span><span class="dot"></span><span class="dot"></span>
           <span class="terminal-title">fm-pcc — zsh</span>
         </div>
-        <div class="terminal-body" id="terminal-body" aria-live="polite">
-          <!-- filled by script.js -->
+        <div class="terminal-body">
+          <div class="banner">fm-pcc — Apple Foundation Models Chat</div>
+          <div class="terminal-subtitle" id="terminal-subtitle">model: on-device · /help for help</div>
+          <div class="terminal-convo" id="terminal-body" aria-live="polite">
+            <!-- filled by script.js -->
+          </div>
+          <div class="terminal-status" id="terminal-status">on-device · turn 1</div>
         </div>
         <div class="toggle-row">
           <button class="toggle active" data-model="on-device" id="toggle-device">
@@ -93,12 +98,57 @@
     </section>
 
     <section class="block">
-      <h2>While you're in the chat</h2>
+      <h2>Bring your files into it</h2>
+      <p>
+        Mention <code>@path/to/file</code> anywhere in a message and its
+        contents get inlined into what's actually sent to the model — the
+        same shorthand as Claude Code. fm-pcc shows an
+        <code>attached: ...</code> note so you can see what went out.
+      </p>
+      <pre class="code"><code><span class="cmd">you › what does @pyproject.toml say the version is?</span></code></pre>
+    </section>
+
+    <section class="block">
+      <h2>Commands, same spirit as fm chat</h2>
       <dl class="keys">
-        <div class="key-row"><dt>Ctrl+T</dt><dd>switch between on-device and cloud pro</dd></div>
+        <div class="key-row"><dt>/model</dt><dd>show, or switch, the active model</dd></div>
+        <div class="key-row"><dt>/edit</dt><dd>propose a file edit — see below</dd></div>
+        <div class="key-row"><dt>/apply</dt><dd>write the pending proposed edit</dd></div>
+        <div class="key-row"><dt>/discard</dt><dd>discard the pending proposed edit</dd></div>
+        <div class="key-row"><dt>/clear</dt><dd>start a new conversation</dd></div>
+        <div class="key-row"><dt>/help</dt><dd>list commands and shortcuts</dd></div>
+        <div class="key-row"><dt>Ctrl+T</dt><dd>toggle on-device / cloud pro</dd></div>
         <div class="key-row"><dt>Ctrl+R</dt><dd>start a new conversation</dd></div>
         <div class="key-row"><dt>Enter</dt><dd>send your message</dd></div>
       </dl>
+    </section>
+
+    <section class="block">
+      <h2>Let it edit files</h2>
+      <p>
+        <code>/edit &lt;path&gt; &lt;instructions&gt;</code> asks the
+        on-device model for a change, shows a diff, and waits for
+        <code>/apply</code> — nothing touches disk until you say so.
+      </p>
+      <pre class="code diff"><code><span class="cmd">you › /edit greet.py add a docstring explaining the function</span>
+
+<span class="fm-line">fm-pcc › Added a docstring explaining the function's purpose.</span>
+
+<span class="ctx">  def greet(name):</span>
+<span class="add">+    '''</span>
+<span class="add">+    This function greets a person by name.</span>
+<span class="add">+    '''</span>
+<span class="ctx">      print("hi " + name)</span>
+
+<span class="comment">/apply to write this change to greet.py, /discard to cancel</span></code></pre>
+      <p class="aside">
+        It asks for a line number and freshly-written text rather than a
+        copy-pasted snippet — the on-device model reliably mangles
+        multi-line source text it has to reproduce verbatim inside JSON, but
+        writing new text and picking a line number both hold up fine. Cloud
+        Pro has no schema control via Shortcuts, so this is on-device only
+        for now.
+      </p>
     </section>
 
   </main>
