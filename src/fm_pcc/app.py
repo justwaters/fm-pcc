@@ -441,6 +441,12 @@ class ChatApp(App):
         self.query_one("#inputbar").styles.border = ("round", accent)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
 
+    def _flash_input(self) -> None:
+        glow = "#ffde59"
+        self.query_one("#inputbar").styles.border = ("round", glow)
+        self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {glow}"))
+        self.set_timer(0.35, self._update_chrome)
+
     def action_toggle_model(self) -> None:
         self.model = "cloud-pro" if self.model == "on-device" else "on-device"
         self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
@@ -596,6 +602,7 @@ class ChatApp(App):
                 input_widget = self.query_one(Input)
                 input_widget.value = f"/{option.id} "
                 input_widget.cursor_position = len(input_widget.value)
+                self._flash_input()
             palette.display = False
             event.prevent_default()
             event.stop()
