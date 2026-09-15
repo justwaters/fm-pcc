@@ -208,6 +208,27 @@ def diff_preview(original: str, updated: str) -> str:
     return "".join(diff)
 
 
+def app_version() -> str:
+    """0.<commit count>, computed live from git history -- no manual bumping.
+
+    Only resolves when running from a git checkout (e.g. `uv tool install
+    -e .`); a real published install has no .git alongside it, so this
+    falls back to a static placeholder there.
+    """
+    try:
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "rev-list", "--count", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        count = result.stdout.strip()
+        if result.returncode == 0 and count.isdigit():
+            return f"0.{count}"
+    except OSError:
+        pass
+    return "0.x"
+
+
 def _gradient(text: str, start: str, end: str) -> Text:
     """Render `text` with a per-character color ramp from `start` to `end`."""
     sr, sg, sb = (int(start[i : i + 2], 16) for i in (1, 3, 5))
@@ -422,7 +443,10 @@ class ChatApp(App):
 
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
-            _gradient(" fm-pcc — Apple Foundation Models Chat", "#f0b429", "#38d9c9")
+            _gradient(
+                f" fm-pcc v{app_version()} — Apple Foundation Models Chat",
+                "#f0b429", "#38d9c9",
+            )
         )
         self.query_one(Input).focus()
         self._update_chrome()
@@ -442,10 +466,13 @@ class ChatApp(App):
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
 
     def _flash_input(self) -> None:
-        glow = "#ffde59"
-        self.query_one("#inputbar").styles.border = ("round", glow)
+        # Pure saturated yellow with a heavier border weight -- on-device's
+        # accent is already amber, so a subtle color-only shift near that
+        # hue is nearly invisible; this needs to pop regardless of model.
+        glow = "#ffff00"
+        self.query_one("#inputbar").styles.border = ("heavy", glow)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {glow}"))
-        self.set_timer(0.35, self._update_chrome)
+        self.set_timer(0.4, self._update_chrome)
 
     def action_toggle_model(self) -> None:
         self.model = "cloud-pro" if self.model == "on-device" else "on-device"
