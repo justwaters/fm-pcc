@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -178,10 +179,9 @@ def propose_edit(
             f"new_lines. Write new_lines yourself -- don't copy existing "
             f"lines verbatim unless they belong in the result."
         )
-        result = subprocess.run(
+        result = _run(
             ["fm", "respond", "--model", "system", "--no-stream", "--greedy",
-             "--schema", schema_path, prompt],
-            capture_output=True, text=True,
+             "--schema", schema_path, prompt]
         )
 
     if result.returncode != 0:
@@ -343,6 +343,50 @@ def _gradient(text: str, start: str, end: str) -> Text:
     return out
 
 
+class GenerationCancelled(Exception):
+    pass
+
+
+_process_lock = threading.Lock()
+_active_process: subprocess.Popen | None = None
+_cancelled_pids: set[int] = set()
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    """subprocess.run-alike whose Popen is registered so Esc-Esc can kill it.
+
+    Only one of these runs at a time in this app (a single background
+    worker per turn), so a single module-level slot is enough -- no need to
+    track a whole set of processes.
+    """
+    global _active_process
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    with _process_lock:
+        _active_process = proc
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        with _process_lock:
+            if _active_process is proc:
+                _active_process = None
+        cancelled = proc.pid in _cancelled_pids
+        _cancelled_pids.discard(proc.pid)
+    if cancelled:
+        raise GenerationCancelled()
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def cancel_active_process() -> bool:
+    """Terminate whatever fm/shortcuts subprocess is currently running, if any."""
+    with _process_lock:
+        proc = _active_process
+    if proc is None or proc.poll() is not None:
+        return False
+    _cancelled_pids.add(proc.pid)
+    proc.terminate()
+    return True
+
+
 def _installed_shortcuts() -> set[str]:
     result = subprocess.run(["shortcuts", "list"], capture_output=True, text=True)
     if result.returncode != 0:
@@ -417,7 +461,7 @@ class Backend:
             args += ["--resume", self._transcript_path]
         args += ["--save-transcript", self._transcript_path, prompt]
 
-        result = subprocess.run(args, capture_output=True, text=True)
+        result = _run(args)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "fm respond failed")
         return result.stdout.strip()
@@ -439,10 +483,7 @@ class Backend:
             with open(in_path, "w") as f:
                 f.write(prompt)
 
-            result = subprocess.run(
-                ["shortcuts", "run", shortcut, "-i", in_path, "-o", out_path],
-                capture_output=True, text=True,
-            )
+            result = _run(["shortcuts", "run", shortcut, "-i", in_path, "-o", out_path])
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
                 raise RuntimeError(
@@ -461,10 +502,7 @@ class Backend:
     def classify(self, prompt: str, model: str) -> str:
         """One-shot, history-free call for routing/classification, not chat."""
         if model == "on-device":
-            result = subprocess.run(
-                ["fm", "respond", "--no-stream", "--greedy", prompt],
-                capture_output=True, text=True,
-            )
+            result = _run(["fm", "respond", "--no-stream", "--greedy", prompt])
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "fm respond failed")
             return result.stdout.strip()
@@ -559,6 +597,7 @@ class ChatApp(App):
         self._history_index: int | None = None
         self._history_draft = ""
         self._suppress_palette_once = False
+        self._last_escape_time = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -660,9 +699,11 @@ class ChatApp(App):
         if name == "help":
             commands = "\n".join(f"  /{cmd:<7} {desc}" for cmd, desc in self.COMMANDS.items())
             shortcuts = (
-                "  ctrl+t  cycle on-device / cloud / cloud pro\n"
-                "  ctrl+r  start a new conversation\n"
-                "  enter   send your message"
+                "  ctrl+t   cycle on-device / cloud / cloud pro\n"
+                "  ctrl+r   start a new conversation\n"
+                "  enter    send your message\n"
+                "  ↑ / ↓    step through what you've sent\n"
+                "  esc esc  stop the current response/edit/task"
             )
             self._add_message(
                 Message("system", f"commands:\n{commands}\n\nshortcuts:\n{shortcuts}")
@@ -711,6 +752,9 @@ class ChatApp(App):
     def _propose_edit(self, path: str, instructions: str) -> None:
         try:
             proposal = propose_edit(path, instructions, os.getcwd())
+        except GenerationCancelled:
+            self.call_from_thread(self._finish_cancelled)
+            return
         except EditError as e:
             self.call_from_thread(self._finish_turn, None, str(e))
             return
@@ -759,6 +803,9 @@ class ChatApp(App):
             proposal = propose_edit(
                 filename, task, cwd, line_range=(section["start"], section["end"])
             )
+        except GenerationCancelled:
+            self.call_from_thread(self._finish_cancelled)
+            return
         except EditError as e:
             self.call_from_thread(self._finish_turn, None, str(e))
             return
@@ -903,6 +950,10 @@ class ChatApp(App):
                 self._history_down()
                 event.prevent_default()
                 event.stop()
+            elif event.key == "escape":
+                self._handle_escape()
+                event.prevent_default()
+                event.stop()
             return
         if event.key == "down":
             palette.action_cursor_down()
@@ -958,6 +1009,8 @@ class ChatApp(App):
         try:
             text = self.backend.respond(prompt, model)
             self.call_from_thread(self._finish_turn, text, None)
+        except GenerationCancelled:
+            self.call_from_thread(self._finish_cancelled)
         except Exception as e:
             self.call_from_thread(self._finish_turn, None, str(e))
 
@@ -977,6 +1030,27 @@ class ChatApp(App):
         input_widget = self.query_one(Input)
         input_widget.disabled = False
         input_widget.focus()
+
+    def _finish_cancelled(self) -> None:
+        if self._thinking is not None:
+            self._thinking.remove()
+            self._thinking = None
+        self._add_message(Message("system", "stopped"))
+        self._enable_input()
+
+    def _handle_escape(self) -> None:
+        input_widget = self.query_one(Input)
+        if not input_widget.disabled:
+            return  # nothing running -- escape has nothing to do here
+
+        now = time.monotonic()
+        if self._last_escape_time and now - self._last_escape_time < 1.5:
+            self._last_escape_time = 0.0
+            cancel_active_process()
+        else:
+            self._last_escape_time = now
+            self.query_one("#status", Static).update("press esc again to stop…")
+            self.set_timer(1.5, self._update_chrome)
 
 
 def _add_shortcut_args(parser: argparse.ArgumentParser) -> None:

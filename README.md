@@ -113,6 +113,12 @@ a larger task is a natural next step, not yet built.
 | `Ctrl+R` | Reset the conversation                        |
 | `Enter`  | Send the message                              |
 | `↑`/`↓`  | Step back/forward through what you've sent (when no dropdown is open) |
+| `Esc` `Esc` | Stop the response/edit/task currently in progress          |
+
+The first `Esc` just warns you; the second, pressed within about 1.5s,
+actually kills the underlying `fm`/`shortcuts` process rather than merely
+resetting the UI — so a stopped on-device turn never finishes writing its
+transcript, and a stopped edit never reaches disk.
 
 ## Limitations
 
