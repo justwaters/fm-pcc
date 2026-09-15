@@ -137,7 +137,7 @@ watching (or interrupting) on anything that requires cleanup.
 
 | Key      | Action                                    |
 |----------|----------------------------------------------|
-| `Ctrl+T` | Cycle on-device / cloud / cloud pro           |
+| `Ctrl+T` | Cycle on-device / cloud / cloud pro / ollama   |
 | `Ctrl+R` | Reset the conversation                        |
 | `Enter`  | Send the message                              |
 | `↑`/`↓`  | Step back/forward through what you've sent (when no dropdown is open) |
