@@ -14,6 +14,7 @@ through the normal Shortcuts "Add Shortcut" confirmation -- there's no way
 """
 import argparse
 import difflib
+import http.client
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Callable
@@ -41,13 +43,15 @@ MODEL_LABELS = {
     "on-device": "on-device",
     "cloud": "cloud",
     "cloud-pro": "cloud pro",
+    "ollama": "ollama",
 }
 MODEL_COLORS = {
     "on-device": "#f0b429",
     "cloud": "#20c997",
     "cloud-pro": "#38d9c9",
+    "ollama": "#9775fa",
 }
-MODEL_ORDER = ["on-device", "cloud", "cloud-pro"]
+MODEL_ORDER = ["on-device", "cloud", "cloud-pro", "ollama"]
 
 # Each of these is a "Use Model" Shortcut (Receive input -> Use <tier> model,
 # bound to Shortcut Input -> Stop and Output Response) sharing the same
@@ -348,44 +352,124 @@ class GenerationCancelled(Exception):
     pass
 
 
-_process_lock = threading.Lock()
-_active_process: subprocess.Popen | None = None
-_cancelled_pids: set[int] = set()
+_op_lock = threading.Lock()
+_active_op: subprocess.Popen | http.client.HTTPConnection | None = None
+_cancel_requested = False
+
+
+def _begin_op(op: subprocess.Popen | http.client.HTTPConnection) -> None:
+    global _active_op, _cancel_requested
+    with _op_lock:
+        _active_op = op
+        _cancel_requested = False
+
+
+def _end_op(op: subprocess.Popen | http.client.HTTPConnection) -> bool:
+    """Unregister `op`. Returns True if it had been cancelled."""
+    global _active_op
+    with _op_lock:
+        was_cancelled = _cancel_requested and _active_op is op
+        if _active_op is op:
+            _active_op = None
+    return was_cancelled
+
+
+def cancel_active_process() -> bool:
+    """Interrupt whatever fm/shortcuts subprocess or Ollama request is running.
+
+    Only one of these runs at a time in this app (a single background
+    worker per turn), so a single module-level slot is enough. A subprocess
+    gets terminated; an HTTP connection gets closed out from under its
+    blocked read, which raises in the thread that's waiting on it.
+    """
+    global _cancel_requested
+    with _op_lock:
+        op = _active_op
+        if op is None:
+            return False
+        _cancel_requested = True
+    if isinstance(op, subprocess.Popen):
+        if op.poll() is None:
+            op.terminate()
+    else:
+        try:
+            op.close()
+        except OSError:
+            pass
+    return True
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    """subprocess.run-alike whose Popen is registered so Esc-Esc can kill it.
-
-    Only one of these runs at a time in this app (a single background
-    worker per turn), so a single module-level slot is enough -- no need to
-    track a whole set of processes.
-    """
-    global _active_process
+    """subprocess.run-alike whose Popen is registered so Esc-Esc can kill it."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    with _process_lock:
-        _active_process = proc
+    _begin_op(proc)
     try:
         stdout, stderr = proc.communicate()
     finally:
-        with _process_lock:
-            if _active_process is proc:
-                _active_process = None
-        cancelled = proc.pid in _cancelled_pids
-        _cancelled_pids.discard(proc.pid)
+        cancelled = _end_op(proc)
     if cancelled:
         raise GenerationCancelled()
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
-def cancel_active_process() -> bool:
-    """Terminate whatever fm/shortcuts subprocess is currently running, if any."""
-    with _process_lock:
-        proc = _active_process
-    if proc is None or proc.poll() is not None:
-        return False
-    _cancelled_pids.add(proc.pid)
-    proc.terminate()
-    return True
+OLLAMA_HOST_DEFAULT = "http://localhost:11434"
+
+
+def _ollama_connect(host: str) -> http.client.HTTPConnection:
+    parsed = urllib.parse.urlparse(host)
+    return http.client.HTTPConnection(parsed.hostname or "localhost", parsed.port or 11434, timeout=180)
+
+
+def _ollama_list_models(host: str) -> list[str]:
+    conn = _ollama_connect(host)
+    try:
+        conn.request("GET", "/api/tags")
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+    except OSError as e:
+        raise RuntimeError(f"couldn't reach Ollama at {host} -- run 'ollama serve'") from e
+    finally:
+        conn.close()
+    if status != 200:
+        raise RuntimeError(f"Ollama returned HTTP {status}")
+    return [m["name"] for m in json.loads(data).get("models", [])]
+
+
+def _ollama_chat(model: str, messages: list[dict], host: str) -> str:
+    """POST to Ollama's /api/chat, cancellable the same way as _run().
+
+    Uses http.client directly (stdlib, no new dependency) rather than
+    `ollama run <model>` so multi-turn history can be passed natively as
+    a messages list instead of re-stuffing prior turns into a text prompt
+    the way the Shortcuts-backed cloud tiers have to.
+    """
+    conn = _ollama_connect(host)
+    _begin_op(conn)
+    try:
+        body = json.dumps({"model": model, "messages": messages, "stream": False})
+        conn.request("POST", "/api/chat", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+    except OSError as e:
+        cancelled = _end_op(conn)
+        conn.close()
+        if cancelled:
+            raise GenerationCancelled()
+        raise RuntimeError(f"couldn't reach Ollama at {host} -- run 'ollama serve'") from e
+
+    cancelled = _end_op(conn)
+    conn.close()
+    if cancelled:
+        raise GenerationCancelled()
+
+    if status != 200:
+        raise RuntimeError(f"Ollama returned HTTP {status}: {data.decode('utf-8', 'replace')[:200]}")
+    payload = json.loads(data)
+    if "error" in payload:
+        raise RuntimeError(f"Ollama error: {payload['error']}")
+    return payload["message"]["content"]
 
 
 def _installed_shortcuts() -> set[str]:
@@ -423,12 +507,14 @@ def ensure_shortcut_installed(
 
 
 class Backend:
-    """Talks to fm (on-device) and Shortcuts (cloud, cloud pro)."""
+    """Talks to fm (on-device), Shortcuts (cloud, cloud pro), and Ollama."""
 
     def __init__(
         self,
         shortcut_overrides: dict[str, str] | None = None,
         on_status: Callable[[str], None] = print,
+        ollama_model: str | None = None,
+        ollama_host: str = OLLAMA_HOST_DEFAULT,
     ):
         self.on_status = on_status
         self._shortcut_overrides = shortcut_overrides or {}
@@ -437,6 +523,10 @@ class Backend:
         self._cloud_history: dict[str, list[tuple[str, str]]] = {
             model: [] for model in CLOUD_SHORTCUTS
         }
+        self.ollama_model = ollama_model
+        self.ollama_host = ollama_host
+        self._ollama_resolved_model: str | None = None
+        self._ollama_history: list[dict[str, str]] = []
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
@@ -445,11 +535,38 @@ class Backend:
         self._transcript_path = None
         for history in self._cloud_history.values():
             history.clear()
+        self._ollama_history.clear()
 
     def respond(self, prompt: str, model: str) -> str:
         if model == "on-device":
             return self._respond_on_device(prompt)
+        if model == "ollama":
+            return self._respond_ollama(prompt)
         return self._respond_cloud(prompt, model)
+
+    def _resolve_ollama_model(self) -> str:
+        if self.ollama_model:
+            return self.ollama_model
+        if self._ollama_resolved_model:
+            return self._ollama_resolved_model
+        models = _ollama_list_models(self.ollama_host)
+        if not models:
+            raise RuntimeError(
+                "no Ollama models installed -- run e.g. 'ollama pull llama3.2'"
+            )
+        self._ollama_resolved_model = models[0]
+        return self._ollama_resolved_model
+
+    def _respond_ollama(self, prompt: str) -> str:
+        model = self._resolve_ollama_model()
+        self._ollama_history.append({"role": "user", "content": prompt})
+        try:
+            text = _ollama_chat(model, self._ollama_history, self.ollama_host)
+        except Exception:
+            self._ollama_history.pop()  # don't keep a failed turn in context
+            raise
+        self._ollama_history.append({"role": "assistant", "content": text})
+        return text
 
     def _respond_on_device(self, prompt: str) -> str:
         if self._transcript_path is None:
@@ -507,6 +624,10 @@ class Backend:
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "fm respond failed")
             return result.stdout.strip()
+        if model == "ollama":
+            return _ollama_chat(
+                self._resolve_ollama_model(), [{"role": "user", "content": prompt}], self.ollama_host
+            )
         return self._run_shortcut(model, prompt)
 
     def _respond_cloud(self, prompt: str, model: str) -> str:
@@ -584,6 +705,8 @@ class ChatApp(App):
         self,
         initial_model: str = "on-device",
         shortcut_overrides: dict[str, str] | None = None,
+        ollama_model: str | None = None,
+        ollama_host: str = OLLAMA_HOST_DEFAULT,
     ):
         super().__init__()
         self.backend = Backend(
@@ -591,6 +714,8 @@ class ChatApp(App):
             on_status=lambda msg: self.call_from_thread(
                 self._add_message, Message("system", msg)
             ),
+            ollama_model=ollama_model,
+            ollama_host=ollama_host,
         )
         self.set_reactive(ChatApp.model, initial_model)
         self.turn = 0
@@ -1078,6 +1203,14 @@ def _add_shortcut_args(parser: argparse.ArgumentParser) -> None:
         "--shortcut-cloud-pro", metavar="NAME",
         help=f"Override the Shortcuts name for cloud pro (default: {CLOUD_SHORTCUTS['cloud-pro']['name']})",
     )
+    parser.add_argument(
+        "--ollama-model", metavar="NAME",
+        help="Ollama model to use (default: the first one 'ollama list' returns)",
+    )
+    parser.add_argument(
+        "--ollama-host", metavar="URL", default=OLLAMA_HOST_DEFAULT,
+        help=f"Ollama server URL (default: {OLLAMA_HOST_DEFAULT})",
+    )
 
 
 def _shortcut_overrides(args: argparse.Namespace) -> dict[str, str]:
@@ -1091,7 +1224,8 @@ def _shortcut_overrides(args: argparse.Namespace) -> dict[str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="fm-pcc", description="Chat with Apple's on-device, cloud, or cloud pro models."
+        prog="fm-pcc",
+        description="Chat with Apple's on-device, cloud, cloud pro, or local Ollama models.",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -1115,11 +1249,18 @@ def main() -> None:
         expanded, attachments = expand_file_references(prompt, os.getcwd())
         if attachments:
             print(f"[attached: {', '.join(attachments)}]", file=sys.stderr)
-        backend = Backend(_shortcut_overrides(args))
+        backend = Backend(
+            _shortcut_overrides(args), ollama_model=args.ollama_model, ollama_host=args.ollama_host
+        )
         print(backend.respond(expanded, args.model))
         return
 
-    ChatApp(initial_model=args.model, shortcut_overrides=_shortcut_overrides(args)).run()
+    ChatApp(
+        initial_model=args.model,
+        shortcut_overrides=_shortcut_overrides(args),
+        ollama_model=args.ollama_model,
+        ollama_host=args.ollama_host,
+    ).run()
 
 
 if __name__ == "__main__":
