@@ -13,6 +13,8 @@ through the normal Shortcuts "Add Shortcut" confirmation -- there's no way
 (or business) silently writing into the Shortcuts library without that.
 """
 import argparse
+import difflib
+import json
 import os
 import re
 import subprocess
@@ -82,6 +84,127 @@ def expand_file_references(prompt: str, cwd: str) -> tuple[str, list[str]]:
         extra += f"\n\n--- {label} ---\n{content}{suffix}\n--- end {label} ---"
 
     return prompt + extra, attachments
+
+
+class EditError(Exception):
+    pass
+
+
+_EDIT_SCHEMA_ARGS = [
+    "schema", "object", "--name", "EditProposal",
+    "--string", "summary", "--description", "One-sentence summary of the change",
+    "--integer", "anchor_line",
+    "--description", "The 1-based line number (from the numbered listing) to act on",
+    "--boolean", "insert_after",
+    "--description", "true to insert new_lines after anchor_line, false to replace anchor_line with new_lines",
+    "--string", "new_lines", "--description", "The new line(s) of text, freshly written (not copied)",
+]
+
+
+def propose_edit(path: str, instructions: str, cwd: str) -> dict:
+    """Ask the on-device model for a line-anchored edit to `path`.
+
+    Guided generation on a small on-device model is unreliable at copying
+    multi-line source text verbatim into a JSON string -- it reliably mangles
+    escaping and truncates. So instead of asking for an old/new text snippet,
+    this shows the file as numbered lines and asks for a line number plus
+    freshly-*written* replacement text, which the model is much better at.
+    We do the actual line lookup ourselves, so there's no verbatim-matching
+    step to fail. On-device only for now -- Cloud Pro (via Shortcuts) has no
+    schema control to constrain output the same way.
+    """
+    full_path = os.path.expanduser(path)
+    if not os.path.isabs(full_path):
+        full_path = os.path.join(cwd, full_path)
+    full_path = os.path.normpath(full_path)
+    label = os.path.relpath(full_path, cwd)
+
+    if not os.path.isfile(full_path):
+        raise EditError(f"no such file: {label}")
+
+    with open(full_path, "r", errors="replace") as f:
+        original = f.read()
+
+    if len(original) > MAX_FILE_CHARS:
+        raise EditError(
+            f"{label} is too large to edit on-device "
+            f"(over {MAX_FILE_CHARS} characters)"
+        )
+
+    lines = original.splitlines()
+    numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+    schema = subprocess.run(
+        ["fm", *_EDIT_SCHEMA_ARGS], capture_output=True, text=True, check=True
+    ).stdout
+
+    with tempfile.TemporaryDirectory() as tmp:
+        schema_path = os.path.join(tmp, "schema.json")
+        with open(schema_path, "w") as f:
+            f.write(schema)
+
+        prompt = (
+            f"Here is {label}, with line numbers:\n\n{numbered}\n\n"
+            f"Apply this change: {instructions}\n\n"
+            f"Pick the single line number (anchor_line) this change belongs "
+            f"at. Set insert_after to true to add new_lines after that line "
+            f"and leave it in place, or false to replace that line with "
+            f"new_lines. Write new_lines yourself -- don't copy existing "
+            f"lines verbatim unless they belong in the result."
+        )
+        result = subprocess.run(
+            ["fm", "respond", "--model", "system", "--no-stream", "--greedy",
+             "--schema", schema_path, prompt],
+            capture_output=True, text=True,
+        )
+
+    if result.returncode != 0:
+        raise EditError(result.stderr.strip() or "fm respond failed")
+
+    try:
+        proposal = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise EditError("model didn't return a valid edit proposal")
+
+    anchor = proposal.get("anchor_line")
+    insert_after = bool(proposal.get("insert_after"))
+    new_lines = proposal.get("new_lines") or ""
+    summary = proposal.get("summary") or "(no summary)"
+
+    if not isinstance(anchor, int) or not (1 <= anchor <= max(len(lines), 1)):
+        raise EditError(f"model picked an out-of-range line ({anchor!r})")
+
+    # When inserting after a line (e.g. after a `def` line), new lines belong
+    # at the block's body indent -- best approximated by the line that
+    # already follows, not the anchor line itself.
+    indent_source = lines[anchor] if insert_after and anchor < len(lines) else lines[anchor - 1]
+    anchor_indent = re.match(r"[ \t]*", indent_source).group() if lines else ""
+    new_split = [
+        line if line.startswith((" ", "\t")) or not line else anchor_indent + line
+        for line in new_lines.splitlines()
+    ]
+
+    if insert_after:
+        updated_lines = lines[:anchor] + new_split + lines[anchor:]
+    else:
+        updated_lines = lines[: anchor - 1] + new_split + lines[anchor:]
+    updated = "\n".join(updated_lines) + ("\n" if original.endswith("\n") else "")
+
+    return {
+        "path": full_path,
+        "label": label,
+        "original": original,
+        "updated": updated,
+        "summary": summary,
+    }
+
+
+def diff_preview(original: str, updated: str) -> str:
+    diff = difflib.unified_diff(
+        original.splitlines(keepends=True),
+        updated.splitlines(keepends=True),
+    )
+    return "".join(diff)
 
 
 def _gradient(text: str, start: str, end: str) -> Text:
@@ -275,6 +398,7 @@ class ChatApp(App):
         self.set_reactive(ChatApp.model, initial_model)
         self.turn = 0
         self._thinking: MessageWidget | None = None
+        self._pending_edit: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -327,6 +451,9 @@ class ChatApp(App):
     COMMANDS = {
         "help": "show this help",
         "model": "show, or switch, the active model (on-device, cloud-pro)",
+        "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
+        "apply": "write the pending proposed edit",
+        "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
         "quit": "exit fm-pcc",
     }
@@ -357,12 +484,69 @@ class ChatApp(App):
                 self._add_message(
                     Message("system", f"unknown model '{arg}' — try on-device or cloud-pro")
                 )
+        elif name == "edit":
+            edit_parts = arg.split(maxsplit=1)
+            if len(edit_parts) < 2:
+                self._add_message(Message("system", "usage: /edit <path> <instructions>"))
+                return
+            path, instructions = edit_parts
+            self.query_one(Input).disabled = True
+            self._thinking = self._add_message(Message("thinking", ""))
+            self._propose_edit(path, instructions)
+        elif name == "apply":
+            self._apply_pending_edit()
+        elif name == "discard":
+            if self._pending_edit:
+                self._pending_edit = None
+                self._add_message(Message("system", "edit discarded"))
+            else:
+                self._add_message(Message("system", "no pending edit"))
         elif name == "clear":
             self.action_reset()
         elif name == "quit":
             self.exit()
         else:
             self._add_message(Message("system", f"unknown command '/{name}' — try /help"))
+
+    @work(thread=True)
+    def _propose_edit(self, path: str, instructions: str) -> None:
+        try:
+            proposal = propose_edit(path, instructions, os.getcwd())
+        except EditError as e:
+            self.call_from_thread(self._finish_turn, None, str(e))
+            return
+        except Exception as e:
+            self.call_from_thread(self._finish_turn, None, f"edit failed: {e}")
+            return
+        diff = diff_preview(proposal["original"], proposal["updated"])
+        self.call_from_thread(self._show_edit_proposal, proposal, diff)
+
+    def _show_edit_proposal(self, proposal: dict, diff: str) -> None:
+        if self._thinking is not None:
+            self._thinking.remove()
+            self._thinking = None
+        self._pending_edit = proposal
+        self._add_message(
+            Message(
+                "system",
+                f"{proposal['summary']}\n\n{diff}\n"
+                f"/apply to write this change to {proposal['label']}, /discard to cancel",
+            )
+        )
+        self._enable_input()
+
+    def _apply_pending_edit(self) -> None:
+        if not self._pending_edit:
+            self._add_message(Message("system", "no pending edit — try /edit <path> <instructions>"))
+            return
+        proposal = self._pending_edit
+        try:
+            with open(proposal["path"], "w") as f:
+                f.write(proposal["updated"])
+            self._add_message(Message("system", f"wrote {proposal['label']}"))
+        except OSError as e:
+            self._add_message(Message("system", f"failed to write {proposal['label']}: {e}"))
+        self._pending_edit = None
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()

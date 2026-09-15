@@ -62,15 +62,27 @@ message (relative to wherever you ran `fm-pcc`, or an absolute path) — its
 contents get inlined into what's actually sent to the model, and fm-pcc
 shows an `attached: ...` note so you can see what went out.
 
-Slash commands, same as `fm chat`:
+Slash commands, same spirit as `fm chat`:
 
-| Command          | Action                                    |
-|------------------|--------------------------------------------|
-| `/model`         | Show the active model                       |
-| `/model <name>`  | Switch model (`on-device` or `cloud-pro`)   |
-| `/clear`         | Start a new conversation                    |
-| `/help`          | List commands and shortcuts                 |
-| `/quit`          | Exit                                        |
+| Command                     | Action                                              |
+|-----------------------------|-------------------------------------------------------|
+| `/model`                    | Show the active model                                  |
+| `/model <name>`             | Switch model (`on-device` or `cloud-pro`)              |
+| `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
+| `/apply`                    | Write the pending proposed edit                        |
+| `/discard`                  | Discard the pending proposed edit                      |
+| `/clear`                    | Start a new conversation                               |
+| `/help`                     | List commands and shortcuts                            |
+| `/quit`                     | Exit                                                   |
+
+`/edit` shows a diff and waits for `/apply` before touching disk — nothing
+is written automatically. It only works on-device: it uses guided
+generation (`fm respond --schema`) to get a structured line-anchored edit
+(a line number plus freshly-written replacement/insertion text) rather than
+asking the model to reproduce file content verbatim, which the on-device
+model is unreliable at for anything spanning more than one line. Cloud Pro
+has no equivalent schema control via Shortcuts, so editing isn't available
+there yet.
 
 ### Keybindings (TUI)
 
