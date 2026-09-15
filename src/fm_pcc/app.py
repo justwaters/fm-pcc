@@ -449,15 +449,6 @@ class ChatApp(App):
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
         self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR
 
-    def _flash_input(self) -> None:
-        # The completed command *text* flashes pure yellow -- on-device's own
-        # accent is already amber, so a border-only shift near that hue barely
-        # registers, and the point is to draw the eye to what was just typed.
-        glow = "#ffff00"
-        self.query_one(Input).styles.color = glow
-        self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {glow}"))
-        self.set_timer(0.5, self._update_chrome)
-
     def action_toggle_model(self) -> None:
         self.model = "cloud-pro" if self.model == "on-device" else "on-device"
         self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
@@ -582,6 +573,10 @@ class ChatApp(App):
         self._update_palette(event.value)
 
     def _update_palette(self, value: str) -> None:
+        self.query_one(Input).styles.color = (
+            "#ffff00" if value.startswith("/") else self.NORMAL_INPUT_COLOR
+        )
+
         palette = self.query_one("#palette", OptionList)
         if value.startswith("/") and " " not in value:
             query = value[1:].lower()
@@ -613,7 +608,6 @@ class ChatApp(App):
                 input_widget = self.query_one(Input)
                 input_widget.value = f"/{option.id} "
                 input_widget.cursor_position = len(input_widget.value)
-                self._flash_input()
             palette.display = False
             event.prevent_default()
             event.stop()
