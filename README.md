@@ -88,9 +88,9 @@ Slash commands, same spirit as `fm chat`:
 | `/model`                    | Open a menu to pick a model (`↑`/`↓`, `Enter`/`Tab`)   |
 | `/model <name>`             | Switch directly (`on-device`, `cloud`, `cloud-pro`, `ollama`) |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
-| `/task <description>`       | Pick a file and section for you, then propose an edit  |
-| `/apply`                    | Write the pending proposed edit                        |
-| `/discard`                  | Discard the pending proposed edit                      |
+| `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
+| `/apply`                    | Write the pending edit proposed by `/edit`             |
+| `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
 | `/help`                     | List commands and shortcuts                            |
 | `/quit`                     | Exit                                                   |
@@ -104,17 +104,34 @@ model is unreliable at for anything spanning more than one line. Neither
 cloud tier has equivalent schema control via Shortcuts, so editing isn't
 available there yet.
 
-`/task <description>` automates the "which file, which part" steps ahead
-of `/edit`: it lists the files in the current directory, asks Cloud Pro to
-pick the one most relevant to your description, deterministically splits
-that file into sections (real top-level blocks for brace languages like
-CSS/JS, fixed-size chunks otherwise — not model-summarized, since that's a
-mechanical task a parser gets right for free), asks Cloud Pro which
-section is relevant, then runs the same on-device `/edit` machinery scoped
-to just that section. Same review step at the end — nothing is written
-until `/apply`. It's one pass (file → section → edit → review) rather than
-an autonomous multi-file loop; chaining several of these automatically for
-a larger task is a natural next step, not yet built.
+`/task <description>` runs an orchestrator/worker loop instead of `/edit`'s
+single reviewed change: Cloud Pro plans, on-device executes and **writes
+immediately, with no per-step `/apply`** — closer to a subagent that Cloud
+Pro keeps dispatching to than a one-shot assistant. Each iteration, Cloud
+Pro sees the task, the full content of every file in the directory, and a
+running log of what's already been done, then either says the task is
+done or picks one concrete next step (a file plus specific instructions).
+That file gets deterministically split into sections (real top-level
+blocks for brace languages like CSS/JS, fixed-size chunks otherwise — not
+model-summarized, since that's a mechanical task a parser gets right for
+free), Cloud Pro picks the relevant section, and on-device drafts and
+writes the edit scoped to it — the same machinery `/edit` uses. This
+repeats until Cloud Pro says done or a 15-step safety cap is hit. `Esc`
+`Esc` stops it between steps.
+
+This is genuinely autonomous, so it can genuinely go wrong: on real
+testing, a task needing cleanup/consolidation (not just clean additions)
+made the loop spiral — each step only had room to insert or replace one
+line-anchored region, so instead of removing stray content from an
+earlier step it kept adding more, without ever converging. To catch this,
+each step's instructions are compared against the last few for suspicious
+similarity (Cloud Pro asking for essentially the same fix again, worded
+slightly differently is what non-convergence actually looked like in
+practice) — if it looks like a repeat, the loop stops immediately with a
+"not making progress" message instead of grinding to the step cap and
+compounding the damage. It's a mitigation, not a fix for the underlying
+cause: `/task` is best suited to clean, additive changes, and worth
+watching (or interrupting) on anything that requires cleanup.
 
 ### Keybindings (TUI)
 

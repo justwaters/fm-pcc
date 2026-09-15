@@ -291,8 +291,39 @@ def _split_top_level_braces(lines: list[str]) -> list[dict]:
     return sections
 
 
-def pick_file(task: str, candidates: list[str], cwd: str, backend: "Backend", model: str) -> str:
-    """Ask a cloud model which candidate file is most relevant to `task`."""
+STALL_SIMILARITY_THRESHOLD = 0.6
+STALL_LOOKBACK = 3
+
+
+def is_stalling(instructions: str, recent_instructions: list[str]) -> bool:
+    """True if `instructions` looks like a near-repeat of a recent step.
+
+    Empirically, a /task loop that isn't converging (e.g. a cleanup task
+    where each step only adds more instead of removing the mess from the
+    last one) shows up as Cloud Pro asking for essentially the same fix
+    again with slightly different wording, not identical text. A fuzzy
+    similarity check against the last few steps' instructions catches that
+    where an exact match wouldn't.
+    """
+    lowered = instructions.lower()
+    for prior in recent_instructions[-STALL_LOOKBACK:]:
+        if difflib.SequenceMatcher(None, lowered, prior.lower()).ratio() > STALL_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
+def plan_next_step(
+    task: str, candidates: list[str], cwd: str, history: list[str], backend: "Backend", model: str
+) -> dict | None:
+    """Ask a cloud model to pick the next single edit step, or declare done.
+
+    This is the orchestrator half of the /task loop: it sees the whole task,
+    the full content of every candidate file, and a running log of what's
+    already been changed, and decides either that nothing more is needed or
+    exactly one concrete next step (a file plus specific instructions for
+    just that change). The on-device model never sees this -- it only ever
+    executes one bounded, already-decided edit at a time.
+    """
     listing = []
     for name in candidates:
         try:
@@ -302,17 +333,37 @@ def pick_file(task: str, candidates: list[str], cwd: str, backend: "Backend", mo
             content = "(unreadable)"
         listing.append(f"--- {name} ---\n{content}")
 
+    progress = "\n".join(f"- {h}" for h in history) if history else "(nothing yet)"
+
     prompt = (
-        f"Task: {task}\n\nHere are the files in this directory:\n\n"
+        f"Task: {task}\n\nFiles in this directory:\n\n"
         + "\n\n".join(listing)
-        + "\n\nWhich ONE file should be edited first to make progress on "
-        "this task? Reply with just the exact filename, nothing else."
+        + f"\n\nSteps already taken:\n{progress}\n\n"
+        "If the task is now fully done, reply with exactly: DONE\n"
+        "Otherwise reply with exactly two lines:\n"
+        "FILE: <exact filename to edit next>\n"
+        "INSTRUCTIONS: <specific instructions for just this one change>"
     )
-    reply = backend.classify(prompt, model).strip().strip("`'\" .")
-    for name in candidates:
-        if name.lower() == reply.lower() or name.lower() in reply.lower():
-            return name
-    raise EditError(f"couldn't tell which file to edit from the model's reply: {reply!r}")
+    reply = backend.classify(prompt, model).strip()
+    if reply.upper().startswith("DONE"):
+        return None
+
+    file_match = re.search(r"FILE:\s*(.+)", reply)
+    instr_match = re.search(r"INSTRUCTIONS:\s*(.+)", reply, re.DOTALL)
+    if not file_match or not instr_match:
+        raise EditError(f"couldn't parse the next step from the model's reply: {reply!r}")
+
+    filename = file_match.group(1).strip().strip("`'\" .")
+    instructions = instr_match.group(1).strip()
+
+    matched = next(
+        (c for c in candidates if c.lower() == filename.lower() or c.lower() in filename.lower()),
+        None,
+    )
+    if not matched:
+        raise EditError(f"model picked an unknown file '{filename}'")
+
+    return {"file": matched, "instructions": instructions}
 
 
 def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
@@ -728,6 +779,8 @@ class ChatApp(App):
         self._suppress_palette_once = False
         self._last_escape_time = 0.0
         self._last_quit_time = 0.0
+        self._task_running = False
+        self._task_cancel_requested = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -823,7 +876,7 @@ class ChatApp(App):
         "help": "show this help",
         "model": "open a menu to switch models, or /model <name> directly",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
-        "task": "pick a file+section for you, then propose an edit: /task <description>",
+        "task": "run a multi-step edit loop, writing as it goes: /task <description>",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -905,9 +958,20 @@ class ChatApp(App):
         diff = diff_preview(proposal["original"], proposal["updated"])
         self.call_from_thread(self._show_edit_proposal, proposal, diff)
 
+    TASK_MAX_STEPS = 15
+
     @work(thread=True)
     def _run_task(self, task: str) -> None:
+        """Orchestrator/worker loop: Cloud Pro plans each step, on-device
+        executes and writes it immediately -- no per-step /apply. Stops when
+        Cloud Pro says the task is done, Esc-Esc is pressed, or a safety cap
+        on step count is hit.
+        """
         cwd = os.getcwd()
+        self._task_running = True
+        self._task_cancel_requested = False
+        history: list[str] = []
+        recent_instructions: list[str] = []
         try:
             candidates = sorted(
                 f for f in os.listdir(cwd)
@@ -916,45 +980,71 @@ class ChatApp(App):
             if not candidates:
                 raise EditError("no files in the current directory")
 
-            self.call_from_thread(
-                self._task_progress, f"looking at {len(candidates)} files to find the right one…"
-            )
-            filename = pick_file(task, candidates, cwd, self.backend, "cloud-pro")
+            for step in range(1, self.TASK_MAX_STEPS + 1):
+                if self._task_cancel_requested:
+                    self.call_from_thread(self._task_progress, "stopped")
+                    break
 
-            self.call_from_thread(
-                self._task_progress, f"picked {filename} — splitting into sections…"
-            )
-            with open(os.path.join(cwd, filename), "r", errors="replace") as f:
-                content = f.read()
-            sections = split_sections(content, filename)
+                self.call_from_thread(
+                    self._task_progress, f"step {step}: deciding what to do next…"
+                )
+                plan = plan_next_step(task, candidates, cwd, history, self.backend, "cloud-pro")
+                if plan is None:
+                    self.call_from_thread(
+                        self._task_progress,
+                        f"done after {step - 1} step(s)."
+                        if step > 1 else "nothing to do -- task already satisfied.",
+                    )
+                    break
 
-            self.call_from_thread(
-                self._task_progress, f"picking which of {len(sections)} sections to edit…"
-            )
-            section = pick_section(task, filename, sections, self.backend, "cloud-pro")
+                filename, instructions = plan["file"], plan["instructions"]
 
-            where = (
-                section["name"]
-                if section["name"].startswith("lines ")
-                else f"{section['name']} (lines {section['start']}-{section['end']})"
-            )
-            self.call_from_thread(
-                self._task_progress, f"drafting an edit to {filename}, {where}…"
-            )
-            proposal = propose_edit(
-                filename, task, cwd, line_range=(section["start"], section["end"])
-            )
+                if is_stalling(instructions, recent_instructions):
+                    self.call_from_thread(
+                        self._task_progress,
+                        f"stopped: step {step} looks like a repeat of a recent "
+                        f"step, not real progress -- {filename}: {instructions}",
+                    )
+                    break
+                recent_instructions.append(instructions)
+
+                self.call_from_thread(
+                    self._task_progress, f"step {step}: {filename} — {instructions}"
+                )
+
+                with open(os.path.join(cwd, filename), "r", errors="replace") as f:
+                    content = f.read()
+                sections = split_sections(content, filename)
+                section = pick_section(instructions, filename, sections, self.backend, "cloud-pro")
+
+                proposal = propose_edit(
+                    filename, instructions, cwd, line_range=(section["start"], section["end"])
+                )
+                with open(proposal["path"], "w") as f:
+                    f.write(proposal["updated"])
+
+                diff = diff_preview(proposal["original"], proposal["updated"])
+                self.call_from_thread(self._task_step_applied, proposal, diff)
+                history.append(f"{filename}: {proposal['summary']}")
+            else:
+                self.call_from_thread(
+                    self._task_progress,
+                    f"stopped after {self.TASK_MAX_STEPS} steps (safety limit)",
+                )
         except GenerationCancelled:
-            self.call_from_thread(self._finish_cancelled)
-            return
+            self.call_from_thread(self._task_progress, "stopped")
         except EditError as e:
-            self.call_from_thread(self._finish_turn, None, str(e))
-            return
+            self.call_from_thread(self._task_progress, f"error: {e}")
         except Exception as e:
-            self.call_from_thread(self._finish_turn, None, f"task failed: {e}")
-            return
-        diff = diff_preview(proposal["original"], proposal["updated"])
-        self.call_from_thread(self._show_edit_proposal, proposal, diff)
+            self.call_from_thread(self._task_progress, f"error: task failed: {e}")
+        finally:
+            self._task_running = False
+            self.call_from_thread(self._enable_input)
+
+    def _task_step_applied(self, proposal: dict, diff: str) -> None:
+        self._add_message(
+            Message("system", f"wrote {proposal['label']}: {proposal['summary']}\n\n{diff}")
+        )
 
     def _task_progress(self, text: str) -> None:
         self._add_message(Message("system", text))
@@ -1187,6 +1277,8 @@ class ChatApp(App):
         now = time.monotonic()
         if self._last_escape_time and now - self._last_escape_time < 1.5:
             self._last_escape_time = 0.0
+            if self._task_running:
+                self._task_cancel_requested = True
             cancel_active_process()
         else:
             self._last_escape_time = now
