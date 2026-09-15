@@ -62,6 +62,11 @@ message (relative to wherever you ran `fm-pcc`, or an absolute path) — its
 contents get inlined into what's actually sent to the model, and fm-pcc
 shows an `attached: ...` note so you can see what went out.
 
+Type `/` and a live palette pops up above the input, filtering as you keep
+typing — same as Claude Code or the Gemini CLI. `↑`/`↓` moves the
+highlight, `Tab` completes the highlighted command into the input,
+`Escape` dismisses it.
+
 Slash commands, same spirit as `fm chat`:
 
 | Command                     | Action                                              |

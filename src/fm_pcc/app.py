@@ -26,11 +26,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
-from textual.widgets import Input, Static
+from textual.widgets import Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -374,6 +375,15 @@ class ChatApp(App):
     .msg-system { margin: 1 0 0 0; }
     .msg-thinking { margin: 1 0 0 0; }
     #status { padding: 0 3; color: #7b838a; }
+    #palette {
+        display: none;
+        height: auto;
+        max-height: 8;
+        margin: 0 2 0 2;
+        border: round #7b838a;
+        background: #1b2126;
+    }
+    #palette > .option-list--option-highlighted { background: #2a3138; }
     #inputbar { height: 3; border: round #7b838a; margin: 0 2 1 2; padding: 0 1; }
     #prompt-glyph { width: 2; content-align: center middle; }
     #input { border: none; background: transparent; }
@@ -405,9 +415,10 @@ class ChatApp(App):
         yield Static(id="subtitle")
         yield VerticalScroll(id="log")
         yield Static(id="status")
+        yield OptionList(id="palette")
         with Horizontal(id="inputbar"):
             yield Static("❯", id="prompt-glyph")
-            yield Input(placeholder="Message fm-pcc…", id="input")
+            yield Input(placeholder="Message fm-pcc… (/ for commands)", id="input")
 
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
@@ -548,7 +559,53 @@ class ChatApp(App):
             self._add_message(Message("system", f"failed to write {proposal['label']}: {e}"))
         self._pending_edit = None
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "input":
+            return
+        self._update_palette(event.value)
+
+    def _update_palette(self, value: str) -> None:
+        palette = self.query_one("#palette", OptionList)
+        if value.startswith("/") and " " not in value:
+            query = value[1:].lower()
+            matches = [name for name in self.COMMANDS if name.startswith(query)]
+            if matches:
+                palette.clear_options()
+                for name in matches:
+                    palette.add_option(Option(f"/{name}  {self.COMMANDS[name]}", id=name))
+                palette.highlighted = 0
+                palette.display = True
+                return
+        palette.display = False
+
+    def on_key(self, event: events.Key) -> None:
+        palette = self.query_one("#palette", OptionList)
+        if not palette.display:
+            return
+        if event.key == "down":
+            palette.action_cursor_down()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            palette.action_cursor_up()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "tab":
+            if palette.highlighted is not None:
+                option = palette.get_option_at_index(palette.highlighted)
+                input_widget = self.query_one(Input)
+                input_widget.value = f"/{option.id} "
+                input_widget.cursor_position = len(input_widget.value)
+            palette.display = False
+            event.prevent_default()
+            event.stop()
+        elif event.key == "escape":
+            palette.display = False
+            event.prevent_default()
+            event.stop()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.query_one("#palette", OptionList).display = False
         prompt = event.value.strip()
         if not prompt:
             return
