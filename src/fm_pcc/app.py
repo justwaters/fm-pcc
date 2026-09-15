@@ -14,6 +14,7 @@ through the normal Shortcuts "Add Shortcut" confirmation -- there's no way
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,18 +23,80 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
-from textual.widgets import Footer, Header, Input, Static
+from textual.widgets import Input, Static
 
 MODEL_LABELS = {
-    "on-device": "On-Device",
-    "cloud-pro": "Cloud Pro",
+    "on-device": "on-device",
+    "cloud-pro": "cloud pro",
+}
+MODEL_COLORS = {
+    "on-device": "#f0b429",
+    "cloud-pro": "#38d9c9",
 }
 CLOUD_PRO_SHORTCUT = "AppleAI"
 CLOUD_PRO_SHORTCUT_URL = "https://www.icloud.com/shortcuts/13ea99c480a245d5a8a8de6cca0fb397"
+
+_FILE_REF_RE = re.compile(r"@(\S+)")
+MAX_FILE_CHARS = 8000
+
+
+def expand_file_references(prompt: str, cwd: str) -> tuple[str, list[str]]:
+    """Inline the contents of any @path/to/file mentions found in `prompt`.
+
+    Paths are resolved relative to `cwd` unless already absolute (~ is
+    expanded too). Mentions that don't resolve to a readable file are left
+    alone -- so stray "@" text (an email, a handle) is harmless. Returns the
+    prompt with file contents appended, and the list of resolved labels for
+    display.
+    """
+    attachments: list[str] = []
+    seen: set[str] = set()
+    extra = ""
+
+    for ref in _FILE_REF_RE.findall(prompt):
+        path = os.path.expanduser(ref)
+        if not os.path.isabs(path):
+            path = os.path.join(cwd, path)
+        path = os.path.normpath(path)
+
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+
+        try:
+            with open(path, "r", errors="replace") as f:
+                content = f.read(MAX_FILE_CHARS + 1)
+        except OSError:
+            continue
+
+        truncated = len(content) > MAX_FILE_CHARS
+        content = content[:MAX_FILE_CHARS]
+        label = os.path.relpath(path, cwd)
+        attachments.append(label)
+        suffix = "\n… (truncated)" if truncated else ""
+        extra += f"\n\n--- {label} ---\n{content}{suffix}\n--- end {label} ---"
+
+    return prompt + extra, attachments
+
+
+def _gradient(text: str, start: str, end: str) -> Text:
+    """Render `text` with a per-character color ramp from `start` to `end`."""
+    sr, sg, sb = (int(start[i : i + 2], 16) for i in (1, 3, 5))
+    er, eg, eb = (int(end[i : i + 2], 16) for i in (1, 3, 5))
+    out = Text()
+    span = max(len(text) - 1, 1)
+    for i, ch in enumerate(text):
+        t = i / span
+        r = round(sr + (er - sr) * t)
+        g = round(sg + (eg - sg) * t)
+        b = round(sb + (eb - sb) * t)
+        out.append(ch, style=f"bold #{r:02x}{g:02x}{b:02x}")
+    return out
 
 
 def _installed_shortcuts() -> set[str]:
@@ -156,23 +219,42 @@ class Backend:
 
 @dataclass
 class Message:
-    role: str  # "user" | "assistant" | "system"
+    role: str  # "user" | "assistant" | "system" | "thinking"
     text: str
 
 
 class MessageWidget(Static):
-    def __init__(self, message: Message):
-        label = {"user": "You", "assistant": "fm-pcc", "system": "*"}[message.role]
-        super().__init__(f"[b]{label}[/b]\n{message.text}", markup=True)
+    """A single turn, rendered as flowing text (no bubble/border chrome)."""
+
+    def __init__(self, message: Message, accent: str):
+        if message.role == "user":
+            body = Text.from_markup(f"[#7b838a]you ›[/] {message.text}")
+        elif message.role == "assistant":
+            prefix = Text("fm-pcc ›", style=f"bold {accent}")
+            body = Text.assemble(prefix, " ", message.text)
+        elif message.role == "thinking":
+            body = Text.from_markup(f"[{accent}]· thinking…[/]")
+        else:
+            body = Text.from_markup(f"[#7b838a italic]{message.text}[/]")
+        super().__init__(body)
         self.add_class(f"msg-{message.role}")
 
 
 class ChatApp(App):
     CSS = """
-    .msg-user { border: round $accent; margin: 1 2 0 8; padding: 1; }
-    .msg-assistant { border: round $success; margin: 1 8 0 2; padding: 1; }
-    .msg-system { color: $text-muted; margin: 1 2; }
-    #log { padding: 1; }
+    Screen { background: #14181c; }
+    #banner { padding: 1 2 0 2; }
+    #subtitle { padding: 0 2 1 2; color: #7b838a; }
+    #log { padding: 0 2; }
+    .msg-user { margin: 1 0 0 0; }
+    .msg-assistant { margin: 1 0 0 0; }
+    .msg-system { margin: 1 0 0 0; }
+    .msg-thinking { margin: 1 0 0 0; }
+    #status { padding: 0 3; color: #7b838a; }
+    #inputbar { height: 3; border: round #7b838a; margin: 0 2 1 2; padding: 0 1; }
+    #prompt-glyph { width: 2; content-align: center middle; }
+    #input { border: none; background: transparent; }
+    #input:focus { border: none; }
     """
 
     BINDINGS = [
@@ -190,38 +272,57 @@ class ChatApp(App):
                 self._add_message, Message("system", msg)
             ),
         )
-        self.model = initial_model
+        self.set_reactive(ChatApp.model, initial_model)
+        self.turn = 0
+        self._thinking: MessageWidget | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static(id="banner")
+        yield Static(id="subtitle")
         yield VerticalScroll(id="log")
-        yield Input(placeholder="Message fm-pcc…", id="input")
-        yield Footer()
+        yield Static(id="status")
+        with Horizontal(id="inputbar"):
+            yield Static("❯", id="prompt-glyph")
+            yield Input(placeholder="Message fm-pcc…", id="input")
 
     def on_mount(self) -> None:
+        self.query_one("#banner", Static).update(
+            _gradient(" fm-pcc — Apple Foundation Models Chat", "#f0b429", "#38d9c9")
+        )
         self.query_one(Input).focus()
-        self._update_title()
+        self._update_chrome()
 
     def watch_model(self, _value: str) -> None:
-        self._update_title()
+        self._update_chrome()
 
-    def _update_title(self) -> None:
-        self.title = "fm-pcc"
-        self.sub_title = f"model: {MODEL_LABELS[self.model]}"
+    def _update_chrome(self) -> None:
+        accent = MODEL_COLORS[self.model]
+        self.query_one("#subtitle", Static).update(
+            f" model: {MODEL_LABELS[self.model]} · ctrl+t switch · ctrl+r reset"
+        )
+        self.query_one("#status", Static).update(
+            f"{MODEL_LABELS[self.model]} · turn {self.turn}"
+        )
+        self.query_one("#inputbar").styles.border = ("round", accent)
+        self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
 
     def action_toggle_model(self) -> None:
         self.model = "cloud-pro" if self.model == "on-device" else "on-device"
-        self._add_message(Message("system", f"Switched to {MODEL_LABELS[self.model]}"))
+        self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
 
     def action_reset(self) -> None:
         self.backend.reset()
+        self.turn = 0
         self.query_one("#log", VerticalScroll).remove_children()
-        self._add_message(Message("system", "Conversation reset."))
+        self._update_chrome()
+        self._add_message(Message("system", "conversation reset"))
 
-    def _add_message(self, message: Message) -> None:
+    def _add_message(self, message: Message) -> MessageWidget:
         log = self.query_one("#log", VerticalScroll)
-        log.mount(MessageWidget(message))
+        widget = MessageWidget(message, MODEL_COLORS[self.model])
+        log.mount(widget)
         log.scroll_end(animate=False)
+        return widget
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
@@ -230,18 +331,34 @@ class ChatApp(App):
         event.input.value = ""
         event.input.disabled = True
         self._add_message(Message("user", prompt))
-        self._respond(prompt)
+
+        expanded, attachments = expand_file_references(prompt, os.getcwd())
+        if attachments:
+            self._add_message(Message("system", f"attached: {', '.join(attachments)}"))
+
+        self._thinking = self._add_message(Message("thinking", ""))
+        self._respond(expanded)
 
     @work(thread=True)
     def _respond(self, prompt: str) -> None:
         model = self.model
         try:
             text = self.backend.respond(prompt, model)
-            self.call_from_thread(self._add_message, Message("assistant", text))
+            self.call_from_thread(self._finish_turn, text, None)
         except Exception as e:
-            self.call_from_thread(self._add_message, Message("system", f"Error: {e}"))
-        finally:
-            self.call_from_thread(self._enable_input)
+            self.call_from_thread(self._finish_turn, None, str(e))
+
+    def _finish_turn(self, text: str | None, error: str | None) -> None:
+        if self._thinking is not None:
+            self._thinking.remove()
+            self._thinking = None
+        if error is not None:
+            self._add_message(Message("system", f"error: {error}"))
+        else:
+            self.turn += 1
+            self._add_message(Message("assistant", text))
+            self._update_chrome()
+        self._enable_input()
 
     def _enable_input(self) -> None:
         input_widget = self.query_one(Input)
@@ -274,8 +391,11 @@ def main() -> None:
         prompt = args.prompt or sys.stdin.read().strip()
         if not prompt:
             parser.error("no prompt given (pass as argument or pipe via stdin)")
+        expanded, attachments = expand_file_references(prompt, os.getcwd())
+        if attachments:
+            print(f"[attached: {', '.join(attachments)}]", file=sys.stderr)
         backend = Backend(args.shortcut)
-        print(backend.respond(prompt, args.model))
+        print(backend.respond(expanded, args.model))
         return
 
     ChatApp(initial_model=args.model, shortcut=args.shortcut).run()
