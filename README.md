@@ -114,11 +114,14 @@ a larger task is a natural next step, not yet built.
 | `Enter`  | Send the message                              |
 | `↑`/`↓`  | Step back/forward through what you've sent (when no dropdown is open) |
 | `Esc` `Esc` | Stop the response/edit/task currently in progress          |
+| `Ctrl+C` `Ctrl+C` | Quit                                              |
 
 The first `Esc` just warns you; the second, pressed within about 1.5s,
 actually kills the underlying `fm`/`shortcuts` process rather than merely
 resetting the UI — so a stopped on-device turn never finishes writing its
-transcript, and a stopped edit never reaches disk.
+transcript, and a stopped edit never reaches disk. `Ctrl+C` works the same
+way (first press warns, second quits), and also cancels anything running
+first so quitting mid-response doesn't hang waiting on it.
 
 ## Limitations
 

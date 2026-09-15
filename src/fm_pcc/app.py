@@ -29,6 +29,7 @@ from typing import Callable
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
 from textual.widgets import Input, OptionList, Static
@@ -572,6 +573,9 @@ class ChatApp(App):
     BINDINGS = [
         ("ctrl+t", "toggle_model", "Toggle model"),
         ("ctrl+r", "reset", "Reset chat"),
+        # priority=True so this fires even though the focused Input has its
+        # own ctrl+c binding (copy) that would otherwise intercept it first.
+        Binding("ctrl+c", "attempt_quit", "Quit", priority=True),
     ]
 
     model: reactive[str] = reactive("on-device")
@@ -598,6 +602,7 @@ class ChatApp(App):
         self._history_draft = ""
         self._suppress_palette_once = False
         self._last_escape_time = 0.0
+        self._last_quit_time = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -672,6 +677,16 @@ class ChatApp(App):
         self._update_chrome()
         self._add_message(Message("system", "conversation reset"))
 
+    def action_attempt_quit(self) -> None:
+        now = time.monotonic()
+        if self._last_quit_time and now - self._last_quit_time < 1.5:
+            cancel_active_process()  # don't hang waiting on a blocked worker thread
+            self.exit()
+        else:
+            self._last_quit_time = now
+            self.query_one("#status", Static).update("press ctrl+c again to quit…")
+            self.set_timer(1.5, self._update_chrome)
+
     def _add_message(self, message: Message) -> MessageWidget:
         log = self.query_one("#log", VerticalScroll)
         widget = MessageWidget(message, MODEL_COLORS[self.model])
@@ -699,11 +714,12 @@ class ChatApp(App):
         if name == "help":
             commands = "\n".join(f"  /{cmd:<7} {desc}" for cmd, desc in self.COMMANDS.items())
             shortcuts = (
-                "  ctrl+t   cycle on-device / cloud / cloud pro\n"
-                "  ctrl+r   start a new conversation\n"
-                "  enter    send your message\n"
-                "  ↑ / ↓    step through what you've sent\n"
-                "  esc esc  stop the current response/edit/task"
+                "  ctrl+t          cycle on-device / cloud / cloud pro\n"
+                "  ctrl+r          start a new conversation\n"
+                "  enter           send your message\n"
+                "  ↑ / ↓           step through what you've sent\n"
+                "  esc esc         stop the current response/edit/task\n"
+                "  ctrl+c ctrl+c   quit"
             )
             self._add_message(
                 Message("system", f"commands:\n{commands}\n\nshortcuts:\n{shortcuts}")
