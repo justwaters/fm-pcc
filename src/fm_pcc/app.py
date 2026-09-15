@@ -434,6 +434,10 @@ class ChatApp(App):
         self._thinking: MessageWidget | None = None
         self._pending_edit: dict | None = None
         self._model_picker_active = False
+        self._history: list[str] = []
+        self._history_index: int | None = None
+        self._history_draft = ""
+        self._suppress_palette_once = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -615,6 +619,38 @@ class ChatApp(App):
             self._add_message(Message("system", f"failed to write {proposal['label']}: {e}"))
         self._pending_edit = None
 
+    def _history_up(self) -> None:
+        if not self._history:
+            return
+        input_widget = self.query_one(Input)
+        if self._history_index is None:
+            self._history_draft = input_widget.value
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        self._recall_history(input_widget)
+
+    def _history_down(self) -> None:
+        if self._history_index is None:
+            return
+        input_widget = self.query_one(Input)
+        if self._history_index < len(self._history) - 1:
+            self._history_index += 1
+        else:
+            self._history_index = None
+        self._recall_history(input_widget)
+
+    def _recall_history(self, input_widget: Input) -> None:
+        value = (
+            self._history[self._history_index]
+            if self._history_index is not None
+            else self._history_draft
+        )
+        self._suppress_palette_once = True
+        input_widget.value = value
+        input_widget.cursor_position = len(value)
+        self.query_one("#palette", OptionList).display = False
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "input":
             return
@@ -634,6 +670,14 @@ class ChatApp(App):
         )
 
         palette = self.query_one("#palette", OptionList)
+        if self._suppress_palette_once:
+            # Programmatic recall (history up/down) fires a deferred
+            # Input.Changed just like typing does -- don't let it reopen the
+            # filter dropdown on top of a history recall.
+            self._suppress_palette_once = False
+            palette.display = False
+            return
+
         if value.startswith("/") and " " not in value:
             query = value[1:].lower()
             matches = [name for name in self.COMMANDS if name.startswith(query)]
@@ -672,6 +716,14 @@ class ChatApp(App):
             return
 
         if not palette.display:
+            if event.key == "up":
+                self._history_up()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "down":
+                self._history_down()
+                event.prevent_default()
+                event.stop()
             return
         if event.key == "down":
             palette.action_cursor_down()
@@ -701,6 +753,11 @@ class ChatApp(App):
         if not prompt:
             return
         event.input.value = ""
+
+        if not self._history or self._history[-1] != prompt:
+            self._history.append(prompt)
+        self._history_index = None
+        self._history_draft = ""
 
         if prompt.startswith("/"):
             self._handle_command(prompt)

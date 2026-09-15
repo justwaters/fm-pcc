@@ -99,6 +99,7 @@ available there yet.
 | `Ctrl+T` | Cycle on-device / cloud / cloud pro           |
 | `Ctrl+R` | Reset the conversation                        |
 | `Enter`  | Send the message                              |
+| `↑`/`↓`  | Step back/forward through what you've sent (when no dropdown is open) |
 
 ## Limitations
 
