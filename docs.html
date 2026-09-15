@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fm-pcc — Documentation</title>
+<meta name="description" content="Full documentation for fm-pcc: requirements, install, models, commands, keybindings, and known limitations.">
+<meta property="og:title" content="fm-pcc — Documentation">
+<meta property="og:description" content="Full documentation for fm-pcc: requirements, install, models, commands, keybindings, and known limitations.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2314181C'/%3E%3Ctext x='4' y='17' font-family='monospace' font-size='14' fill='%23F0B429'%3E%3E_%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Source+Serif+4:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="nav">
+    <a class="wordmark" href="index.html">fm-pcc</a>
+    <div class="navlinks">
+      <a class="navlink" href="index.html">Home</a>
+      <a class="navlink" href="https://github.com/justwaters/fm-pcc" target="_blank" rel="noopener">View on GitHub <span class="ext">↗</span></a>
+    </div>
+  </header>
+
+  <main>
+
+    <section class="hero">
+      <h1>Documentation</h1>
+      <p class="dek">
+        Everything fm-pcc does, in one place — requirements, install,
+        the four models, every command, every keybinding, and the
+        limitations worth knowing about before you rely on it.
+      </p>
+    </section>
+
+    <nav class="toc" aria-label="Table of contents">
+      <a href="#requirements">Requirements</a>
+      <a href="#install">Install</a>
+      <a href="#models">Models</a>
+      <a href="#usage">Usage</a>
+      <a href="#in-the-chat">In the chat</a>
+      <a href="#commands">Commands</a>
+      <a href="#task-loop">The /task loop</a>
+      <a href="#keybindings">Keybindings</a>
+      <a href="#limitations">Limitations</a>
+    </nav>
+
+    <section class="block" id="requirements">
+      <h2>Requirements</h2>
+      <ul>
+        <li>macOS 27 with Apple Intelligence enabled, and the <code>fm</code>
+          CLI licensed (run <code>fm license</code> once).</li>
+        <li><a href="https://docs.astral.sh/uv/" target="_blank" rel="noopener">uv</a>,
+          used both to install fm-pcc and to run it.</li>
+        <li>Two saved Shortcuts for the cloud tiers — a "Use Model" action
+          bound to Shortcut Input, followed by "Stop and Output" set to the
+          action's response — one set to <strong>Cloud</strong> named
+          <code>PCC-Cloud</code>, one set to <strong>Cloud Pro</strong>
+          named <code>PCC-CloudPro</code>. Override either name with
+          <code>--shortcut-cloud</code> / <code>--shortcut-cloud-pro</code>
+          if yours are named differently. You don't need to build these —
+          see Install below.</li>
+        <li>Optional: <a href="https://ollama.com" target="_blank" rel="noopener">Ollama</a>
+          installed and running (<code>ollama serve</code>) with at least
+          one model pulled (<code>ollama pull llama3.2</code>) if you want
+          the <code>ollama</code> model. Everything else works without it.</li>
+      </ul>
+    </section>
+
+    <section class="block" id="install">
+      <h2>Install</h2>
+      <pre class="code"><code><span class="cmd">uv tool install git+https://github.com/justwaters/fm-pcc</span></code></pre>
+      <p>
+        This puts a <code>fm-pcc</code> command on your <code>PATH</code>
+        (run <code>uv tool update-shell</code> once if a fresh shell can't
+        find it), so it works from any directory.
+      </p>
+      <p>
+        The first time you actually use Cloud or Cloud Pro, if its
+        shortcut isn't installed yet, fm-pcc opens its iCloud share link
+        for you —
+        <a href="https://www.icloud.com/shortcuts/9f4e45968b974ef7ad8d29eb06f98a9b" target="_blank" rel="noopener">Cloud</a>,
+        <a href="https://www.icloud.com/shortcuts/7f7f8e41dfee459a89c28ca0b8c60984" target="_blank" rel="noopener">Cloud Pro</a>
+        — tap <strong>Add Shortcut</strong> in the sheet that appears, and
+        it'll pick up from there. On-device chat needs no setup at all.
+      </p>
+      <p class="aside">
+        For local development, install from a checkout instead:
+        <code>uv tool install -e .</code>
+      </p>
+    </section>
+
+    <section class="block" id="models">
+      <h2>Models</h2>
+      <dl class="keys">
+        <div class="key-row">
+          <dt><span class="model-dot on-device"></span>on-device</dt>
+          <dd>Calls <code>fm respond</code> directly, using its own
+            <code>--resume</code>/<code>--save-transcript</code> flags to
+            keep real multi-turn context across a conversation. No setup,
+            works offline.</dd>
+        </div>
+        <div class="key-row">
+          <dt><span class="model-dot cloud"></span>cloud</dt>
+          <dd>No CLI/API exists for this tier, so fm-pcc shells out to the
+            <code>PCC-Cloud</code> Shortcut via <code>shortcuts run</code>
+            and strips the RTF it returns. Shortcuts has no scriptable
+            session concept, so multi-turn context is approximated by
+            resending prior turns as plain text with each new prompt.</dd>
+        </div>
+        <div class="key-row">
+          <dt><span class="model-dot cloud-pro"></span>cloud pro</dt>
+          <dd>Same mechanism as Cloud, via the <code>PCC-CloudPro</code>
+            Shortcut instead. The bigger, more capable cloud tier.</dd>
+        </div>
+        <div class="key-row">
+          <dt><span class="model-dot ollama"></span>ollama</dt>
+          <dd>Talks to a local <code>ollama serve</code> over HTTP
+            (<code>/api/chat</code>, via stdlib <code>http.client</code> —
+            no extra dependency), passing real multi-turn message history
+            natively instead of the resend-as-text approximation the
+            Shortcuts-backed tiers need. If no model is specified, it uses
+            whichever one <code>ollama list</code> returns first
+            (<code>--ollama-model</code> to pick one, <code>--ollama-host</code>
+            if the server isn't at the default
+            <code>http://localhost:11434</code>).</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="block" id="usage">
+      <h2>Usage</h2>
+      <pre class="code"><code><span class="cmd">fm-pcc</span>                                    <span class="comment"># chat TUI, starts on-device</span>
+<span class="cmd">fm-pcc --model cloud-pro</span>                  <span class="comment"># start the TUI on cloud pro instead</span>
+<span class="cmd">fm-pcc --model ollama</span>                     <span class="comment"># start on Ollama (first model 'ollama list' has)</span>
+<span class="cmd">fm-pcc --model ollama --ollama-model llama3.2</span>  <span class="comment"># ...or a specific one</span>
+<span class="cmd">fm-pcc respond "What is Swift?"</span>           <span class="comment"># one-shot, non-interactive (default: cloud-pro)</span>
+<span class="cmd">fm-pcc respond -m on-device "..."</span>         <span class="comment"># one-shot on-device</span></code></pre>
+
+      <h3>Flags</h3>
+      <table class="doctable">
+        <tr><th>Flag</th><th>Applies to</th><th>Meaning</th></tr>
+        <tr><td><code>-m</code>, <code>--model</code></td><td>both</td>
+          <td>Which model to use — <code>on-device</code>, <code>cloud</code>,
+            <code>cloud-pro</code>, or <code>ollama</code>. Default is
+            <code>on-device</code> for the TUI, <code>cloud-pro</code> for
+            <code>respond</code>.</td></tr>
+        <tr><td><code>--shortcut-cloud</code></td><td>both</td>
+          <td>Override the Shortcuts name used for <code>cloud</code>
+            (default <code>PCC-Cloud</code>).</td></tr>
+        <tr><td><code>--shortcut-cloud-pro</code></td><td>both</td>
+          <td>Override the Shortcuts name used for <code>cloud-pro</code>
+            (default <code>PCC-CloudPro</code>).</td></tr>
+        <tr><td><code>--ollama-model</code></td><td>both</td>
+          <td>Ollama model to use. Default: the first one
+            <code>ollama list</code> returns.</td></tr>
+        <tr><td><code>--ollama-host</code></td><td>both</td>
+          <td>Ollama server URL. Default <code>http://localhost:11434</code>.</td></tr>
+      </table>
+    </section>
+
+    <section class="block" id="in-the-chat">
+      <h2>In the chat</h2>
+      <p>
+        Reference a local file by mentioning <code>@path/to/file</code>
+        anywhere in your message (relative to wherever you ran fm-pcc, or
+        an absolute path) — its contents get inlined into what's actually
+        sent to the model, and fm-pcc shows an <code>attached: ...</code>
+        note so you can see what went out.
+      </p>
+      <pre class="code"><code><span class="cmd">you › what does @pyproject.toml say the version is?</span></code></pre>
+      <p>
+        Type <code>/</code> and a live palette pops up above the input,
+        filtering as you keep typing — same as Claude Code or the Gemini
+        CLI. <code>↑</code>/<code>↓</code> moves the highlight,
+        <code>Tab</code> completes the highlighted command into the input,
+        <code>Escape</code> dismisses it. Only a complete, exact command
+        name turns the input text yellow — a partial like <code>/mo</code>
+        doesn't, <code>/model</code> does.
+      </p>
+    </section>
+
+    <section class="block" id="commands">
+      <h2>Commands</h2>
+      <table class="doctable">
+        <tr><th>Command</th><th>Action</th></tr>
+        <tr><td><code>/model</code></td>
+          <td>Open a menu to pick a model (<code>↑</code>/<code>↓</code> to
+            navigate, <code>Enter</code> or <code>Tab</code> to select,
+            <code>Escape</code> to cancel).</td></tr>
+        <tr><td><code>/model &lt;name&gt;</code></td>
+          <td>Switch directly — <code>on-device</code>, <code>cloud</code>,
+            <code>cloud-pro</code>, or <code>ollama</code>.</td></tr>
+        <tr><td><code>/edit &lt;path&gt; &lt;instructions&gt;</code></td>
+          <td>Propose a single edit to a file, on-device only. Shows a
+            diff and waits for <code>/apply</code> — see below.</td></tr>
+        <tr><td><code>/task &lt;description&gt;</code></td>
+          <td>Run a multi-step edit loop that writes as it goes — see
+            <a href="#task-loop">The /task loop</a>.</td></tr>
+        <tr><td><code>/apply</code></td>
+          <td>Write the pending edit proposed by <code>/edit</code>.</td></tr>
+        <tr><td><code>/discard</code></td>
+          <td>Discard the pending edit proposed by <code>/edit</code>.</td></tr>
+        <tr><td><code>/clear</code></td><td>Start a new conversation.</td></tr>
+        <tr><td><code>/help</code></td><td>List commands and shortcuts.</td></tr>
+        <tr><td><code>/quit</code></td><td>Exit.</td></tr>
+      </table>
+
+      <h3>/edit</h3>
+      <p>
+        <code>/edit &lt;path&gt; &lt;instructions&gt;</code> shows a diff
+        and waits for <code>/apply</code> before touching disk — nothing
+        is written automatically. It only works on-device: it uses guided
+        generation (<code>fm respond --schema</code>) to get a structured
+        <em>line-anchored</em> edit — a line number plus freshly-written
+        replacement or insertion text — rather than asking the model to
+        reproduce file content verbatim, which the on-device model is
+        unreliable at for anything spanning more than one line. Neither
+        cloud tier has equivalent schema control via Shortcuts, so editing
+        isn't available there yet.
+      </p>
+      <pre class="code diff"><code><span class="cmd">you › /edit greet.py add a docstring explaining the function</span>
+
+<span class="fm-line">fm-pcc › Added a docstring explaining the function's purpose.</span>
+
+<span class="ctx">  def greet(name):</span>
+<span class="add">+    '''</span>
+<span class="add">+    This function greets a person by name.</span>
+<span class="add">+    '''</span>
+<span class="ctx">      print("hi " + name)</span>
+
+<span class="comment">/apply to write this change to greet.py, /discard to cancel</span></code></pre>
+    </section>
+
+    <section class="block" id="task-loop">
+      <h2>The /task loop</h2>
+      <p>
+        <code>/task &lt;description&gt;</code> runs an orchestrator/worker
+        loop instead of <code>/edit</code>'s single reviewed change: Cloud
+        Pro plans, on-device executes and <strong>writes immediately, with
+        no per-step <code>/apply</code></strong> — closer to a subagent
+        that Cloud Pro keeps dispatching to than a one-shot assistant.
+      </p>
+      <p>
+        Each iteration, Cloud Pro sees the task, the full content of every
+        file in the current directory, and a running log of what's already
+        been done, then either says the task is done or picks one concrete
+        next step — a file plus specific instructions. That file gets
+        deterministically split into sections (real top-level blocks for
+        brace languages like CSS/JS, fixed-size chunks otherwise — not
+        model-summarized, since splitting a file into sections is exactly
+        the kind of mechanical task a parser gets right for free and a
+        small model doesn't). Cloud Pro picks the relevant section, and
+        on-device drafts and writes the edit scoped to it, using the same
+        machinery as <code>/edit</code>. This repeats until Cloud Pro says
+        done or a 15-step safety cap is hit. <code>Esc</code>
+        <code>Esc</code> stops it between steps.
+      </p>
+      <p>
+        This is genuinely autonomous, so it can genuinely go wrong: on
+        real testing, a task needing cleanup or consolidation — not just
+        clean additions — made the loop spiral. Each step can only insert
+        or replace one line-anchored region, so instead of removing stray
+        content from an earlier step, it kept adding more, all the way to
+        the safety cap, leaving the file worse than when it started.
+      </p>
+      <p>
+        To catch this, each step's instructions are compared against the
+        last few for suspicious similarity — in practice, a
+        non-converging loop showed up as Cloud Pro asking for essentially
+        the same fix again, worded slightly differently, which an exact
+        text match wouldn't catch. If a step looks like a repeat, the loop
+        stops immediately with a "not making progress" message instead of
+        grinding to the cap and compounding the damage.
+      </p>
+      <p class="aside">
+        It's a mitigation, not a fix for the underlying cause — <code>/task</code>
+        is best suited to clean, additive changes, and worth watching (or
+        interrupting) on anything that requires cleanup.
+      </p>
+    </section>
+
+    <section class="block" id="keybindings">
+      <h2>Keybindings</h2>
+      <table class="doctable">
+        <tr><th>Key</th><th>Action</th></tr>
+        <tr><td><code>Ctrl+T</code></td>
+          <td>Cycle on-device / cloud / cloud pro / ollama.</td></tr>
+        <tr><td><code>Ctrl+R</code></td><td>Reset the conversation.</td></tr>
+        <tr><td><code>Enter</code></td><td>Send the message.</td></tr>
+        <tr><td><code>↑</code> / <code>↓</code></td>
+          <td>Step back/forward through what you've sent, when no dropdown
+            is open.</td></tr>
+        <tr><td><code>Esc</code> <code>Esc</code></td>
+          <td>Stop the response, edit, or task currently in progress.</td></tr>
+        <tr><td><code>Ctrl+C</code> <code>Ctrl+C</code></td><td>Quit.</td></tr>
+      </table>
+      <p class="aside">
+        The first <code>Esc</code> just warns you; the second, pressed
+        within about 1.5s, actually kills the underlying
+        <code>fm</code>/<code>shortcuts</code> process (or closes the
+        Ollama connection) rather than merely resetting the UI — so a
+        stopped on-device turn never finishes writing its transcript, and
+        a stopped edit never reaches disk. <code>Ctrl+C</code> works the
+        same way (first press warns, second quits), and also cancels
+        anything running first so quitting mid-response doesn't hang
+        waiting on it.
+      </p>
+    </section>
+
+    <section class="block" id="limitations">
+      <h2>Limitations</h2>
+      <ul>
+        <li>Cloud/Cloud Pro's "multi-turn context" is just prior turns
+          re-sent as text, not a real session — it'll drift on long
+          conversations.</li>
+        <li>No streaming; each response is shown once it's fully
+          generated.</li>
+        <li><code>/edit</code> and <code>/task</code> are on-device only —
+          neither cloud tier supports the schema control they need.</li>
+        <li><code>/task</code> can spiral on cleanup-style tasks; see
+          <a href="#task-loop">The /task loop</a>.</li>
+      </ul>
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    <span class="wordmark">fm-pcc</span>
+    <a class="navlink" href="https://github.com/justwaters/fm-pcc" target="_blank" rel="noopener">Source on GitHub <span class="ext">↗</span></a>
+  </footer>
+
+</div>
+
+</body>
+</html>
