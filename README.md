@@ -55,6 +55,23 @@ fm-pcc respond "What is Swift?"     # one-shot, non-interactive (default: cloud-
 fm-pcc respond -m on-device "..."   # one-shot on-device
 ```
 
+### In the chat
+
+Reference a local file by mentioning `@path/to/file` anywhere in your
+message (relative to wherever you ran `fm-pcc`, or an absolute path) — its
+contents get inlined into what's actually sent to the model, and fm-pcc
+shows an `attached: ...` note so you can see what went out.
+
+Slash commands, same as `fm chat`:
+
+| Command          | Action                                    |
+|------------------|--------------------------------------------|
+| `/model`         | Show the active model                       |
+| `/model <name>`  | Switch model (`on-device` or `cloud-pro`)   |
+| `/clear`         | Start a new conversation                    |
+| `/help`          | List commands and shortcuts                 |
+| `/quit`          | Exit                                        |
+
 ### Keybindings (TUI)
 
 | Key      | Action                          |

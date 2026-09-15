@@ -298,7 +298,7 @@ class ChatApp(App):
     def _update_chrome(self) -> None:
         accent = MODEL_COLORS[self.model]
         self.query_one("#subtitle", Static).update(
-            f" model: {MODEL_LABELS[self.model]} · ctrl+t switch · ctrl+r reset"
+            f" model: {MODEL_LABELS[self.model]} · /help for help"
         )
         self.query_one("#status", Static).update(
             f"{MODEL_LABELS[self.model]} · turn {self.turn}"
@@ -324,11 +324,56 @@ class ChatApp(App):
         log.scroll_end(animate=False)
         return widget
 
+    COMMANDS = {
+        "help": "show this help",
+        "model": "show, or switch, the active model (on-device, cloud-pro)",
+        "clear": "start a new conversation",
+        "quit": "exit fm-pcc",
+    }
+    COMMAND_ALIASES = {"?": "help", "reset": "clear", "exit": "quit", "q": "quit"}
+
+    def _handle_command(self, raw: str) -> None:
+        parts = raw[1:].strip().split(maxsplit=1)
+        name = self.COMMAND_ALIASES.get(parts[0].lower(), parts[0].lower()) if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if name == "help":
+            commands = "\n".join(f"  /{cmd:<7} {desc}" for cmd, desc in self.COMMANDS.items())
+            shortcuts = (
+                "  ctrl+t  toggle on-device / cloud pro\n"
+                "  ctrl+r  start a new conversation\n"
+                "  enter   send your message"
+            )
+            self._add_message(
+                Message("system", f"commands:\n{commands}\n\nshortcuts:\n{shortcuts}")
+            )
+        elif name == "model":
+            if not arg:
+                self._add_message(Message("system", f"model: {MODEL_LABELS[self.model]}"))
+            elif arg in MODEL_LABELS:
+                self.model = arg
+                self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
+            else:
+                self._add_message(
+                    Message("system", f"unknown model '{arg}' — try on-device or cloud-pro")
+                )
+        elif name == "clear":
+            self.action_reset()
+        elif name == "quit":
+            self.exit()
+        else:
+            self._add_message(Message("system", f"unknown command '/{name}' — try /help"))
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
             return
         event.input.value = ""
+
+        if prompt.startswith("/"):
+            self._handle_command(prompt)
+            return
+
         event.input.disabled = True
         self._add_message(Message("user", prompt))
 
