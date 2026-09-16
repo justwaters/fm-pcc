@@ -993,6 +993,7 @@ class ChatApp(App):
         "task": "run a multi-step edit loop, writing as it goes: /task <description>",
         "ask": "research a question via cloud/core subagents: /ask <question>",
         "subagents": "show or set the cloud/core roles: /subagents [cloud|core] <model>",
+        "compare": "ask every model the same question: /compare <question>",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -1038,6 +1039,12 @@ class ChatApp(App):
                 return
             self.query_one(Input).disabled = True
             self._run_ask(arg)
+        elif name == "compare":
+            if not arg:
+                self._add_message(Message("system", "usage: /compare <question>"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_compare(arg)
         elif name == "subagents":
             self._handle_subagents(arg)
         elif name == "edit":
@@ -1266,6 +1273,38 @@ class ChatApp(App):
         self.turn += 1
         self._add_message(Message("assistant", answer))
         self._update_chrome()
+
+    @work(thread=True)
+    def _run_compare(self, question: str) -> None:
+        """Ask every model the same question, one at a time, showing each
+        answer as it comes back. Uses classify() (history-free) for all of
+        them so this never pollutes any model's real conversation.
+        """
+        self._loop_running = True
+        self._loop_cancel_requested = False
+        try:
+            for m in MODEL_ORDER:
+                if self._loop_cancel_requested:
+                    self.call_from_thread(self._log_progress, "stopped")
+                    return
+                self.call_from_thread(self._log_progress, f"asking {model_label(m)}…")
+                try:
+                    answer = self.backend.classify(question, m)
+                except GenerationCancelled:
+                    raise
+                except Exception as e:
+                    answer = f"(error: {e})"
+                self.call_from_thread(self._compare_result, m, answer)
+        except GenerationCancelled:
+            self.call_from_thread(self._log_progress, "stopped")
+        finally:
+            self._loop_running = False
+            self.call_from_thread(self._enable_input)
+
+    def _compare_result(self, model: str, answer: str) -> None:
+        self._add_message(
+            Message("assistant", f"{model_label(model)}:\n{answer}")
+        )
 
     def _show_edit_proposal(self, proposal: dict, diff: str) -> None:
         if self._thinking is not None:

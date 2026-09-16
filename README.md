@@ -93,6 +93,7 @@ Slash commands, same spirit as `fm chat`:
 | `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
 | `/ask <question>`           | Research a question via cloud/core subagents (see below) |
 | `/subagents [cloud\|core] <model>` | Show or set which model plays each subagent role  |
+| `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -154,6 +155,13 @@ few sub-questions; each sub-question is dispatched to the **core** role;
 then **cloud** synthesizes a final answer from that research. Cheap
 questions just get answered directly in one round-trip — decomposition
 only kicks in when the cloud role itself judges it would help.
+
+`/compare <question>` asks every model (on-device, cloud, cloud pro,
+ollama) the same question, one at a time, and shows each answer as it
+comes back — useful for seeing how they actually differ on a given
+prompt. Uses history-free calls for all of them, so it never affects any
+model's real conversation; if one model errors (e.g. Ollama isn't
+running), that shows up as its answer instead of aborting the rest.
 
 ### Keybindings (TUI)
 
