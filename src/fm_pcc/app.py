@@ -876,6 +876,7 @@ class ChatApp(App):
         self._loop_cancel_requested = False
         self.subagent_roles: dict[str, str] = {"cloud": "cloud-pro", "core": "on-device"}
         self._message_log: list[Message] = []
+        self._undo_stack: list[dict] = []
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -987,6 +988,13 @@ class ChatApp(App):
             self.query_one("#status", Static).update("press ctrl+c again to quit…")
             self.set_timer(1.5, self._update_chrome)
 
+    UNDO_STACK_MAX = 20
+
+    def _push_undo(self, path: str, label: str, original: str) -> None:
+        self._undo_stack.append({"path": path, "label": label, "original": original})
+        if len(self._undo_stack) > self.UNDO_STACK_MAX:
+            self._undo_stack.pop(0)
+
     def _add_message(self, message: Message) -> MessageWidget:
         log = self.query_one("#log", VerticalScroll)
         widget = MessageWidget(message, model_color(self.model))
@@ -1006,6 +1014,7 @@ class ChatApp(App):
         "compare": "ask every model the same question: /compare <question>",
         "save": "save the conversation: /save <name>",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
+        "undo": "revert the last file write made by /edit or /task",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -1061,6 +1070,8 @@ class ChatApp(App):
             self._handle_save(arg)
         elif name == "resume":
             self._handle_resume(arg)
+        elif name == "undo":
+            self._handle_undo()
         elif name == "subagents":
             self._handle_subagents(arg)
         elif name == "edit":
@@ -1177,6 +1188,7 @@ class ChatApp(App):
                 )
                 with open(proposal["path"], "w") as f:
                     f.write(proposal["updated"])
+                self._push_undo(proposal["path"], proposal["label"], proposal["original"])
 
                 diff = diff_preview(proposal["original"], proposal["updated"])
                 self.call_from_thread(self._task_step_applied, proposal, diff)
@@ -1293,6 +1305,19 @@ class ChatApp(App):
         self.model = snapshot.get("model", self.model)
         self._update_chrome()
         self._add_message(Message("system", f"resumed session '{name}'"))
+
+    def _handle_undo(self) -> None:
+        if not self._undo_stack:
+            self._add_message(Message("system", "nothing to undo"))
+            return
+        entry = self._undo_stack.pop()
+        try:
+            with open(entry["path"], "w") as f:
+                f.write(entry["original"])
+        except OSError as e:
+            self._add_message(Message("system", f"couldn't undo write to {entry['label']}: {e}"))
+            return
+        self._add_message(Message("system", f"reverted {entry['label']}"))
 
     def _handle_subagents(self, arg: str) -> None:
         if not arg:
@@ -1434,6 +1459,7 @@ class ChatApp(App):
         try:
             with open(proposal["path"], "w") as f:
                 f.write(proposal["updated"])
+            self._push_undo(proposal["path"], proposal["label"], proposal["original"])
             self._add_message(Message("system", f"wrote {proposal['label']}"))
         except OSError as e:
             self._add_message(Message("system", f"failed to write {proposal['label']}: {e}"))

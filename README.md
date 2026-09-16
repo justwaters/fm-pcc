@@ -100,6 +100,7 @@ Slash commands, same spirit as `fm chat`:
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
+| `/undo`                      | Revert the last file write made by `/edit` or `/task`  |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -176,6 +177,12 @@ model/turn you were on, on-device's real transcript (so `fm respond
 cloud/cloud-pro/Ollama. `/resume <name>` clears the screen and restores
 all of that; `/resume` with no name lists what's saved instead of
 resuming anything.
+
+`/undo` reverts the most recent file write made by `/apply` or `/task`,
+restoring that file's exact prior content. It's a stack — repeated
+`/undo` walks back further, up to the last 20 writes across both
+commands — not a single-slot toggle, so it composes with a `/task` run
+that made several changes.
 
 ### Keybindings (TUI)
 
