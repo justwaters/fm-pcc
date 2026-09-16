@@ -98,6 +98,8 @@ Slash commands, same spirit as `fm chat`:
 | `/ask <question>`           | Research a question via cloud/core subagents (see below) |
 | `/subagents [cloud\|core] <model>` | Show or set which model plays each subagent role  |
 | `/compare <question>`       | Ask every model the same question, one at a time       |
+| `/save <name>`               | Save the conversation under a name                     |
+| `/resume [name]`             | Resume a saved conversation, or list saved ones        |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -166,6 +168,14 @@ comes back — useful for seeing how they actually differ on a given
 prompt. Uses history-free calls for all of them, so it never affects any
 model's real conversation; if one model errors (e.g. Ollama isn't
 running), that shows up as its answer instead of aborting the rest.
+
+`/save <name>` writes the current conversation to
+`~/.fm-pcc/sessions/<name>.json` — every message shown on screen, which
+model/turn you were on, on-device's real transcript (so `fm respond
+--resume` picks back up correctly), and the resend-as-text history for
+cloud/cloud-pro/Ollama. `/resume <name>` clears the screen and restores
+all of that; `/resume` with no name lists what's saved instead of
+resuming anything.
 
 ### Keybindings (TUI)
 

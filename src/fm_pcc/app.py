@@ -545,6 +545,7 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
+SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
 
 
 def _ollama_connect(host: str) -> http.client.HTTPConnection:
@@ -874,6 +875,7 @@ class ChatApp(App):
         self._loop_running = False
         self._loop_cancel_requested = False
         self.subagent_roles: dict[str, str] = {"cloud": "cloud-pro", "core": "on-device"}
+        self._message_log: list[Message] = []
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -970,6 +972,7 @@ class ChatApp(App):
     def action_reset(self) -> None:
         self.backend.reset()
         self.turn = 0
+        self._message_log = []
         self.query_one("#log", VerticalScroll).remove_children()
         self._update_chrome()
         self._add_message(Message("system", "conversation reset"))
@@ -989,6 +992,8 @@ class ChatApp(App):
         widget = MessageWidget(message, model_color(self.model))
         log.mount(widget)
         log.scroll_end(animate=False)
+        if message.role in ("user", "assistant"):
+            self._message_log.append(message)
         return widget
 
     COMMANDS = {
@@ -999,6 +1004,8 @@ class ChatApp(App):
         "ask": "research a question via cloud/core subagents: /ask <question>",
         "subagents": "show or set the cloud/core roles: /subagents [cloud|core] <model>",
         "compare": "ask every model the same question: /compare <question>",
+        "save": "save the conversation: /save <name>",
+        "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -1050,6 +1057,10 @@ class ChatApp(App):
                 return
             self.query_one(Input).disabled = True
             self._run_compare(arg)
+        elif name == "save":
+            self._handle_save(arg)
+        elif name == "resume":
+            self._handle_resume(arg)
         elif name == "subagents":
             self._handle_subagents(arg)
         elif name == "edit":
@@ -1192,6 +1203,96 @@ class ChatApp(App):
 
     def _log_progress(self, text: str) -> None:
         self._add_message(Message("system", text))
+
+    @staticmethod
+    def _sanitize_session_name(name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]", "_", name)
+
+    def _handle_save(self, arg: str) -> None:
+        name = arg.strip()
+        if not name:
+            self._add_message(Message("system", "usage: /save <name>"))
+            return
+
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        path = os.path.join(SESSIONS_DIR, f"{self._sanitize_session_name(name)}.json")
+
+        on_device_transcript = None
+        transcript_path = self.backend._transcript_path
+        if transcript_path and os.path.isfile(transcript_path):
+            try:
+                with open(transcript_path, "r") as f:
+                    on_device_transcript = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                on_device_transcript = None
+
+        snapshot = {
+            "model": self.model,
+            "turn": self.turn,
+            "messages": [{"role": m.role, "text": m.text} for m in self._message_log],
+            "on_device_transcript": on_device_transcript,
+            "cloud_history": self.backend._cloud_history,
+            "ollama_history": self.backend._ollama_history,
+        }
+        try:
+            with open(path, "w") as f:
+                json.dump(snapshot, f, indent=2)
+        except OSError as e:
+            self._add_message(Message("system", f"couldn't save session '{name}': {e}"))
+            return
+        self._add_message(Message("system", f"saved session '{name}'"))
+
+    def _handle_resume(self, arg: str) -> None:
+        name = arg.strip()
+        if not name:
+            try:
+                saved = sorted(
+                    f[:-5] for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")
+                )
+            except OSError:
+                saved = []
+            if not saved:
+                self._add_message(Message("system", "no saved sessions — try /save <name> first"))
+            else:
+                self._add_message(
+                    Message("system", "saved sessions:\n" + "\n".join(f"  {s}" for s in saved))
+                )
+            return
+
+        path = os.path.join(SESSIONS_DIR, f"{self._sanitize_session_name(name)}.json")
+        if not os.path.isfile(path):
+            self._add_message(Message("system", f"no saved session named '{name}'"))
+            return
+        try:
+            with open(path, "r") as f:
+                snapshot = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._add_message(Message("system", f"couldn't read session '{name}': {e}"))
+            return
+
+        self.backend._cloud_history = snapshot.get(
+            "cloud_history", {m: [] for m in CLOUD_SHORTCUTS}
+        )
+        self.backend._ollama_history = snapshot.get("ollama_history", {})
+
+        transcript = snapshot.get("on_device_transcript")
+        if transcript is not None:
+            transcript_path = os.path.join(tempfile.gettempdir(), f"fm-pcc-{uuid.uuid4().hex}.json")
+            with open(transcript_path, "w") as f:
+                json.dump(transcript, f)
+            self.backend._transcript_path = transcript_path
+        else:
+            self.backend._transcript_path = None
+
+        self.query_one("#log", VerticalScroll).remove_children()
+        self._message_log = []
+        for m in snapshot.get("messages", []):
+            self._add_message(Message(m["role"], m["text"]))
+
+        self.turn = snapshot.get("turn", 0)
+        self.model = snapshot.get("model", self.model)
+        self._update_chrome()
+        self._add_message(Message("system", f"resumed session '{name}'"))
 
     def _handle_subagents(self, arg: str) -> None:
         if not arg:
