@@ -1132,8 +1132,19 @@ class ChatApp(App):
                 "  esc esc         stop the current response/edit/task\n"
                 "  ctrl+c ctrl+c   quit"
             )
+            note = (
+                "note: fm-pcc's chat is text-only, but the underlying `fm` CLI "
+                "can also analyze images directly -- `fm respond --image "
+                "photo.jpg --tool ocr \"...\"` for reliable text extraction, or "
+                "`--tool barcode` to actually decode a barcode/QR code (without "
+                "the tool, the model just guesses at unreadable pixel patterns "
+                "like that). Not wired into fm-pcc's chat yet."
+            )
             self._add_message(
-                Message("system", f"commands:\n{commands}\n\nshortcuts:\n{shortcuts}")
+                Message(
+                    "system",
+                    f"commands:\n{commands}\n\nshortcuts:\n{shortcuts}\n\n{note}",
+                )
             )
         elif name == "model":
             if not arg:

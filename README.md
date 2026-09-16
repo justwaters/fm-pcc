@@ -216,6 +216,27 @@ transcript, and a stopped edit never reaches disk. `Ctrl+C` works the same
 way (first press warns, second quits), and also cancels anything running
 first so quitting mid-response doesn't hang waiting on it.
 
+### Image analysis (not yet in fm-pcc's chat)
+
+fm-pcc's chat is text-only for now, but the underlying `fm` CLI can also
+analyze images directly, with two built-in tools worth knowing about:
+
+```
+fm respond --image photo.jpg --tool ocr "transcribe the text in this image"
+fm respond --image photo.jpg --tool barcode "what does the barcode/QR code say?"
+```
+
+These aren't just prompt hints — they call real Vision framework requests
+(`VNRecognizeTextRequest`/`VNDetectBarcodesRequest`) rather than relying on
+the model's own vision understanding of the image pixels. That distinction
+matters in practice: asked to decode a QR code *without* `--tool barcode`,
+the model confidently returned a plausible-looking but entirely made-up
+value, since it has no real way to decode barcode pixel patterns; with the
+tool, it decoded correctly. Similarly, `--tool ocr` transcribed a
+multi-line block of dense text (including an alphanumeric reference code)
+exactly, where the model's unassisted reading of the same image dropped a
+character and a space.
+
 ## Limitations
 
 - Cloud/Cloud Pro's "multi-turn context" is just prior turns re-sent as
