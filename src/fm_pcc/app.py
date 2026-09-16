@@ -546,6 +546,30 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
+NOTIFY_MIN_SECONDS = 5.0
+
+
+def _applescript_string(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def notify(title: str, message: str) -> None:
+    """Best-effort desktop notification -- never raises, never blocks the
+    caller on anything but the (short, timed-out) osascript call itself.
+    """
+    try:
+        message = message.strip().replace("\n", " ")
+        if len(message) > 200:
+            message = message[:197] + "…"
+        script = (
+            f"display notification {_applescript_string(message)} "
+            f"with title {_applescript_string(title)}"
+        )
+        subprocess.run(
+            ["osascript", "-e", script], check=False, capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
 
 
 def _ollama_connect(host: str) -> http.client.HTTPConnection:
@@ -1134,6 +1158,7 @@ class ChatApp(App):
         self._loop_cancel_requested = False
         history: list[str] = []
         recent_instructions: list[str] = []
+        start_time = time.monotonic()
         try:
             candidates = sorted(
                 f for f in os.listdir(cwd)
@@ -1207,6 +1232,8 @@ class ChatApp(App):
         finally:
             self._loop_running = False
             self.call_from_thread(self._enable_input)
+            if time.monotonic() - start_time >= NOTIFY_MIN_SECONDS:
+                notify("fm-pcc", f"/task finished: {task}")
 
     def _task_step_applied(self, proposal: dict, diff: str) -> None:
         self._add_message(
@@ -1361,6 +1388,7 @@ class ChatApp(App):
         self._loop_cancel_requested = False
         cloud_model = self.subagent_roles["cloud"]
         core_model = self.subagent_roles["core"]
+        start_time = time.monotonic()
         try:
             self.call_from_thread(
                 self._log_progress, f"{model_label(cloud_model)} is thinking this through…"
@@ -1399,6 +1427,8 @@ class ChatApp(App):
         finally:
             self._loop_running = False
             self.call_from_thread(self._enable_input)
+            if time.monotonic() - start_time >= NOTIFY_MIN_SECONDS:
+                notify("fm-pcc", f"/ask finished: {question}")
 
     def _ask_answered(self, answer: str) -> None:
         self.turn += 1

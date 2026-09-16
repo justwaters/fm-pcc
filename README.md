@@ -184,6 +184,12 @@ restoring that file's exact prior content. It's a stack — repeated
 commands — not a single-slot toggle, so it composes with a `/task` run
 that made several changes.
 
+`/task` and `/ask` post a macOS notification when they finish, but only
+if the run took 5 seconds or longer — quick ones don't bother you. This
+is best-effort: it shells out to `osascript` and silently does nothing
+if that fails (e.g. notifications aren't permitted), rather than
+interrupting the run itself.
+
 ### Keybindings (TUI)
 
 | Key      | Action                                    |
