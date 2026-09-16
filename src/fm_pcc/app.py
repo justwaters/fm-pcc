@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
+from rich.markup import escape as rich_escape
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -52,6 +53,29 @@ MODEL_COLORS = {
     "ollama": "#9775fa",
 }
 MODEL_ORDER = ["on-device", "cloud", "cloud-pro", "ollama"]
+
+
+def model_label(model: str) -> str:
+    """Display label for a model id -- including a specific "ollama:<tag>"."""
+    if model in MODEL_LABELS:
+        return MODEL_LABELS[model]
+    if model.startswith("ollama:"):
+        return model.split(":", 1)[1]
+    return model
+
+
+def model_color(model: str) -> str:
+    """Accent color for a model id -- any "ollama:<tag>" gets ollama's color."""
+    if model in MODEL_COLORS:
+        return MODEL_COLORS[model]
+    if model.startswith("ollama:"):
+        return MODEL_COLORS["ollama"]
+    return MODEL_COLORS["on-device"]
+
+
+def model_family(model: str) -> str:
+    """Collapse a specific "ollama:<tag>" back to the general "ollama" family."""
+    return "ollama" if model.startswith("ollama:") else model
 
 # Each of these is a "Use Model" Shortcut (Receive input -> Use <tier> model,
 # bound to Shortcut Input -> Stop and Output Response) sharing the same
@@ -384,6 +408,61 @@ def pick_section(task: str, filename: str, sections: list[dict], backend: "Backe
     return sections[index]
 
 
+ASK_MAX_SUBQUESTIONS = 8
+
+
+def decompose_question(question: str, backend: "Backend", model: str) -> dict:
+    """Ask the "cloud" role to either answer directly, or split into
+    sub-questions for the "core" role to research first.
+
+    Returns {"answer": str} if it answered directly, or
+    {"subquestions": [str, ...]} if it decomposed. If the reply doesn't
+    match either expected shape, it's treated as a direct answer rather
+    than raising -- a plain but usable reply beats a hard failure here.
+    """
+    prompt = (
+        f"Question: {question}\n\n"
+        "If this is simple enough to answer directly and completely, reply "
+        "with exactly:\nANSWER: <your answer>\n\n"
+        "If it would be answered better by researching a few simpler "
+        "sub-questions first, reply with exactly:\nSUBQUESTIONS:\n"
+        "1. <sub-question>\n2. <sub-question>\n"
+        f"(as many as needed, no more than {ASK_MAX_SUBQUESTIONS})"
+    )
+    reply = backend.classify(prompt, model).strip()
+    upper = reply.upper()
+
+    if upper.startswith("ANSWER:"):
+        return {"answer": reply.split(":", 1)[1].strip()}
+
+    if upper.startswith("SUBQUESTIONS:"):
+        # Numbering was requested but isn't always honored -- treat every
+        # non-empty line as one sub-question, stripping a leading
+        # "1.", "2)", "-", or "*" if present rather than requiring one.
+        subquestions = []
+        for line in reply.split(":", 1)[1].splitlines():
+            line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
+            if line:
+                subquestions.append(line)
+        if subquestions:
+            return {"subquestions": subquestions[:ASK_MAX_SUBQUESTIONS]}
+
+    return {"answer": reply}
+
+
+def synthesize_answer(
+    question: str, subanswers: list[tuple[str, str]], backend: "Backend", model: str
+) -> str:
+    """Ask the "cloud" role to combine sub-answers into one final answer."""
+    research = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in subanswers)
+    prompt = (
+        f"Original question: {question}\n\nResearch:\n{research}\n\n"
+        "Using this research, write one clear, complete final answer to the "
+        "original question."
+    )
+    return backend.classify(prompt, model).strip()
+
+
 def _gradient(text: str, start: str, end: str) -> Text:
     """Render `text` with a per-character color ramp from `start` to `end`."""
     sr, sg, sb = (int(start[i : i + 2], 16) for i in (1, 3, 5))
@@ -577,7 +656,7 @@ class Backend:
         self.ollama_model = ollama_model
         self.ollama_host = ollama_host
         self._ollama_resolved_model: str | None = None
-        self._ollama_history: list[dict[str, str]] = []
+        self._ollama_history: dict[str, list[dict[str, str]]] = {}
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
@@ -591,11 +670,16 @@ class Backend:
     def respond(self, prompt: str, model: str) -> str:
         if model == "on-device":
             return self._respond_on_device(prompt)
-        if model == "ollama":
-            return self._respond_ollama(prompt)
+        if model == "ollama" or model.startswith("ollama:"):
+            return self._respond_ollama(prompt, model)
         return self._respond_cloud(prompt, model)
 
-    def _resolve_ollama_model(self) -> str:
+    def _resolve_ollama_model(self, model: str = "ollama") -> str:
+        """`model` is either the generic "ollama" (auto-resolve) or a
+        specific "ollama:<tag>" picked directly, e.g. from the /model menu.
+        """
+        if model.startswith("ollama:"):
+            return model.split(":", 1)[1]
         if self.ollama_model:
             return self.ollama_model
         if self._ollama_resolved_model:
@@ -608,15 +692,16 @@ class Backend:
         self._ollama_resolved_model = models[0]
         return self._ollama_resolved_model
 
-    def _respond_ollama(self, prompt: str) -> str:
-        model = self._resolve_ollama_model()
-        self._ollama_history.append({"role": "user", "content": prompt})
+    def _respond_ollama(self, prompt: str, model: str) -> str:
+        tag = self._resolve_ollama_model(model)
+        history = self._ollama_history.setdefault(tag, [])
+        history.append({"role": "user", "content": prompt})
         try:
-            text = _ollama_chat(model, self._ollama_history, self.ollama_host)
+            text = _ollama_chat(tag, history, self.ollama_host)
         except Exception:
-            self._ollama_history.pop()  # don't keep a failed turn in context
+            history.pop()  # don't keep a failed turn in context
             raise
-        self._ollama_history.append({"role": "assistant", "content": text})
+        history.append({"role": "assistant", "content": text})
         return text
 
     def _respond_on_device(self, prompt: str) -> str:
@@ -675,9 +760,11 @@ class Backend:
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "fm respond failed")
             return result.stdout.strip()
-        if model == "ollama":
+        if model == "ollama" or model.startswith("ollama:"):
             return _ollama_chat(
-                self._resolve_ollama_model(), [{"role": "user", "content": prompt}], self.ollama_host
+                self._resolve_ollama_model(model),
+                [{"role": "user", "content": prompt}],
+                self.ollama_host,
             )
         return self._run_shortcut(model, prompt)
 
@@ -704,14 +791,14 @@ class MessageWidget(Static):
 
     def __init__(self, message: Message, accent: str):
         if message.role == "user":
-            body = Text.from_markup(f"[#7b838a]you ›[/] {message.text}")
+            body = Text.from_markup(f"[#7b838a]you ›[/] {rich_escape(message.text)}")
         elif message.role == "assistant":
             prefix = Text("fm-pcc ›", style=f"bold {accent}")
             body = Text.assemble(prefix, " ", message.text)
         elif message.role == "thinking":
             body = Text.from_markup(f"[{accent}]· thinking…[/]")
         else:
-            body = Text.from_markup(f"[#7b838a italic]{message.text}[/]")
+            body = Text.from_markup(f"[#7b838a italic]{rich_escape(message.text)}[/]")
         super().__init__(body)
         self.add_class(f"msg-{message.role}")
 
@@ -779,8 +866,9 @@ class ChatApp(App):
         self._suppress_palette_once = False
         self._last_escape_time = 0.0
         self._last_quit_time = 0.0
-        self._task_running = False
-        self._task_cancel_requested = False
+        self._loop_running = False
+        self._loop_cancel_requested = False
+        self.subagent_roles: dict[str, str] = {"cloud": "cloud-pro", "core": "on-device"}
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -808,34 +896,60 @@ class ChatApp(App):
     NORMAL_INPUT_COLOR = "#e7e5dd"
 
     def _update_chrome(self) -> None:
-        accent = MODEL_COLORS[self.model]
+        accent = model_color(self.model)
         self.query_one("#subtitle", Static).update(
-            f" model: {MODEL_LABELS[self.model]} · /help for help"
+            f" model: {model_label(self.model)} · /help for help"
         )
         self.query_one("#status", Static).update(
-            f"{MODEL_LABELS[self.model]} · turn {self.turn}"
+            f"{model_label(self.model)} · turn {self.turn}"
         )
         self.query_one("#inputbar").styles.border = ("round", accent)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
         self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR
 
     def action_toggle_model(self) -> None:
-        next_index = (MODEL_ORDER.index(self.model) + 1) % len(MODEL_ORDER)
+        next_index = (MODEL_ORDER.index(model_family(self.model)) + 1) % len(MODEL_ORDER)
         self._select_model(MODEL_ORDER[next_index])
 
     def _select_model(self, model: str) -> None:
         if model == self.model:
             return
         self.model = model
-        self._add_message(Message("system", f"switched to {MODEL_LABELS[self.model]}"))
+        self._add_message(Message("system", f"switched to {model_label(self.model)}"))
 
     def _open_model_picker(self) -> None:
         palette = self.query_one("#palette", OptionList)
         palette.clear_options()
+
+        try:
+            ollama_models = _ollama_list_models(self.backend.ollama_host)
+        except Exception:
+            ollama_models = []
+
+        # `None` marks a non-selectable group header -- only "ollama" gets
+        # one, to show its locally installed models as a tree underneath.
+        entries: list[str | None] = []
         for key in MODEL_ORDER:
-            marker = "● " if key == self.model else "○ "
-            palette.add_option(Option(f"{marker}{MODEL_LABELS[key]}", id=key))
-        palette.highlighted = MODEL_ORDER.index(self.model)
+            if key == "ollama" and ollama_models:
+                entries.append(None)
+                entries.extend(f"ollama:{tag}" for tag in ollama_models)
+            else:
+                entries.append(key)
+
+        for i, entry in enumerate(entries):
+            if entry is None:
+                palette.add_option(Option("ollama", id="_header_ollama", disabled=True))
+                continue
+            marker = "● " if entry == self.model else "○ "
+            if entry.startswith("ollama:"):
+                branch = "└─" if i == len(entries) - 1 else "├─"
+                palette.add_option(Option(f"{branch} {marker}{model_label(entry)}", id=entry))
+            else:
+                palette.add_option(Option(f"{marker}{model_label(entry)}", id=entry))
+
+        selectable = [e for e in entries if e is not None]
+        highlight_target = self.model if self.model in selectable else selectable[0]
+        palette.highlighted = next(i for i, e in enumerate(entries) if e == highlight_target)
         palette.display = True
         palette.focus()
         self._model_picker_active = True
@@ -867,7 +981,7 @@ class ChatApp(App):
 
     def _add_message(self, message: Message) -> MessageWidget:
         log = self.query_one("#log", VerticalScroll)
-        widget = MessageWidget(message, MODEL_COLORS[self.model])
+        widget = MessageWidget(message, model_color(self.model))
         log.mount(widget)
         log.scroll_end(animate=False)
         return widget
@@ -877,6 +991,8 @@ class ChatApp(App):
         "model": "open a menu to switch models, or /model <name> directly",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
         "task": "run a multi-step edit loop, writing as it goes: /task <description>",
+        "ask": "research a question via cloud/core subagents: /ask <question>",
+        "subagents": "show or set the cloud/core roles: /subagents [cloud|core] <model>",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -892,7 +1008,7 @@ class ChatApp(App):
         if name == "help":
             commands = "\n".join(f"  /{cmd:<7} {desc}" for cmd, desc in self.COMMANDS.items())
             shortcuts = (
-                "  ctrl+t          cycle on-device / cloud / cloud pro\n"
+                "  ctrl+t          cycle on-device / cloud / cloud pro / ollama\n"
                 "  ctrl+r          start a new conversation\n"
                 "  enter           send your message\n"
                 "  ↑ / ↓           step through what you've sent\n"
@@ -905,13 +1021,25 @@ class ChatApp(App):
         elif name == "model":
             if not arg:
                 self._open_model_picker()
-            elif arg in MODEL_LABELS:
+            elif arg in MODEL_LABELS or arg.startswith("ollama:"):
                 self._select_model(arg)
             else:
                 choices = ", ".join(MODEL_ORDER)
                 self._add_message(
-                    Message("system", f"unknown model '{arg}' — try one of: {choices}")
+                    Message(
+                        "system",
+                        f"unknown model '{arg}' — try one of: {choices}, "
+                        f"or ollama:<name> for a specific local model",
+                    )
                 )
+        elif name == "ask":
+            if not arg:
+                self._add_message(Message("system", "usage: /ask <question>"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_ask(arg)
+        elif name == "subagents":
+            self._handle_subagents(arg)
         elif name == "edit":
             edit_parts = arg.split(maxsplit=1)
             if len(edit_parts) < 2:
@@ -968,8 +1096,8 @@ class ChatApp(App):
         on step count is hit.
         """
         cwd = os.getcwd()
-        self._task_running = True
-        self._task_cancel_requested = False
+        self._loop_running = True
+        self._loop_cancel_requested = False
         history: list[str] = []
         recent_instructions: list[str] = []
         try:
@@ -981,17 +1109,19 @@ class ChatApp(App):
                 raise EditError("no files in the current directory")
 
             for step in range(1, self.TASK_MAX_STEPS + 1):
-                if self._task_cancel_requested:
-                    self.call_from_thread(self._task_progress, "stopped")
+                if self._loop_cancel_requested:
+                    self.call_from_thread(self._log_progress, "stopped")
                     break
 
                 self.call_from_thread(
-                    self._task_progress, f"step {step}: deciding what to do next…"
+                    self._log_progress, f"step {step}: deciding what to do next…"
                 )
-                plan = plan_next_step(task, candidates, cwd, history, self.backend, "cloud-pro")
+                plan = plan_next_step(
+                    task, candidates, cwd, history, self.backend, self.subagent_roles["cloud"]
+                )
                 if plan is None:
                     self.call_from_thread(
-                        self._task_progress,
+                        self._log_progress,
                         f"done after {step - 1} step(s)."
                         if step > 1 else "nothing to do -- task already satisfied.",
                     )
@@ -1001,7 +1131,7 @@ class ChatApp(App):
 
                 if is_stalling(instructions, recent_instructions):
                     self.call_from_thread(
-                        self._task_progress,
+                        self._log_progress,
                         f"stopped: step {step} looks like a repeat of a recent "
                         f"step, not real progress -- {filename}: {instructions}",
                     )
@@ -1009,13 +1139,15 @@ class ChatApp(App):
                 recent_instructions.append(instructions)
 
                 self.call_from_thread(
-                    self._task_progress, f"step {step}: {filename} — {instructions}"
+                    self._log_progress, f"step {step}: {filename} — {instructions}"
                 )
 
                 with open(os.path.join(cwd, filename), "r", errors="replace") as f:
                     content = f.read()
                 sections = split_sections(content, filename)
-                section = pick_section(instructions, filename, sections, self.backend, "cloud-pro")
+                section = pick_section(
+                    instructions, filename, sections, self.backend, self.subagent_roles["cloud"]
+                )
 
                 proposal = propose_edit(
                     filename, instructions, cwd, line_range=(section["start"], section["end"])
@@ -1028,17 +1160,17 @@ class ChatApp(App):
                 history.append(f"{filename}: {proposal['summary']}")
             else:
                 self.call_from_thread(
-                    self._task_progress,
+                    self._log_progress,
                     f"stopped after {self.TASK_MAX_STEPS} steps (safety limit)",
                 )
         except GenerationCancelled:
-            self.call_from_thread(self._task_progress, "stopped")
+            self.call_from_thread(self._log_progress, "stopped")
         except EditError as e:
-            self.call_from_thread(self._task_progress, f"error: {e}")
+            self.call_from_thread(self._log_progress, f"error: {e}")
         except Exception as e:
-            self.call_from_thread(self._task_progress, f"error: task failed: {e}")
+            self.call_from_thread(self._log_progress, f"error: task failed: {e}")
         finally:
-            self._task_running = False
+            self._loop_running = False
             self.call_from_thread(self._enable_input)
 
     def _task_step_applied(self, proposal: dict, diff: str) -> None:
@@ -1046,8 +1178,94 @@ class ChatApp(App):
             Message("system", f"wrote {proposal['label']}: {proposal['summary']}\n\n{diff}")
         )
 
-    def _task_progress(self, text: str) -> None:
+    def _log_progress(self, text: str) -> None:
         self._add_message(Message("system", text))
+
+    def _handle_subagents(self, arg: str) -> None:
+        if not arg:
+            lines = "\n".join(
+                f"  {role} → {model_label(model)}" for role, model in self.subagent_roles.items()
+            )
+            self._add_message(
+                Message(
+                    "system",
+                    f"subagent roles (used by /ask and /task):\n{lines}\n\n"
+                    f"set with: /subagents [cloud|core] <model>",
+                )
+            )
+            return
+
+        parts = arg.split(maxsplit=1)
+        valid_model = len(parts) == 2 and (parts[1] in MODEL_ORDER or parts[1].startswith("ollama:"))
+        if len(parts) != 2 or parts[0] not in self.subagent_roles or not valid_model:
+            choices = ", ".join(MODEL_ORDER)
+            self._add_message(
+                Message(
+                    "system",
+                    f"usage: /subagents [cloud|core] <model> — model must be one "
+                    f"of: {choices}, or ollama:<name>",
+                )
+            )
+            return
+
+        role, model = parts
+        self.subagent_roles[role] = model
+        self._add_message(Message("system", f"{role} → {model_label(model)}"))
+
+    @work(thread=True)
+    def _run_ask(self, question: str) -> None:
+        """Orchestrator/worker for Q&A: the "cloud" role either answers
+        directly or splits the question into sub-questions, each dispatched
+        to the "core" role, then "cloud" synthesizes a final answer from
+        that research. Read-only -- no files are touched.
+        """
+        self._loop_running = True
+        self._loop_cancel_requested = False
+        cloud_model = self.subagent_roles["cloud"]
+        core_model = self.subagent_roles["core"]
+        try:
+            self.call_from_thread(
+                self._log_progress, f"{model_label(cloud_model)} is thinking this through…"
+            )
+            plan = decompose_question(question, self.backend, cloud_model)
+
+            if "answer" in plan:
+                self.call_from_thread(self._ask_answered, plan["answer"])
+                return
+
+            subquestions = plan["subquestions"]
+            self.call_from_thread(
+                self._log_progress,
+                f"breaking this into {len(subquestions)} sub-question(s) for "
+                f"{model_label(core_model)}…",
+            )
+
+            subanswers = []
+            for i, subq in enumerate(subquestions, start=1):
+                if self._loop_cancel_requested:
+                    self.call_from_thread(self._log_progress, "stopped")
+                    return
+                self.call_from_thread(self._log_progress, f"  {i}. {subq}")
+                answer = self.backend.classify(subq, core_model)
+                subanswers.append((subq, answer))
+
+            self.call_from_thread(
+                self._log_progress, f"{model_label(cloud_model)} is synthesizing an answer…"
+            )
+            final = synthesize_answer(question, subanswers, self.backend, cloud_model)
+            self.call_from_thread(self._ask_answered, final)
+        except GenerationCancelled:
+            self.call_from_thread(self._log_progress, "stopped")
+        except Exception as e:
+            self.call_from_thread(self._log_progress, f"error: ask failed: {e}")
+        finally:
+            self._loop_running = False
+            self.call_from_thread(self._enable_input)
+
+    def _ask_answered(self, answer: str) -> None:
+        self.turn += 1
+        self._add_message(Message("assistant", answer))
+        self._update_chrome()
 
     def _show_edit_proposal(self, proposal: dict, diff: str) -> None:
         if self._thinking is not None:
@@ -1277,8 +1495,8 @@ class ChatApp(App):
         now = time.monotonic()
         if self._last_escape_time and now - self._last_escape_time < 1.5:
             self._last_escape_time = 0.0
-            if self._task_running:
-                self._task_cancel_requested = True
+            if self._loop_running:
+                self._loop_cancel_requested = True
             cancel_active_process()
         else:
             self._last_escape_time = now
@@ -1314,6 +1532,15 @@ def _shortcut_overrides(args: argparse.Namespace) -> dict[str, str]:
     return overrides
 
 
+def _model_arg(value: str) -> str:
+    if value in MODEL_ORDER or value.startswith("ollama:"):
+        return value
+    choices = ", ".join(MODEL_ORDER)
+    raise argparse.ArgumentTypeError(
+        f"invalid choice: {value!r} (choose from {choices}, or ollama:<name>)"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="fm-pcc",
@@ -1323,11 +1550,11 @@ def main() -> None:
 
     respond_p = sub.add_parser("respond", help="Non-interactive one-shot response")
     respond_p.add_argument("prompt", nargs="?", help="Prompt (reads stdin if omitted)")
-    respond_p.add_argument("-m", "--model", default="cloud-pro", choices=MODEL_ORDER)
+    respond_p.add_argument("-m", "--model", default="cloud-pro", type=_model_arg)
     _add_shortcut_args(respond_p)
 
     parser.add_argument(
-        "-m", "--model", default="on-device", choices=MODEL_ORDER,
+        "-m", "--model", default="on-device", type=_model_arg,
         help="Starting model for the chat TUI (default: on-device)",
     )
     _add_shortcut_args(parser)

@@ -20,8 +20,10 @@ by driving a "Use Model" Shortcut for each cloud tier instead.
 - **Ollama** — talks to a local `ollama serve` over HTTP (`/api/chat`,
   stdlib `http.client`, no extra dependency), passing real multi-turn
   message history natively instead of the resend-as-text approximation the
-  Shortcuts-backed tiers need. If no model is specified, it uses whichever
-  one `ollama list` returns first.
+  Shortcuts-backed tiers need. Every locally installed model shows up as
+  its own entry in the `/model` menu (`ollama:<name>`), each with
+  independent conversation history; picking bare `ollama` auto-resolves to
+  whichever one `ollama list` returns first.
 
 ## Requirements
 
@@ -85,10 +87,12 @@ Slash commands, same spirit as `fm chat`:
 
 | Command                     | Action                                              |
 |-----------------------------|-------------------------------------------------------|
-| `/model`                    | Open a menu to pick a model (`↑`/`↓`, `Enter`/`Tab`)   |
-| `/model <name>`             | Switch directly (`on-device`, `cloud`, `cloud-pro`, `ollama`) |
+| `/model`                    | Open a menu to pick a model (`↑`/`↓`, `Enter`/`Tab`) — locally installed Ollama models are listed individually in a tree under `ollama` |
+| `/model <name>`             | Switch directly — `on-device`, `cloud`, `cloud-pro`, `ollama`, or `ollama:<name>` for a specific local model |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
 | `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
+| `/ask <question>`           | Research a question via cloud/core subagents (see below) |
+| `/subagents [cloud\|core] <model>` | Show or set which model plays each subagent role  |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -132,6 +136,24 @@ practice) — if it looks like a repeat, the loop stops immediately with a
 compounding the damage. It's a mitigation, not a fix for the underlying
 cause: `/task` is best suited to clean, additive changes, and worth
 watching (or interrupting) on anything that requires cleanup.
+
+`/subagents` controls which model plays each of two roles, **cloud**
+(planning/judgment calls — defaults to `cloud-pro`) and **core**
+(fast/local execution — defaults to `on-device`), used by both `/task`
+(its planning and section-picking) and `/ask` (below). Either role can be
+set to any model, including a specific `ollama:<name>`. One thing this
+*doesn't* change: `/task`'s actual file-writing step always runs on-device
+regardless of the "core" setting, since it's the only backend with the
+guided-generation schema support editing requires — this is a real
+technical constraint, not a default that "core" can override.
+
+`/ask <question>` is a similar orchestrator/worker pattern applied to
+research instead of editing, entirely read-only. The **cloud** role either
+answers directly (if it's confident it can) or splits the question into a
+few sub-questions; each sub-question is dispatched to the **core** role;
+then **cloud** synthesizes a final answer from that research. Cheap
+questions just get answered directly in one round-trip — decomposition
+only kicks in when the cloud role itself judges it would help.
 
 ### Keybindings (TUI)
 
