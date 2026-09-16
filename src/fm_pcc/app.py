@@ -28,6 +28,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
+from rich.console import Group
+from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 from rich.text import Text
 from textual import events, work
@@ -794,7 +796,10 @@ class MessageWidget(Static):
             body = Text.from_markup(f"[#7b838a]you ›[/] {rich_escape(message.text)}")
         elif message.role == "assistant":
             prefix = Text("fm-pcc ›", style=f"bold {accent}")
-            body = Text.assemble(prefix, " ", message.text)
+            # Cloud/Ollama replies routinely come back as markdown (headers,
+            # lists, bold); plain-text replies render through Markdown
+            # unchanged, so this is a safe default for either.
+            body = Group(prefix, Markdown(message.text))
         elif message.role == "thinking":
             body = Text.from_markup(f"[{accent}]· thinking…[/]")
         else:

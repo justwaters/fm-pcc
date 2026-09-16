@@ -73,6 +73,10 @@ fm-pcc --model ollama --ollama-model llama3.2   # ...or a specific one
 
 ### In the chat
 
+Replies are rendered as markdown (headings, bold, lists, code blocks) —
+cloud/Ollama models routinely answer in markdown, and plain text renders
+through unchanged either way.
+
 Reference a local file by mentioning `@path/to/file` anywhere in your
 message (relative to wherever you ran `fm-pcc`, or an absolute path) — its
 contents get inlined into what's actually sent to the model, and fm-pcc
