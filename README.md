@@ -73,6 +73,11 @@ fm-pcc --model ollama --ollama-model llama3.2   # ...or a specific one
 
 ### In the chat
 
+On startup, if the current directory is a git repo and/or has a README,
+fm-pcc shows a one-line orientation note (repo name, file count, the
+README's first line) — no model call involved, just local filesystem
+and `git rev-parse`.
+
 Replies are rendered as markdown (headings, bold, lists, code blocks) —
 cloud/Ollama models routinely answer in markdown, and plain text renders
 through unchanged either way.
@@ -80,7 +85,10 @@ through unchanged either way.
 Reference a local file by mentioning `@path/to/file` anywhere in your
 message (relative to wherever you ran `fm-pcc`, or an absolute path) — its
 contents get inlined into what's actually sent to the model, and fm-pcc
-shows an `attached: ...` note so you can see what went out.
+shows an `attached: ...` note so you can see what went out. `@readme` is a
+special case that resolves to whichever README variant actually exists
+(`README.md`, `README`, `README.rst`, ...) since the real filename varies
+by project.
 
 Type `/` and a live palette pops up above the input, filtering as you keep
 typing — same as Claude Code or the Gemini CLI. `↑`/`↓` moves the

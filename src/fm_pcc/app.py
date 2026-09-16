@@ -95,26 +95,42 @@ CLOUD_SHORTCUTS = {
 
 _FILE_REF_RE = re.compile(r"@(\S+)")
 MAX_FILE_CHARS = 8000
+README_NAMES = ["README.md", "README.rst", "README.txt", "README", "readme.md", "Readme.md"]
+
+
+def find_readme(cwd: str) -> str | None:
+    for name in README_NAMES:
+        path = os.path.join(cwd, name)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def expand_file_references(prompt: str, cwd: str) -> tuple[str, list[str]]:
     """Inline the contents of any @path/to/file mentions found in `prompt`.
 
     Paths are resolved relative to `cwd` unless already absolute (~ is
-    expanded too). Mentions that don't resolve to a readable file are left
-    alone -- so stray "@" text (an email, a handle) is harmless. Returns the
-    prompt with file contents appended, and the list of resolved labels for
-    display.
+    expanded too). `@readme` is a special alias that resolves to whichever
+    actual README variant exists in `cwd` (README.md, README, etc.), since
+    the real filename/extension varies by project. Mentions that don't
+    resolve to a readable file are left alone -- so stray "@" text (an
+    email, a handle) is harmless. Returns the prompt with file contents
+    appended, and the list of resolved labels for display.
     """
     attachments: list[str] = []
     seen: set[str] = set()
     extra = ""
 
     for ref in _FILE_REF_RE.findall(prompt):
-        path = os.path.expanduser(ref)
-        if not os.path.isabs(path):
-            path = os.path.join(cwd, path)
-        path = os.path.normpath(path)
+        if ref.lower() == "readme":
+            path = find_readme(cwd)
+            if path is None:
+                continue
+        else:
+            path = os.path.expanduser(ref)
+            if not os.path.isabs(path):
+                path = os.path.join(cwd, path)
+            path = os.path.normpath(path)
 
         if path in seen or not os.path.isfile(path):
             continue
@@ -549,6 +565,58 @@ SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
 NOTIFY_MIN_SECONDS = 5.0
 
 
+def _git_repo_name(cwd: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return os.path.basename(result.stdout.strip().rstrip("/"))
+
+
+def _readme_first_line(path: str) -> str | None:
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                stripped = line.strip().lstrip("#").strip()
+                if stripped:
+                    return stripped
+    except OSError:
+        return None
+    return None
+
+
+def launch_context_hint(cwd: str) -> str | None:
+    """Best-effort one-line orientation shown on startup: the git repo name
+    and a file count if `cwd` is inside a repo, plus the README's first
+    non-empty line if one exists. Never raises; returns None if there's
+    nothing worth showing (not a repo, no README).
+    """
+    parts = []
+    repo_name = _git_repo_name(cwd)
+    if repo_name:
+        try:
+            file_count = sum(
+                1 for f in os.listdir(cwd)
+                if os.path.isfile(os.path.join(cwd, f)) and not f.startswith(".")
+            )
+            parts.append(f"git repo '{repo_name}' ({file_count} files here)")
+        except OSError:
+            parts.append(f"git repo '{repo_name}'")
+
+    readme_path = find_readme(cwd)
+    if readme_path:
+        first_line = _readme_first_line(readme_path)
+        if first_line:
+            parts.append(f"README: {first_line}")
+
+    return " · ".join(parts) if parts else None
+
+
 def _applescript_string(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -921,6 +989,9 @@ class ChatApp(App):
         )
         self.query_one(Input).focus()
         self._update_chrome()
+        hint = launch_context_hint(os.getcwd())
+        if hint:
+            self._add_message(Message("system", hint))
 
     def watch_model(self, _value: str) -> None:
         self._update_chrome()
