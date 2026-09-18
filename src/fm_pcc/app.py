@@ -430,8 +430,8 @@ ASK_MAX_SUBQUESTIONS = 8
 
 
 def decompose_question(question: str, backend: "Backend", model: str) -> dict:
-    """Ask the "cloud" role to either answer directly, or split into
-    sub-questions for the "core" role to research first.
+    """Ask the "planning" role to either answer directly, or split into
+    sub-questions for the "building" role to research first.
 
     Returns {"answer": str} if it answered directly, or
     {"subquestions": [str, ...]} if it decomposed. If the reply doesn't
@@ -471,7 +471,7 @@ def decompose_question(question: str, backend: "Backend", model: str) -> dict:
 def synthesize_answer(
     question: str, subanswers: list[tuple[str, str]], backend: "Backend", model: str
 ) -> str:
-    """Ask the "cloud" role to combine sub-answers into one final answer."""
+    """Ask the "planning" role to combine sub-answers into one final answer."""
     research = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in subanswers)
     prompt = (
         f"Original question: {question}\n\nResearch:\n{research}\n\n"
@@ -966,7 +966,7 @@ class ChatApp(App):
         self._last_quit_time = 0.0
         self._loop_running = False
         self._loop_cancel_requested = False
-        self.subagent_roles: dict[str, str] = {"cloud": "cloud-pro", "core": "on-device"}
+        self.subagent_roles: dict[str, str] = {"planning": "cloud-pro", "building": "on-device"}
         self._message_log: list[Message] = []
         self._undo_stack: list[dict] = []
 
@@ -1105,7 +1105,7 @@ class ChatApp(App):
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
         "task": "run a multi-step edit loop, writing as it goes: /task <description>",
         "ask": "research a question via cloud/core subagents: /ask <question>",
-        "subagents": "show or set the cloud/core roles: /subagents [cloud|core] <model>",
+        "subagents": "show or set the planning/building roles: /subagents [planning|building] <model>",
         "compare": "ask every model the same question: /compare <question>",
         "save": "save the conversation: /save <name>",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
@@ -1258,7 +1258,7 @@ class ChatApp(App):
                     self._log_progress, f"step {step}: deciding what to do next…"
                 )
                 plan = plan_next_step(
-                    task, candidates, cwd, history, self.backend, self.subagent_roles["cloud"]
+                    task, candidates, cwd, history, self.backend, self.subagent_roles["planning"]
                 )
                 if plan is None:
                     self.call_from_thread(
@@ -1287,7 +1287,7 @@ class ChatApp(App):
                     content = f.read()
                 sections = split_sections(content, filename)
                 section = pick_section(
-                    instructions, filename, sections, self.backend, self.subagent_roles["cloud"]
+                    instructions, filename, sections, self.backend, self.subagent_roles["planning"]
                 )
 
                 proposal = propose_edit(
@@ -1437,7 +1437,7 @@ class ChatApp(App):
                 Message(
                     "system",
                     f"subagent roles (used by /ask and /task):\n{lines}\n\n"
-                    f"set with: /subagents [cloud|core] <model>",
+                    f"set with: /subagents [planning|building] <model>",
                 )
             )
             return
@@ -1449,8 +1449,8 @@ class ChatApp(App):
             self._add_message(
                 Message(
                     "system",
-                    f"usage: /subagents [cloud|core] <model> — model must be one "
-                    f"of: {choices}, or ollama:<name>",
+                    f"usage: /subagents [planning|building] <model> — model must be "
+                    f"one of: {choices}, or ollama:<name>",
                 )
             )
             return
@@ -1461,21 +1461,21 @@ class ChatApp(App):
 
     @work(thread=True)
     def _run_ask(self, question: str) -> None:
-        """Orchestrator/worker for Q&A: the "cloud" role either answers
+        """Orchestrator/worker for Q&A: the "planning" role either answers
         directly or splits the question into sub-questions, each dispatched
-        to the "core" role, then "cloud" synthesizes a final answer from
-        that research. Read-only -- no files are touched.
+        to the "building" role, then "planning" synthesizes a final answer
+        from that research. Read-only -- no files are touched.
         """
         self._loop_running = True
         self._loop_cancel_requested = False
-        cloud_model = self.subagent_roles["cloud"]
-        core_model = self.subagent_roles["core"]
+        planning_model = self.subagent_roles["planning"]
+        building_model = self.subagent_roles["building"]
         start_time = time.monotonic()
         try:
             self.call_from_thread(
-                self._log_progress, f"{model_label(cloud_model)} is thinking this through…"
+                self._log_progress, f"{model_label(planning_model)} is thinking this through…"
             )
-            plan = decompose_question(question, self.backend, cloud_model)
+            plan = decompose_question(question, self.backend, planning_model)
 
             if "answer" in plan:
                 self.call_from_thread(self._ask_answered, plan["answer"])
@@ -1485,7 +1485,7 @@ class ChatApp(App):
             self.call_from_thread(
                 self._log_progress,
                 f"breaking this into {len(subquestions)} sub-question(s) for "
-                f"{model_label(core_model)}…",
+                f"{model_label(building_model)}…",
             )
 
             subanswers = []
@@ -1494,13 +1494,13 @@ class ChatApp(App):
                     self.call_from_thread(self._log_progress, "stopped")
                     return
                 self.call_from_thread(self._log_progress, f"  {i}. {subq}")
-                answer = self.backend.classify(subq, core_model)
+                answer = self.backend.classify(subq, building_model)
                 subanswers.append((subq, answer))
 
             self.call_from_thread(
-                self._log_progress, f"{model_label(cloud_model)} is synthesizing an answer…"
+                self._log_progress, f"{model_label(planning_model)} is synthesizing an answer…"
             )
-            final = synthesize_answer(question, subanswers, self.backend, cloud_model)
+            final = synthesize_answer(question, subanswers, self.backend, planning_model)
             self.call_from_thread(self._ask_answered, final)
         except GenerationCancelled:
             self.call_from_thread(self._log_progress, "stopped")

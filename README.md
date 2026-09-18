@@ -104,7 +104,7 @@ Slash commands, same spirit as `fm chat`:
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
 | `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
 | `/ask <question>`           | Research a question via cloud/core subagents (see below) |
-| `/subagents [cloud\|core] <model>` | Show or set which model plays each subagent role  |
+| `/subagents [planning\|building] <model>` | Show or set which model plays each subagent role  |
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
@@ -153,23 +153,24 @@ compounding the damage. It's a mitigation, not a fix for the underlying
 cause: `/task` is best suited to clean, additive changes, and worth
 watching (or interrupting) on anything that requires cleanup.
 
-`/subagents` controls which model plays each of two roles, **cloud**
-(planning/judgment calls — defaults to `cloud-pro`) and **core**
+`/subagents` controls which model plays each of two roles, **planning**
+(planning/judgment calls — defaults to `cloud-pro`) and **building**
 (fast/local execution — defaults to `on-device`), used by both `/task`
 (its planning and section-picking) and `/ask` (below). Either role can be
 set to any model, including a specific `ollama:<name>`. One thing this
 *doesn't* change: `/task`'s actual file-writing step always runs on-device
-regardless of the "core" setting, since it's the only backend with the
+regardless of the "building" setting, since it's the only backend with the
 guided-generation schema support editing requires — this is a real
-technical constraint, not a default that "core" can override.
+technical constraint, not a default that "building" can override.
 
 `/ask <question>` is a similar orchestrator/worker pattern applied to
-research instead of editing, entirely read-only. The **cloud** role either
-answers directly (if it's confident it can) or splits the question into a
-few sub-questions; each sub-question is dispatched to the **core** role;
-then **cloud** synthesizes a final answer from that research. Cheap
-questions just get answered directly in one round-trip — decomposition
-only kicks in when the cloud role itself judges it would help.
+research instead of editing, entirely read-only. The **planning** role
+either answers directly (if it's confident it can) or splits the question
+into a few sub-questions; each sub-question is dispatched to the
+**building** role; then **planning** synthesizes a final answer from that
+research. Cheap questions just get answered directly in one round-trip —
+decomposition only kicks in when the planning role itself judges it would
+help.
 
 `/compare <question>` asks every model (on-device, cloud, cloud pro,
 ollama) the same question, one at a time, and shows each answer as it
