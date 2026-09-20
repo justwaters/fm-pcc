@@ -199,6 +199,25 @@ is best-effort: it shells out to `osascript` and silently does nothing
 if that fails (e.g. notifications aren't permitted), rather than
 interrupting the run itself.
 
+### Statusline
+
+The line just above the input reads `directory (branch) | model |
+Context:xx%`, in the spirit of Claude Code's own statusline — directory
+and branch are just `cwd`'s basename and `git branch --show-current`
+(the `(branch)` part is omitted outside a git repo). The context
+percentage is exact where it can be:
+
+- **on-device** — `fm count-tokens --transcript` against the documented
+  4,096-token session limit for the on-device model.
+- **ollama** — the real token counts Ollama returns with every chat
+  response, against that model's own context length from `/api/show`.
+
+Neither Apple's Shortcuts bridge nor its cloud/cloud-pro tiers expose any
+token accounting, so there's no way to measure either number for those —
+**cloud/cloud-pro's percentage is a rough chars÷4 estimate against a
+guessed 32k context window**, not a real measurement. Treat it as a
+rough indicator, not a reliable count, for those two tiers specifically.
+
 ### Keybindings (TUI)
 
 | Key      | Action                                    |

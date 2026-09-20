@@ -563,6 +563,8 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
 NOTIFY_MIN_SECONDS = 5.0
+ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
+CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess
 
 
 def _git_repo_name(cwd: str) -> str | None:
@@ -576,6 +578,22 @@ def _git_repo_name(cwd: str) -> str | None:
     if result.returncode != 0:
         return None
     return os.path.basename(result.stdout.strip().rstrip("/"))
+
+
+def git_branch(cwd: str) -> str | None:
+    """Current branch name, or None if `cwd` isn't a git repo or HEAD is
+    detached (an empty branch name isn't worth showing in the statusline).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 def _readme_first_line(path: str) -> str | None:
@@ -661,13 +679,18 @@ def _ollama_list_models(host: str) -> list[str]:
     return [m["name"] for m in json.loads(data).get("models", [])]
 
 
-def _ollama_chat(model: str, messages: list[dict], host: str) -> str:
+def _ollama_chat(model: str, messages: list[dict], host: str) -> tuple[str, int | None]:
     """POST to Ollama's /api/chat, cancellable the same way as _run().
 
     Uses http.client directly (stdlib, no new dependency) rather than
     `ollama run <model>` so multi-turn history can be passed natively as
     a messages list instead of re-stuffing prior turns into a text prompt
     the way the Shortcuts-backed cloud tiers have to.
+
+    Returns (reply text, total tokens now in context) -- the second value
+    is `prompt_eval_count + eval_count` from Ollama's own accounting (real
+    tokenizer counts, not an estimate), or None if either is missing from
+    the response.
     """
     conn = _ollama_connect(host)
     _begin_op(conn)
@@ -694,7 +717,45 @@ def _ollama_chat(model: str, messages: list[dict], host: str) -> str:
     payload = json.loads(data)
     if "error" in payload:
         raise RuntimeError(f"Ollama error: {payload['error']}")
-    return payload["message"]["content"]
+
+    prompt_tokens = payload.get("prompt_eval_count")
+    eval_tokens = payload.get("eval_count")
+    total_tokens = (
+        prompt_tokens + eval_tokens
+        if prompt_tokens is not None and eval_tokens is not None
+        else None
+    )
+    return payload["message"]["content"], total_tokens
+
+
+def _ollama_context_length(model: str, host: str) -> int | None:
+    """Look up `model`'s context window from /api/show. The key is always
+    "<architecture>.context_length" (e.g. "llama.context_length",
+    "qwen2.context_length") -- the architecture prefix varies by model
+    family, so this matches on the suffix generically rather than trying
+    to enumerate every architecture name.
+    """
+    conn = _ollama_connect(host)
+    try:
+        body = json.dumps({"name": model})
+        conn.request("POST", "/api/show", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+    except OSError:
+        return None
+    finally:
+        conn.close()
+    if status != 200:
+        return None
+    try:
+        info = json.loads(data).get("model_info", {})
+    except json.JSONDecodeError:
+        return None
+    for key, value in info.items():
+        if key.endswith("context_length") and isinstance(value, int):
+            return value
+    return None
 
 
 def _installed_shortcuts() -> set[str]:
@@ -752,12 +813,15 @@ class Backend:
         self.ollama_host = ollama_host
         self._ollama_resolved_model: str | None = None
         self._ollama_history: dict[str, list[dict[str, str]]] = {}
+        self._ollama_context_tokens: dict[str, int] = {}
+        self._ollama_context_length: dict[str, int] = {}
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
 
     def reset(self) -> None:
         self._transcript_path = None
+        self._ollama_context_tokens.clear()
         for history in self._cloud_history.values():
             history.clear()
         self._ollama_history.clear()
@@ -792,11 +856,13 @@ class Backend:
         history = self._ollama_history.setdefault(tag, [])
         history.append({"role": "user", "content": prompt})
         try:
-            text = _ollama_chat(tag, history, self.ollama_host)
+            text, total_tokens = _ollama_chat(tag, history, self.ollama_host)
         except Exception:
             history.pop()  # don't keep a failed turn in context
             raise
         history.append({"role": "assistant", "content": text})
+        if total_tokens is not None:
+            self._ollama_context_tokens[tag] = total_tokens
         return text
 
     def _respond_on_device(self, prompt: str) -> str:
@@ -856,11 +922,12 @@ class Backend:
                 raise RuntimeError(result.stderr.strip() or "fm respond failed")
             return result.stdout.strip()
         if model == "ollama" or model.startswith("ollama:"):
-            return _ollama_chat(
+            text, _ = _ollama_chat(
                 self._resolve_ollama_model(model),
                 [{"role": "user", "content": prompt}],
                 self.ollama_host,
             )
+            return text
         return self._run_shortcut(model, prompt)
 
     def _respond_cloud(self, prompt: str, model: str) -> str:
@@ -873,6 +940,52 @@ class Backend:
         text = self._run_shortcut(model, full_prompt)
         history.append((prompt, text))
         return text
+
+    def context_usage(self, model: str) -> tuple[int | None, int | None]:
+        """Return (tokens used, context window size) for `model`'s current
+        session, or (None, None)/(None, max) when a piece is unknown.
+
+        - on-device: exact, via `fm count-tokens --transcript` against the
+          documented 4,096-token session limit.
+        - ollama: exact, from the real token counts Ollama returns with
+          each chat response, against that model's own context length
+          (from /api/show) -- both real numbers, not estimates.
+        - cloud/cloud-pro: no API exposes either number for Apple's
+          PCC-backed tiers, so this is a chars/4 estimate against a
+          guessed context size, clearly a rough approximation.
+        """
+        family = model_family(model)
+
+        if family == "on-device":
+            if not self._transcript_path or not os.path.isfile(self._transcript_path):
+                return 0, ON_DEVICE_CONTEXT_TOKENS
+            try:
+                result = subprocess.run(
+                    ["fm", "count-tokens", "--quiet", "--transcript", self._transcript_path],
+                    capture_output=True, text=True, timeout=15,
+                )
+                used = int(result.stdout.strip())
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                return None, ON_DEVICE_CONTEXT_TOKENS
+            return used, ON_DEVICE_CONTEXT_TOKENS
+
+        if family == "ollama":
+            try:
+                tag = self._resolve_ollama_model(model)
+            except Exception:
+                return None, None
+            used = self._ollama_context_tokens.get(tag)
+            max_tokens = self._ollama_context_length.get(tag)
+            if max_tokens is None:
+                max_tokens = _ollama_context_length(tag, self.ollama_host)
+                if max_tokens is not None:
+                    self._ollama_context_length[tag] = max_tokens
+            return used, max_tokens
+
+        # cloud / cloud-pro
+        history = self._cloud_history.get(model, [])
+        chars = sum(len(u) + len(a) for u, a in history)
+        return chars // 4, CLOUD_CONTEXT_TOKENS_ESTIMATE
 
 
 @dataclass
@@ -969,6 +1082,7 @@ class ChatApp(App):
         self.subagent_roles: dict[str, str] = {"planning": "cloud-pro", "building": "on-device"}
         self._message_log: list[Message] = []
         self._undo_stack: list[dict] = []
+        self._branch = git_branch(os.getcwd())
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -998,14 +1112,24 @@ class ChatApp(App):
 
     NORMAL_INPUT_COLOR = "#e7e5dd"
 
+    def _status_line(self) -> str:
+        directory = os.path.basename(os.getcwd()) or os.getcwd()
+        location = f"{directory} ({self._branch})" if self._branch else directory
+
+        used, max_tokens = self.backend.context_usage(self.model)
+        if used is None or not max_tokens:
+            context = "Context:n/a"
+        else:
+            context = f"Context:{min(100, round(100 * used / max_tokens))}%"
+
+        return f"{location} | {model_label(self.model)} | {context}"
+
     def _update_chrome(self) -> None:
         accent = model_color(self.model)
         self.query_one("#subtitle", Static).update(
             f" model: {model_label(self.model)} · /help for help"
         )
-        self.query_one("#status", Static).update(
-            f"{model_label(self.model)} · turn {self.turn}"
-        )
+        self.query_one("#status", Static).update(self._status_line())
         self.query_one("#inputbar").styles.border = ("round", accent)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
         self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR
