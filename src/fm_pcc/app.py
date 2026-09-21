@@ -79,6 +79,25 @@ def model_family(model: str) -> str:
     """Collapse a specific "ollama:<tag>" back to the general "ollama" family."""
     return "ollama" if model.startswith("ollama:") else model
 
+
+STATUS_ACCENTS = {
+    "on-device": "#f0b429",
+    "pcc": "#38d9c9",
+    "ollama": "#9775fa",
+}
+
+
+def status_accent(model: str) -> str:
+    """Coarser 3-way accent for the statusline: on-device, pcc (cloud and
+    cloud-pro share one color here), or ollama -- unlike model_color(),
+    which distinguishes all four model tiers individually for the input
+    border and prompt glyph.
+    """
+    family = model_family(model)
+    if family in ("cloud", "cloud-pro"):
+        return STATUS_ACCENTS["pcc"]
+    return STATUS_ACCENTS.get(family, STATUS_ACCENTS["on-device"])
+
 # Each of these is a "Use Model" Shortcut (Receive input -> Use <tier> model,
 # bound to Shortcut Input -> Stop and Output Response) sharing the same
 # shape, just pointed at a different model tier.
@@ -1024,7 +1043,6 @@ class ChatApp(App):
     .msg-assistant { margin: 1 0 0 0; }
     .msg-system { margin: 1 0 0 0; }
     .msg-thinking { margin: 1 0 0 0; }
-    #status { padding: 0 3; color: #7b838a; }
     #palette {
         display: none;
         height: auto;
@@ -1034,10 +1052,11 @@ class ChatApp(App):
         background: #1b2126;
     }
     #palette > .option-list--option-highlighted { background: #2a3138; }
-    #inputbar { height: 3; border: round #7b838a; margin: 0 2 1 2; padding: 0 1; }
+    #inputbar { height: 3; border: round #7b838a; margin: 0 2 0 2; padding: 0 1; }
     #prompt-glyph { width: 2; content-align: center middle; }
     #input { border: none; background: transparent; }
     #input:focus { border: none; }
+    #status { padding: 0 3 1 3; }
     """
 
     BINDINGS = [
@@ -1088,11 +1107,11 @@ class ChatApp(App):
         yield Static(id="banner")
         yield Static(id="subtitle")
         yield VerticalScroll(id="log")
-        yield Static(id="status")
         yield OptionList(id="palette")
         with Horizontal(id="inputbar"):
             yield Static("❯", id="prompt-glyph")
             yield Input(placeholder="Message fm-pcc… (/ for commands)", id="input")
+        yield Static(id="status")
 
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
@@ -1129,7 +1148,9 @@ class ChatApp(App):
         self.query_one("#subtitle", Static).update(
             f" model: {model_label(self.model)} · /help for help"
         )
-        self.query_one("#status", Static).update(self._status_line())
+        status = self.query_one("#status", Static)
+        status.update(self._status_line())
+        status.styles.color = status_accent(self.model)
         self.query_one("#inputbar").styles.border = ("round", accent)
         self.query_one("#prompt-glyph", Static).update(Text("❯", style=f"bold {accent}"))
         self.query_one(Input).styles.color = self.NORMAL_INPUT_COLOR

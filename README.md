@@ -201,11 +201,14 @@ interrupting the run itself.
 
 ### Statusline
 
-The line just above the input reads `directory (branch) | model |
+The line below the input reads `directory (branch) | model |
 Context:xx%`, in the spirit of Claude Code's own statusline — directory
 and branch are just `cwd`'s basename and `git branch --show-current`
-(the `(branch)` part is omitted outside a git repo). The context
-percentage is exact where it can be:
+(the `(branch)` part is omitted outside a git repo). Its text color
+reflects which of three families is active — on-device, any PCC tier
+(cloud or cloud-pro, sharing one color), or Ollama — a coarser grouping
+than the four individual accent colors used for the input border and
+prompt glyph elsewhere. The context percentage is exact where it can be:
 
 - **on-device** — `fm count-tokens --transcript` against the documented
   4,096-token session limit for the on-device model.
