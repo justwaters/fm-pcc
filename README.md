@@ -98,6 +98,18 @@ fm-pcc shows a one-line orientation note (repo name, file count, the
 README's first line) — no model call involved, just local filesystem
 and `git rev-parse`.
 
+The model has no real awareness of your filesystem on its own —
+verified directly against `fm respond`, not just fm-pcc's own prompting:
+asked "what directory are we in?" with no context at all, it confidently
+answers with a plausible-sounding but entirely made-up path. So the
+first message of every conversation has the real working directory and
+its top-level contents (names only, not file contents — that's what
+`@file` is for) silently included alongside what you typed, shown as a
+`context: ...` note. Only the first message pays this cost; each
+backend's own multi-turn memory (on-device's `--resume` transcript, the
+cloud tiers' resend-as-text history, Ollama's native message array)
+keeps it in view for the rest of that conversation.
+
 Replies are rendered as markdown (headings, bold, lists, code blocks) —
 cloud/Ollama models routinely answer in markdown, and plain text renders
 through unchanged either way.

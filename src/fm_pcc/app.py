@@ -172,6 +172,38 @@ def expand_file_references(prompt: str, cwd: str) -> tuple[str, list[str]]:
     return prompt + extra, attachments
 
 
+ENVIRONMENT_HEADER_MAX_ENTRIES = 200
+
+
+def build_environment_header(cwd: str) -> str:
+    """A deterministic, real snapshot of the working directory -- top-level
+    names only (matching /task's own directory scope: no subdirectory
+    recursion, no dotfiles), not file contents (that's what @file is for).
+
+    Without this, the model has zero actual filesystem awareness and will
+    confidently guess a plausible-sounding but made-up cwd/listing -- verified
+    directly against `fm respond` itself, not just fm-pcc's own prompting.
+    Injected once, into the first message of a conversation (see
+    on_input_submitted), rather than every turn: each backend's own
+    multi-turn memory (on-device's --resume transcript, the cloud tiers'
+    resend-as-text history, Ollama's native messages array) keeps it in view
+    for the rest of that conversation without paying the cost again.
+    """
+    try:
+        entries = sorted(e for e in os.listdir(cwd) if not e.startswith("."))
+    except OSError as e:
+        return f"Current directory: {cwd} (couldn't list contents: {e})"
+
+    shown = entries[:ENVIRONMENT_HEADER_MAX_ENTRIES]
+    listing = ", ".join(
+        f"{e}/" if os.path.isdir(os.path.join(cwd, e)) else e for e in shown
+    )
+    if len(entries) > ENVIRONMENT_HEADER_MAX_ENTRIES:
+        listing += f", … ({len(entries) - ENVIRONMENT_HEADER_MAX_ENTRIES} more not shown)"
+
+    return f"Current directory: {cwd}\nContents: {listing or '(empty)'}"
+
+
 class EditError(Exception):
     pass
 
@@ -2262,6 +2294,11 @@ class ChatApp(App):
         expanded, attachments = expand_file_references(prompt, os.getcwd())
         if attachments:
             self._add_message(Message("system", f"attached: {', '.join(attachments)}"))
+
+        if self.turn == 0:
+            cwd = os.getcwd()
+            expanded = f"{build_environment_header(cwd)}\n\n{expanded}"
+            self._add_message(Message("system", f"context: {cwd} and its contents included"))
 
         self._thinking = self._add_message(Message("thinking", ""))
         self._respond(expanded)
