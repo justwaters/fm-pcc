@@ -292,6 +292,72 @@ def propose_edit(
     }
 
 
+_NEW_FILE_SCHEMA_ARGS = [
+    "schema", "object", "--name", "NewFileProposal",
+    "--string", "summary", "--description", "One-sentence summary of the new file",
+    "--string", "content", "--description", "The complete contents of the new file, freshly written",
+]
+
+
+def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
+    """Ask the on-device model to write a brand new file from scratch.
+
+    Returns the same shape propose_edit() does (path, label, original,
+    updated, summary), with `original` always "", so /task's write/diff/undo
+    plumbing doesn't need to distinguish creating a file from editing one.
+    Restricted to a plain top-level filename inside `cwd` -- no
+    subdirectories, no escaping the working directory -- and refuses to
+    clobber a file that already exists (that's /edit's or /task's edit path's
+    job, not this one's).
+    """
+    if os.path.basename(path) != path or path in ("", ".", ".."):
+        raise EditError(f"refusing to create an invalid filename: {path!r}")
+
+    full_path = os.path.normpath(os.path.join(cwd, path))
+    label = os.path.relpath(full_path, cwd)
+
+    if os.path.exists(full_path):
+        raise EditError(f"{label} already exists -- edit it instead of creating it")
+
+    schema = subprocess.run(
+        ["fm", *_NEW_FILE_SCHEMA_ARGS], capture_output=True, text=True, check=True
+    ).stdout
+
+    with tempfile.TemporaryDirectory() as tmp:
+        schema_path = os.path.join(tmp, "schema.json")
+        with open(schema_path, "w") as f:
+            f.write(schema)
+
+        prompt = (
+            f"Create a new file at {label}.\n\n"
+            f"Instructions: {instructions}\n\n"
+            f"Write the complete contents of this file, from scratch."
+        )
+        result = _run(
+            ["fm", "respond", "--model", "system", "--no-stream", "--greedy",
+             "--schema", schema_path, prompt]
+        )
+
+    if result.returncode != 0:
+        raise EditError(result.stderr.strip() or "fm respond failed")
+
+    try:
+        proposal = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise EditError("model didn't return a valid file proposal")
+
+    content = proposal.get("content") or ""
+    summary = proposal.get("summary") or "(no summary)"
+
+    return {
+        "path": full_path,
+        "label": label,
+        "original": "",
+        "updated": content,
+        "summary": summary,
+    }
+
+
 def diff_preview(original: str, updated: str) -> str:
     diff = difflib.unified_diff(
         original.splitlines(keepends=True),
@@ -377,14 +443,19 @@ def is_stalling(instructions: str, recent_instructions: list[str]) -> bool:
 def plan_next_step(
     task: str, candidates: list[str], cwd: str, history: list[str], backend: "Backend", model: str
 ) -> dict | None:
-    """Ask a cloud model to pick the next single edit step, or declare done.
+    """Ask a cloud model to pick the next single edit/create step, or declare
+    done.
 
     This is the orchestrator half of the /task loop: it sees the whole task,
     the full content of every candidate file, and a running log of what's
     already been changed, and decides either that nothing more is needed or
     exactly one concrete next step (a file plus specific instructions for
     just that change). The on-device model never sees this -- it only ever
-    executes one bounded, already-decided edit at a time.
+    executes one bounded, already-decided edit or file creation at a time.
+
+    The named file doesn't have to already exist -- if it doesn't match any
+    candidate, /task treats it as a new file to create, which is how an
+    empty directory can be bootstrapped from nothing.
     """
     listing = []
     for name in candidates:
@@ -399,11 +470,13 @@ def plan_next_step(
 
     prompt = (
         f"Task: {task}\n\nFiles in this directory:\n\n"
-        + "\n\n".join(listing)
+        + ("\n\n".join(listing) if listing else "(empty directory -- no files yet)")
         + f"\n\nSteps already taken:\n{progress}\n\n"
         "If the task is now fully done, reply with exactly: DONE\n"
         "Otherwise reply with exactly two lines:\n"
-        "FILE: <exact filename to edit next>\n"
+        "FILE: <filename to work on next -- name one of the existing files "
+        "above to edit it, or a new filename with no subdirectories to "
+        "create it>\n"
         "INSTRUCTIONS: <specific instructions for just this one change>"
     )
     reply = backend.classify(prompt, model).strip()
@@ -418,14 +491,17 @@ def plan_next_step(
     filename = file_match.group(1).strip().strip("`'\" .")
     instructions = instr_match.group(1).strip()
 
+    # Only ever touch a plain top-level filename inside cwd -- rejects
+    # absolute paths, "..", and subdirectories, whether the file is being
+    # edited or created.
+    if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
+        raise EditError(f"model picked an invalid filename: {filename!r}")
+
     matched = next(
         (c for c in candidates if c.lower() == filename.lower() or c.lower() in filename.lower()),
         None,
     )
-    if not matched:
-        raise EditError(f"model picked an unknown file '{filename}'")
-
-    return {"file": matched, "instructions": instructions}
+    return {"file": matched or filename, "instructions": instructions}
 
 
 def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
@@ -1165,6 +1241,7 @@ class ChatApp(App):
         self._branch = git_branch(os.getcwd())
         self._previous_model: str | None = None
         self._latest_version: str | None = None
+        self._last_task_description: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -1360,8 +1437,10 @@ class ChatApp(App):
 
     UNDO_STACK_MAX = 20
 
-    def _push_undo(self, path: str, label: str, original: str) -> None:
-        self._undo_stack.append({"path": path, "label": label, "original": original})
+    def _push_undo(self, path: str, label: str, original: str, existed_before: bool = True) -> None:
+        self._undo_stack.append(
+            {"path": path, "label": label, "original": original, "existed_before": existed_before}
+        )
         if len(self._undo_stack) > self.UNDO_STACK_MAX:
             self._undo_stack.pop(0)
 
@@ -1385,6 +1464,7 @@ class ChatApp(App):
         "save": "save the conversation: /save <name>",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
+        "push": "commit and push the current changes to git",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -1468,8 +1548,11 @@ class ChatApp(App):
             if not arg:
                 self._add_message(Message("system", "usage: /task <description>"))
                 return
+            self._last_task_description = arg
             self.query_one(Input).disabled = True
             self._run_task(arg)
+        elif name == "push":
+            self._handle_push()
         elif name == "apply":
             self._apply_pending_edit()
         elif name == "discard":
@@ -1521,8 +1604,6 @@ class ChatApp(App):
                 f for f in os.listdir(cwd)
                 if os.path.isfile(os.path.join(cwd, f)) and not f.startswith(".")
             )
-            if not candidates:
-                raise EditError("no files in the current directory")
 
             for step in range(1, self.TASK_MAX_STEPS + 1):
                 if self._loop_cancel_requested:
@@ -1536,11 +1617,11 @@ class ChatApp(App):
                     task, candidates, cwd, history, self.backend, self.subagent_roles["planning"]
                 )
                 if plan is None:
-                    self.call_from_thread(
-                        self._log_progress,
-                        f"done after {step - 1} step(s)."
-                        if step > 1 else "nothing to do -- task already satisfied.",
-                    )
+                    if history:
+                        done_message = f"done after {step - 1} step(s) -- run /push to commit and push these changes."
+                    else:
+                        done_message = "nothing to do -- task already satisfied."
+                    self.call_from_thread(self._log_progress, done_message)
                     break
 
                 filename, instructions = plan["file"], plan["instructions"]
@@ -1558,23 +1639,33 @@ class ChatApp(App):
                     self._log_progress, f"step {step}: {filename} — {instructions}"
                 )
 
-                with open(os.path.join(cwd, filename), "r", errors="replace") as f:
-                    content = f.read()
-                sections = split_sections(content, filename)
-                section = pick_section(
-                    instructions, filename, sections, self.backend, self.subagent_roles["planning"]
-                )
+                creating = not os.path.isfile(os.path.join(cwd, filename))
+                if creating:
+                    proposal = propose_new_file(filename, instructions, cwd)
+                else:
+                    with open(os.path.join(cwd, filename), "r", errors="replace") as f:
+                        content = f.read()
+                    sections = split_sections(content, filename)
+                    section = pick_section(
+                        instructions, filename, sections, self.backend, self.subagent_roles["planning"]
+                    )
+                    proposal = propose_edit(
+                        filename, instructions, cwd, line_range=(section["start"], section["end"])
+                    )
 
-                proposal = propose_edit(
-                    filename, instructions, cwd, line_range=(section["start"], section["end"])
-                )
                 with open(proposal["path"], "w") as f:
                     f.write(proposal["updated"])
-                self._push_undo(proposal["path"], proposal["label"], proposal["original"])
+                self._push_undo(
+                    proposal["path"], proposal["label"], proposal["original"],
+                    existed_before=not creating,
+                )
+                if creating and filename not in candidates:
+                    candidates = sorted(candidates + [filename])
 
                 diff = diff_preview(proposal["original"], proposal["updated"])
                 self.call_from_thread(self._task_step_applied, proposal, diff)
-                history.append(f"{filename}: {proposal['summary']}")
+                verb = "created" if creating else "edited"
+                history.append(f"{filename}: {verb} -- {proposal['summary']}")
             else:
                 self.call_from_thread(
                     self._log_progress,
@@ -1696,12 +1787,77 @@ class ChatApp(App):
             return
         entry = self._undo_stack.pop()
         try:
-            with open(entry["path"], "w") as f:
-                f.write(entry["original"])
+            if entry.get("existed_before", True):
+                with open(entry["path"], "w") as f:
+                    f.write(entry["original"])
+                self._add_message(Message("system", f"reverted {entry['label']}"))
+            else:
+                os.remove(entry["path"])
+                self._add_message(Message("system", f"removed {entry['label']} (undid its creation)"))
         except OSError as e:
-            self._add_message(Message("system", f"couldn't undo write to {entry['label']}: {e}"))
+            self._add_message(Message("system", f"couldn't undo the change to {entry['label']}: {e}"))
+
+    def _handle_push(self) -> None:
+        cwd = os.getcwd()
+        try:
+            status = subprocess.run(
+                ["git", "-C", cwd, "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self._add_message(Message("system", f"couldn't check git status: {e}"))
             return
-        self._add_message(Message("system", f"reverted {entry['label']}"))
+        if status.returncode != 0:
+            self._add_message(Message("system", "not a git repository here (or git isn't available)"))
+            return
+        if not status.stdout.strip():
+            self._add_message(Message("system", "nothing to push -- working tree is clean"))
+            return
+
+        self.query_one(Input).disabled = True
+        self._add_message(Message("system", "pushing…"))
+        self._run_push()
+
+    @work(thread=True)
+    def _run_push(self) -> None:
+        cwd = os.getcwd()
+        message = self._last_task_description or "automated changes"
+        try:
+            add = subprocess.run(
+                ["git", "-C", cwd, "add", "-A"], capture_output=True, text=True, timeout=30
+            )
+            if add.returncode != 0:
+                self.call_from_thread(self._push_finished, False, add.stderr.strip())
+                return
+
+            commit = subprocess.run(
+                ["git", "-C", cwd, "commit", "-m", f"fm-pcc: {message}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if commit.returncode != 0:
+                detail = (commit.stderr or commit.stdout).strip()
+                self.call_from_thread(self._push_finished, False, detail)
+                return
+
+            push = subprocess.run(
+                ["git", "-C", cwd, "push"], capture_output=True, text=True, timeout=120
+            )
+            if push.returncode != 0:
+                detail = (push.stderr or push.stdout).strip()
+                self.call_from_thread(self._push_finished, False, detail)
+                return
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.call_from_thread(self._push_finished, False, str(e))
+            return
+
+        self.call_from_thread(self._push_finished, True, "")
+
+    def _push_finished(self, success: bool, detail: str) -> None:
+        self._enable_input()
+        if success:
+            self._add_message(Message("system", "pushed."))
+        else:
+            self._add_message(Message("system", f"push failed: {detail[:300]}"))
 
     def _handle_subagents(self, arg: str) -> None:
         if not arg:

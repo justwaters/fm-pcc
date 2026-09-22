@@ -116,7 +116,8 @@ Slash commands, same spirit as `fm chat`:
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
-| `/undo`                      | Revert the last file write made by `/edit` or `/task`  |
+| `/undo`                      | Revert the last file write (or creation) made by `/edit` or `/task` |
+| `/push`                      | Commit and push the current changes to git             |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -138,14 +139,29 @@ immediately, with no per-step `/apply`** — closer to a subagent that Cloud
 Pro keeps dispatching to than a one-shot assistant. Each iteration, Cloud
 Pro sees the task, the full content of every file in the directory, and a
 running log of what's already been done, then either says the task is
-done or picks one concrete next step (a file plus specific instructions).
-That file gets deterministically split into sections (real top-level
-blocks for brace languages like CSS/JS, fixed-size chunks otherwise — not
+done or picks one concrete next step: a filename plus specific
+instructions for just that change. If the filename already exists, that
+file gets deterministically split into sections (real top-level blocks
+for brace languages like CSS/JS, fixed-size chunks otherwise — not
 model-summarized, since that's a mechanical task a parser gets right for
 free), Cloud Pro picks the relevant section, and on-device drafts and
-writes the edit scoped to it — the same machinery `/edit` uses. This
-repeats until Cloud Pro says done or a 15-step safety cap is hit. `Esc`
-`Esc` stops it between steps.
+writes the edit scoped to it — the same machinery `/edit` uses. If the
+filename *doesn't* exist yet, on-device instead writes it from scratch —
+which is what makes `/task make me a website about <product>` work
+starting from an empty directory: the first step creates `index.html`,
+later steps can create `style.css` or edit either file further. New
+filenames are restricted to a plain name in the current directory (no
+subdirectories, no `..`) for both creating and editing. This repeats
+until Cloud Pro says done or a 15-step safety cap is hit. `Esc` `Esc`
+stops it between steps.
+
+`/task` never touches git itself — when it finishes having made changes,
+it tells you to run `/push`, which stages everything, commits (using the
+task description as the commit message when there is one), and pushes to
+the current branch's upstream. This is a deliberate separation: file
+changes happen automatically as `/task` runs, but nothing leaves your
+machine until you explicitly ask it to, after you've had a chance to look
+at what got written.
 
 This is genuinely autonomous, so it can genuinely go wrong: on real
 testing, a task needing cleanup/consolidation (not just clean additions)
@@ -196,10 +212,11 @@ all of that; `/resume` with no name lists what's saved instead of
 resuming anything.
 
 `/undo` reverts the most recent file write made by `/apply` or `/task`,
-restoring that file's exact prior content. It's a stack — repeated
-`/undo` walks back further, up to the last 20 writes across both
-commands — not a single-slot toggle, so it composes with a `/task` run
-that made several changes.
+restoring that file's exact prior content — or, if that step *created*
+the file, removing it entirely rather than leaving an empty file behind.
+It's a stack — repeated `/undo` walks back further, up to the last 20
+writes across both commands — not a single-slot toggle, so it composes
+with a `/task` run that made several changes.
 
 `/task` and `/ask` post a macOS notification when they finish, but only
 if the run took 5 seconds or longer — quick ones don't bother you. This
