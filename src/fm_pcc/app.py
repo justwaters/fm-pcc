@@ -519,6 +519,15 @@ class GenerationCancelled(Exception):
     pass
 
 
+class ICloudPlusRequired(RuntimeError):
+    """Raised when a Shortcuts-backed cloud tier fails specifically because
+    the signed-in account lacks iCloud+ -- Apple's "Use Model" action's own
+    error text for this ("...you must be signed in to an iCloud+ account
+    to use the <tier> model") is specific enough to match on reliably.
+    """
+    pass
+
+
 _op_lock = threading.Lock()
 _active_op: subprocess.Popen | http.client.HTTPConnection | None = None
 _cancel_requested = False
@@ -834,6 +843,7 @@ class Backend:
         self._ollama_history: dict[str, list[dict[str, str]]] = {}
         self._ollama_context_tokens: dict[str, int] = {}
         self._ollama_context_length: dict[str, int] = {}
+        self._icloud_plus_unavailable: set[str] = set()
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
@@ -920,6 +930,9 @@ class Backend:
             result = _run(["shortcuts", "run", shortcut, "-i", in_path, "-o", out_path])
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "").strip()
+                if "icloud+" in detail.lower():
+                    self._icloud_plus_unavailable.add(model)
+                    raise ICloudPlusRequired(detail)
                 raise RuntimeError(
                     f"Shortcut '{shortcut}' failed: {detail}\n"
                     f"Check it exists ('shortcuts list') and its 'Use Model' "
@@ -1102,6 +1115,7 @@ class ChatApp(App):
         self._message_log: list[Message] = []
         self._undo_stack: list[dict] = []
         self._branch = git_branch(os.getcwd())
+        self._previous_model: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -1126,7 +1140,8 @@ class ChatApp(App):
         if hint:
             self._add_message(Message("system", hint))
 
-    def watch_model(self, _value: str) -> None:
+    def watch_model(self, old_value: str, _new_value: str) -> None:
+        self._previous_model = old_value
         self._update_chrome()
 
     NORMAL_INPUT_COLOR = "#e7e5dd"
@@ -1162,6 +1177,14 @@ class ChatApp(App):
     def _select_model(self, model: str) -> None:
         if model == self.model:
             return
+        if model in self.backend._icloud_plus_unavailable:
+            self._add_message(
+                Message(
+                    "system",
+                    f"{model_label(model)} requires iCloud+ on this account — not switching",
+                )
+            )
+            return
         self.model = model
         self._add_message(Message("system", f"switched to {model_label(self.model)}"))
 
@@ -1189,11 +1212,17 @@ class ChatApp(App):
                 palette.add_option(Option("ollama", id="_header_ollama", disabled=True))
                 continue
             marker = "● " if entry == self.model else "○ "
+            unavailable = entry in self.backend._icloud_plus_unavailable
+            label = model_label(entry)
+            if unavailable:
+                label = f"{label} (Requires iCloud+)"
             if entry.startswith("ollama:"):
                 branch = "└─" if i == len(entries) - 1 else "├─"
-                palette.add_option(Option(f"{branch} {marker}{model_label(entry)}", id=entry))
+                palette.add_option(
+                    Option(f"{branch} {marker}{label}", id=entry, disabled=unavailable)
+                )
             else:
-                palette.add_option(Option(f"{marker}{model_label(entry)}", id=entry))
+                palette.add_option(Option(f"{marker}{label}", id=entry, disabled=unavailable))
 
         selectable = [e for e in entries if e is not None]
         highlight_target = self.model if self.model in selectable else selectable[0]
@@ -1888,6 +1917,8 @@ class ChatApp(App):
             self.call_from_thread(self._finish_turn, text, None)
         except GenerationCancelled:
             self.call_from_thread(self._finish_cancelled)
+        except ICloudPlusRequired as e:
+            self.call_from_thread(self._finish_icloud_plus_required, model, str(e))
         except Exception as e:
             self.call_from_thread(self._finish_turn, None, str(e))
 
@@ -1901,6 +1932,22 @@ class ChatApp(App):
             self.turn += 1
             self._add_message(Message("assistant", text))
             self._update_chrome()
+        self._enable_input()
+
+    def _finish_icloud_plus_required(self, failed_model: str, error: str) -> None:
+        if self._thinking is not None:
+            self._thinking.remove()
+            self._thinking = None
+        fallback = self._previous_model if self._previous_model != failed_model else None
+        fallback = fallback or "on-device"
+        self._add_message(
+            Message(
+                "system",
+                f"error: {model_label(failed_model)} requires iCloud+ on this "
+                f"account ({error}) — switching back to {model_label(fallback)}",
+            )
+        )
+        self.model = fallback
         self._enable_input()
 
     def _enable_input(self) -> None:

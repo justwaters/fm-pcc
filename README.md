@@ -57,6 +57,14 @@ installed yet, `fm-pcc` opens its iCloud share link for you —
 — tap **Add Shortcut** in the sheet that appears, and it'll pick up from
 there. On-device chat works with no setup at all.
 
+Cloud Pro in particular also requires the signed-in account to have
+iCloud+ — if it doesn't, Apple's own "Use Model" action fails with an
+error naming that requirement (this doesn't seem to apply to plain
+Cloud). fm-pcc recognizes that specific error, switches you back to
+whichever model you were on before it failed, and greys out the
+affected tier in `/model` (labeled "Requires iCloud+") for the rest of
+the session so it doesn't keep failing the same way.
+
 For local development, install from a checkout instead:
 `uv tool install -e .`
 
