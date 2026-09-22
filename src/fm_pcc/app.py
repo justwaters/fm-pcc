@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Callable
@@ -37,7 +38,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.reactive import reactive
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from . import __version__
@@ -593,6 +594,41 @@ SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
 NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
 CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess
+UPDATE_CHECK_URL = "https://raw.githubusercontent.com/justwaters/fm-pcc/master/src/fm_pcc/__init__.py"
+
+
+def _parse_version(text: str) -> str | None:
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    return match.group(1) if match else None
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts = []
+    for piece in version.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    return _version_tuple(candidate) > _version_tuple(current)
+
+
+def fetch_latest_version(url: str = UPDATE_CHECK_URL, timeout: float = 4.0) -> str | None:
+    """Best-effort check for a newer version, by reading __version__ straight
+    out of __init__.py on the repo's default branch -- no release/tag system
+    to query, and this needs no auth and isn't subject to API rate limits.
+    Never raises; returns None on any failure (offline, timeout, unexpected
+    content) so a failed check just means no update button, not a crash.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    return _parse_version(text)
 
 
 def _git_repo_name(cwd: str) -> str | None:
@@ -1069,7 +1105,19 @@ class ChatApp(App):
     #prompt-glyph { width: 2; content-align: center middle; }
     #input { border: none; background: transparent; }
     #input:focus { border: none; }
-    #status { padding: 0 3 1 3; }
+    #statusbar { height: auto; margin: 0 2 1 2; }
+    #status { width: 1fr; padding: 0 1; content-align: left middle; }
+    #update-button {
+        display: none;
+        min-width: 0;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        background: #1b2126;
+        color: #ffd43b;
+        text-style: bold;
+    }
+    #update-button:hover { background: #2a3138; }
     """
 
     BINDINGS = [
@@ -1116,6 +1164,7 @@ class ChatApp(App):
         self._undo_stack: list[dict] = []
         self._branch = git_branch(os.getcwd())
         self._previous_model: str | None = None
+        self._latest_version: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -1125,7 +1174,9 @@ class ChatApp(App):
         with Horizontal(id="inputbar"):
             yield Static("❯", id="prompt-glyph")
             yield Input(placeholder="Message fm-pcc… (/ for commands)", id="input")
-        yield Static(id="status")
+        with Horizontal(id="statusbar"):
+            yield Static(id="status")
+            yield Button("", id="update-button")
 
     def on_mount(self) -> None:
         self.query_one("#banner", Static).update(
@@ -1139,6 +1190,56 @@ class ChatApp(App):
         hint = launch_context_hint(os.getcwd())
         if hint:
             self._add_message(Message("system", hint))
+        self._check_for_update()
+
+    @work(thread=True)
+    def _check_for_update(self) -> None:
+        latest = fetch_latest_version()
+        if latest and is_newer(latest, __version__):
+            self.call_from_thread(self._show_update_button, latest)
+
+    def _show_update_button(self, latest: str) -> None:
+        self._latest_version = latest
+        button = self.query_one("#update-button", Button)
+        button.label = f"Update (v{__version__} -> v{latest})"
+        button.display = True
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "update-button":
+            self._run_update()
+
+    @work(thread=True)
+    def _run_update(self) -> None:
+        self.call_from_thread(self._update_started)
+        try:
+            result = subprocess.run(
+                ["uv", "tool", "upgrade", "fm-pcc"],
+                capture_output=True, text=True, timeout=180,
+            )
+            success = result.returncode == 0
+            detail = (result.stderr or result.stdout or "").strip()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            success = False
+            detail = str(e)
+        self.call_from_thread(self._update_finished, success, detail)
+
+    def _update_started(self) -> None:
+        button = self.query_one("#update-button", Button)
+        button.disabled = True
+        button.label = "Updating…"
+        self._add_message(Message("system", "updating fm-pcc…"))
+
+    def _update_finished(self, success: bool, detail: str) -> None:
+        button = self.query_one("#update-button", Button)
+        if success:
+            button.label = f"Updated to v{self._latest_version} -- restart fm-pcc"
+            self._add_message(
+                Message("system", f"updated to v{self._latest_version} — restart fm-pcc to use it")
+            )
+        else:
+            button.disabled = False
+            button.label = f"Update (v{__version__} -> v{self._latest_version})"
+            self._add_message(Message("system", f"update failed: {detail[:300]}"))
 
     def watch_model(self, old_value: str, _new_value: str) -> None:
         self._previous_model = old_value

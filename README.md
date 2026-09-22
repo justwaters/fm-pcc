@@ -229,6 +229,16 @@ token accounting, so there's no way to measure either number for those —
 guessed 32k context window**, not a real measurement. Treat it as a
 rough indicator, not a reliable count, for those two tiers specifically.
 
+Next to the statusline, on the right, an **Update (vX.XX -> vY.YY)**
+button appears whenever a newer version is available — checked once at
+startup by reading `__version__` straight out of `__init__.py` on the
+repo's default branch (no release/tag system to query). It's invisible
+the rest of the time, when you're already up to date. Clicking it runs
+`uv tool upgrade fm-pcc` in the background and reports success or
+failure as a message; since the running process already has its own
+code loaded in memory, you'll need to restart fm-pcc afterward to
+actually use the new version.
+
 ### Keybindings (TUI)
 
 | Key      | Action                                    |
