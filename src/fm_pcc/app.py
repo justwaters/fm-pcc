@@ -18,6 +18,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -208,6 +209,27 @@ class EditError(Exception):
     pass
 
 
+def resolve_safe_path(path: str, cwd: str) -> str:
+    """Resolve `path` relative to `cwd` and guarantee it stays inside it.
+
+    Unlike the old flat "no path separators at all" rule, this allows real
+    nesting (e.g. "test/path.txt" once "test" exists, or even before it
+    does -- callers that write files create missing parent directories
+    themselves) since folder creation/organization requires it. What it
+    still refuses: absolute paths, and any ".." that would escape `cwd`.
+    """
+    if not path or path in (".", ".."):
+        raise EditError(f"refusing an invalid path: {path!r}")
+    if os.path.isabs(path):
+        raise EditError(f"refusing an absolute path: {path!r}")
+
+    full = os.path.normpath(os.path.join(cwd, path))
+    cwd_norm = os.path.normpath(cwd)
+    if full != cwd_norm and not full.startswith(cwd_norm + os.sep):
+        raise EditError(f"refusing a path outside the working directory: {path!r}")
+    return full
+
+
 _EDIT_SCHEMA_ARGS = [
     "schema", "object", "--name", "EditProposal",
     "--string", "summary", "--description", "One-sentence summary of the change",
@@ -337,15 +359,13 @@ def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
     Returns the same shape propose_edit() does (path, label, original,
     updated, summary), with `original` always "", so /task's write/diff/undo
     plumbing doesn't need to distinguish creating a file from editing one.
-    Restricted to a plain top-level filename inside `cwd` -- no
-    subdirectories, no escaping the working directory -- and refuses to
-    clobber a file that already exists (that's /edit's or /task's edit path's
-    job, not this one's).
+    `path` may be nested (e.g. "test/path.txt") -- any missing parent
+    directories are created automatically, so the model doesn't have to get
+    the ordering right relative to a separate folder-creation step. Refuses
+    to escape `cwd`, and refuses to clobber a file that already exists
+    (that's /edit's or /task's edit path's job, not this one's).
     """
-    if os.path.basename(path) != path or path in ("", ".", ".."):
-        raise EditError(f"refusing to create an invalid filename: {path!r}")
-
-    full_path = os.path.normpath(os.path.join(cwd, path))
+    full_path = resolve_safe_path(path, cwd)
     label = os.path.relpath(full_path, cwd)
 
     if os.path.exists(full_path):
@@ -388,6 +408,109 @@ def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
         "updated": content,
         "summary": summary,
     }
+
+
+def create_folder(path: str, cwd: str) -> dict:
+    """Create a new, empty directory. Deterministic, no model involved --
+    making a folder needs no judgment call, just a real filesystem op.
+    """
+    full_path = resolve_safe_path(path, cwd)
+    label = os.path.relpath(full_path, cwd)
+    if os.path.exists(full_path):
+        raise EditError(f"{label} already exists")
+    os.makedirs(full_path)
+    return {"path": full_path, "label": label, "summary": f"created folder {label}"}
+
+
+def move_or_rename(src: str, dest: str, cwd: str) -> dict:
+    """Move or rename a file or folder within `cwd`. Same reasoning as
+    create_folder: no model judgment needed, just a real filesystem op --
+    the model only ever supplies the source and destination paths.
+    """
+    src_full = resolve_safe_path(src, cwd)
+    dest_full = resolve_safe_path(dest, cwd)
+    src_label = os.path.relpath(src_full, cwd)
+    dest_label = os.path.relpath(dest_full, cwd)
+
+    if not os.path.exists(src_full):
+        raise EditError(f"no such file or folder: {src_label}")
+    if os.path.exists(dest_full):
+        raise EditError(f"{dest_label} already exists")
+
+    os.makedirs(os.path.dirname(dest_full), exist_ok=True)
+    shutil.move(src_full, dest_full)
+    return {
+        "src_path": src_full,
+        "src_label": src_label,
+        "dest_path": dest_full,
+        "dest_label": dest_label,
+        "summary": f"moved {src_label} to {dest_label}",
+    }
+
+
+def git_run(args: list[str], cwd: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def git_status_porcelain(cwd: str) -> str:
+    result = git_run(["status", "--porcelain"], cwd, timeout=10)
+    if result.returncode != 0:
+        raise EditError("not a git repository here (or git isn't available)")
+    return result.stdout
+
+
+def git_has_unpushed_commits(cwd: str) -> bool:
+    """True if HEAD is ahead of its upstream. Best-effort: no upstream
+    configured (e.g. a branch that's never been pushed) isn't treated as a
+    real answer either way -- the caller should push anyway and let git's
+    own error explain what's actually wrong, rather than this silently
+    reporting "false" and _handle_push refusing to even try.
+    """
+    result = git_run(["rev-list", "@{u}..HEAD", "--count"], cwd, timeout=10)
+    if result.returncode != 0:
+        return True
+    return result.stdout.strip() not in ("", "0")
+
+
+def git_add_all(cwd: str) -> None:
+    result = git_run(["add", "-A"], cwd)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+
+
+def git_commit(message: str, cwd: str) -> str:
+    result = git_run(["commit", "-m", message], cwd)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def git_pull(cwd: str) -> str:
+    result = git_run(["pull"], cwd, timeout=120)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def git_push(cwd: str) -> str:
+    result = git_run(["push"], cwd, timeout=120)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def git_create_branch(name: str, cwd: str) -> str:
+    result = git_run(["checkout", "-b", name], cwd, timeout=30)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def git_switch_branch(name: str, cwd: str) -> str:
+    result = git_run(["checkout", name], cwd, timeout=30)
+    if result.returncode != 0:
+        raise EditError((result.stderr or result.stdout).strip())
+    return result.stdout.strip()
 
 
 def diff_preview(original: str, updated: str) -> str:
@@ -472,25 +595,67 @@ def is_stalling(instructions: str, recent_instructions: list[str]) -> bool:
     return False
 
 
+_TASK_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+TASK_MAX_CANDIDATES = 50
+
+
+def gather_task_tree(cwd: str) -> tuple[list[str], list[str]]:
+    """Relative file and folder paths inside `cwd`, walked recursively but
+    skipping dotfiles/dirs and common noise directories -- each capped so a
+    large tree doesn't blow the planner's context budget, and so a new
+    folder's contents are visible to /task's very next step rather than
+    only the top level.
+    """
+    files: list[str] = []
+    folders: list[str] = []
+    for root, dirs, filenames in os.walk(cwd):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in _TASK_SKIP_DIRS)
+        for d in dirs:
+            folders.append(os.path.relpath(os.path.join(root, d), cwd))
+        for f in sorted(filenames):
+            if not f.startswith("."):
+                files.append(os.path.relpath(os.path.join(root, f), cwd))
+        if len(files) >= TASK_MAX_CANDIDATES and len(folders) >= TASK_MAX_CANDIDATES:
+            break
+    return files[:TASK_MAX_CANDIDATES], folders[:TASK_MAX_CANDIDATES]
+
+
+TASK_ACTIONS = {
+    "EDIT", "CREATE_FILE", "CREATE_FOLDER", "RENAME", "MOVE",
+    "GIT_ADD", "GIT_COMMIT", "GIT_PUSH", "GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH", "GIT_PULL",
+}
+# /push already requires an explicit, separate action from the user rather
+# than firing automatically -- these four get the same treatment: /task can
+# plan them, but never executes them itself, only surfaces the matching
+# command (/push, /branch create|switch, /pull) for the user to run.
+TASK_GIT_CONFIRM_GATED = {"GIT_PUSH", "GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH", "GIT_PULL"}
+_TASK_ACTIONS_NEEDING_PATH = {"EDIT", "CREATE_FILE", "CREATE_FOLDER", "RENAME", "MOVE"}
+
+
 def plan_next_step(
-    task: str, candidates: list[str], cwd: str, history: list[str], backend: "Backend", model: str
+    task: str,
+    files: list[str],
+    folders: list[str],
+    cwd: str,
+    history: list[str],
+    backend: "Backend",
+    model: str,
 ) -> dict | None:
-    """Ask a cloud model to pick the next single edit/create step, or declare
-    done.
+    """Ask a cloud model to pick the next single step, or declare done.
 
     This is the orchestrator half of the /task loop: it sees the whole task,
-    the full content of every candidate file, and a running log of what's
-    already been changed, and decides either that nothing more is needed or
-    exactly one concrete next step (a file plus specific instructions for
-    just that change). The on-device model never sees this -- it only ever
-    executes one bounded, already-decided edit or file creation at a time.
+    the full content of every candidate file, the folders that already
+    exist, and a running log of what's already been changed, and decides
+    either that nothing more is needed or exactly one concrete next step.
+    The on-device model never sees this -- it only ever executes one
+    bounded, already-decided step at a time.
 
-    The named file doesn't have to already exist -- if it doesn't match any
-    candidate, /task treats it as a new file to create, which is how an
-    empty directory can be bootstrapped from nothing.
+    A path for CREATE_FILE/CREATE_FOLDER doesn't have to already exist --
+    that's how an empty directory gets bootstrapped from nothing, and how a
+    file can land inside a folder created moments earlier in the same run.
     """
     listing = []
-    for name in candidates:
+    for name in files:
         try:
             with open(os.path.join(cwd, name), "r", errors="replace") as f:
                 content = f.read(MAX_FILE_CHARS)
@@ -499,41 +664,181 @@ def plan_next_step(
         listing.append(f"--- {name} ---\n{content}")
 
     progress = "\n".join(f"- {h}" for h in history) if history else "(nothing yet)"
+    folders_line = ", ".join(folders) if folders else "(none)"
 
     prompt = (
-        f"Task: {task}\n\nFiles in this directory:\n\n"
-        + ("\n\n".join(listing) if listing else "(empty directory -- no files yet)")
-        + f"\n\nSteps already taken:\n{progress}\n\n"
-        "If the task is now fully done, reply with exactly: DONE\n"
-        "Otherwise reply with exactly two lines:\n"
-        "FILE: <filename to work on next -- name one of the existing files "
-        "above to edit it, or a new filename with no subdirectories to "
-        "create it>\n"
-        "INSTRUCTIONS: <specific instructions for just this one change>"
+        f"Task: {task}\n\n"
+        "Reply with exactly ONE next step, in exactly this three-line "
+        "format (or exactly DONE if the task is now fully complete). "
+        "Check the \"Steps already taken\" log below FIRST: if it shows "
+        "the exact thing the task asked for has already happened, reply "
+        "DONE immediately -- do not propose another step that "
+        "re-does, undoes, reverts, or \"improves\" something already "
+        "completed. A short task (e.g. one rename, one move, one new "
+        "file) is normally DONE after a single successful step.\n\n"
+        "ACTION: <one of EDIT, CREATE_FILE, CREATE_FOLDER, RENAME, MOVE, "
+        "GIT_ADD, GIT_COMMIT, GIT_PUSH, GIT_BRANCH_CREATE, GIT_BRANCH_SWITCH, GIT_PULL>\n"
+        "TARGET: <depends on ACTION, see below>\n"
+        "INSTRUCTIONS: <depends on ACTION, see below -- can be blank>\n\n"
+        "IMPORTANT: if the task's own words mention committing, staging, "
+        "pushing, pulling, or branches, that means a GIT_* action -- pick "
+        "one of those, don't reinterpret \"commit\" as writing text into a "
+        "file. Once every file change the task calls for is done, GIT_ADD "
+        "then GIT_COMMIT (in that order, one per step) are usually the "
+        "right next steps if the task mentioned git at all. Never pick a "
+        "GIT_* action for a task that never mentioned git/commit/push/pull/"
+        "branch.\n\n"
+        "What TARGET/INSTRUCTIONS mean per action:\n"
+        "- EDIT: TARGET is the existing file to change; INSTRUCTIONS "
+        "describes the change.\n"
+        "- CREATE_FILE: TARGET is the new file's path -- use the exact "
+        "filename the task asks for. Only put it inside a folder (e.g. "
+        "assets/logo.png) if the task itself says to, or an earlier step "
+        "already created that folder for this purpose -- never invent a "
+        "folder to put a plain file in. INSTRUCTIONS describes its "
+        "contents.\n"
+        "- CREATE_FOLDER: TARGET is the new folder's path; INSTRUCTIONS is "
+        "unused.\n"
+        "- RENAME or MOVE: TARGET is the CURRENT (old) path, INSTRUCTIONS "
+        "is the NEW (destination) path -- just the path itself, never a "
+        "sentence describing the move. TARGET is always the file/folder "
+        "that already exists right now; INSTRUCTIONS is always where it "
+        "should end up, even if that means combining a folder name with "
+        "the original filename yourself. Worked examples:\n"
+        "  \"rename report.txt to report_final.txt\" -> "
+        "ACTION: RENAME, TARGET: report.txt, INSTRUCTIONS: report_final.txt\n"
+        "  \"move report.txt into the archive folder\" -> "
+        "ACTION: MOVE, TARGET: report.txt, INSTRUCTIONS: archive/report.txt\n"
+        "- GIT_ADD, GIT_PUSH, GIT_PULL: TARGET and INSTRUCTIONS are unused.\n"
+        "- GIT_COMMIT: INSTRUCTIONS is the commit message; TARGET is "
+        "unused.\n"
+        "- GIT_BRANCH_CREATE or GIT_BRANCH_SWITCH: TARGET is the branch "
+        "name; INSTRUCTIONS is unused.\n\n"
+        "Every path (TARGET or a destination in INSTRUCTIONS) must be "
+        "relative to the current directory shown below -- never an "
+        "absolute path (no leading /) and never a home-directory path "
+        "like /Users/... or ~/...\n\n"
+        f"Folders that already exist: {folders_line}\n\n"
+        f"Files in this directory:\n\n"
+        + ("\n\n".join(listing) if listing else "(no files yet)")
+        + f"\n\nSteps already taken:\n{progress}"
     )
     reply = backend.classify(prompt, model).strip()
     if reply.upper().startswith("DONE"):
         return None
 
-    file_match = re.search(r"FILE:\s*(.+)", reply)
-    instr_match = re.search(r"INSTRUCTIONS:\s*(.+)", reply, re.DOTALL)
-    if not file_match or not instr_match:
+    action_match = re.search(r"ACTION:\s*(\S+)", reply)
+    # [ \t]*, not \s* -- \s* would swallow the newline when TARGET is blank
+    # (a valid case for several actions) and bleed into the next line.
+    target_match = re.search(r"TARGET:[ \t]*(.*)", reply)
+    instr_match = re.search(r"INSTRUCTIONS:[ \t]*(.*)", reply, re.DOTALL)
+    if not action_match:
         raise EditError(f"couldn't parse the next step from the model's reply: {reply!r}")
 
-    filename = file_match.group(1).strip().strip("`'\" .")
-    instructions = instr_match.group(1).strip()
+    if instr_match:
+        # Defensive: the model occasionally echoes the whole ACTION/TARGET/
+        # INSTRUCTIONS template a second time inside its own INSTRUCTIONS
+        # value instead of just answering it -- cut that off if present
+        # rather than treating the echoed template as real instructions.
+        instr_value = instr_match.group(1)
+        echo = re.search(r"\n\s*ACTION:", instr_value)
+        if echo:
+            instr_match = re.match(r"(.*)", instr_value[: echo.start()], re.DOTALL)
 
-    # Only ever touch a plain top-level filename inside cwd -- rejects
-    # absolute paths, "..", and subdirectories, whether the file is being
-    # edited or created.
-    if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
-        raise EditError(f"model picked an invalid filename: {filename!r}")
+    action = action_match.group(1).strip().upper().strip("`'\",.:;")
+    if action not in TASK_ACTIONS:
+        raise EditError(f"model picked an unknown action: {action!r}")
 
-    matched = next(
-        (c for c in candidates if c.lower() == filename.lower() or c.lower() in filename.lower()),
-        None,
-    )
-    return {"file": matched or filename, "instructions": instructions}
+    target = target_match.group(1).strip().strip("`'\" .") if target_match else ""
+    instructions = instr_match.group(1).strip() if instr_match else ""
+
+    # Defensive: the model occasionally crams TARGET and INSTRUCTIONS onto
+    # one line (e.g. "TARGET: scratch, INSTRUCTIONS: ") instead of separate
+    # lines -- strip the embedded label (and anything after it) off TARGET.
+    # The separate INSTRUCTIONS search above still finds the real value
+    # fine either way, since it matches that label from anywhere in the
+    # reply, not just its own line.
+    target = re.sub(r"[,\s]*INSTRUCTIONS:.*$", "", target, flags=re.IGNORECASE | re.DOTALL)
+    target = target.strip().strip("`'\" .")
+
+    if action in _TASK_ACTIONS_NEEDING_PATH:
+        if not target or os.path.isabs(target) or target in (".", ".."):
+            raise EditError(f"model picked an invalid path for {action}: {target!r}")
+
+        if action in ("CREATE_FOLDER", "CREATE_FILE"):
+            parent = os.path.dirname(target)
+            if parent and os.path.basename(parent) == os.path.basename(target):
+                # Seen for real: right after correctly creating a folder,
+                # on-device sometimes proposes creating "X/X" -- a
+                # same-named duplicate nested inside the folder it just
+                # made, instead of recognizing the task is done. A
+                # legitimate nested file always differs from its parent's
+                # name (has an extension, etc.), so this pattern is only
+                # ever this specific confusion, not a real request.
+                raise EditError(
+                    f"refusing to create {target!r} -- looks like a "
+                    f"confused duplicate of the folder it would sit "
+                    f"inside, not a real request"
+                )
+
+        if action in ("RENAME", "MOVE") and not instructions and "/" in target:
+            # Common on-device confusion for "move X into Y folder": it
+            # combines the whole destination into TARGET (e.g.
+            # "archive/report.txt") instead of splitting old/new paths
+            # correctly, leaving INSTRUCTIONS blank. If TARGET's basename
+            # matches something that actually exists, recover: that's the
+            # real source, and the original TARGET is the real
+            # destination -- deterministic, since we can check the
+            # filesystem ourselves rather than needing the model to get
+            # this right.
+            basename = os.path.basename(target)
+            first_component = target.split("/", 1)[0]
+            if basename in files or basename in folders:
+                target, instructions = basename, target
+            elif first_component in files or first_component in folders:
+                # A second confusion, mostly seen for RENAME: TARGET ends
+                # up holding "old/new" as shorthand for "rename old to
+                # new" (e.g. "draft/final") rather than two separate
+                # fields -- the giveaway is that the FIRST component is
+                # something that already exists, not the last.
+                target, instructions = target.split("/", 1)
+
+        if action in ("EDIT", "RENAME", "MOVE") and "/" not in target:
+            # Tolerate the model naming something close to (rather than
+            # exactly) an existing file/folder, same as the old FILE: field
+            # used to for EDIT. Skipped once TARGET has a "/" -- substring
+            # matching a multi-component path against single-component
+            # candidates is more likely to corrupt it (e.g. matching just
+            # "archive" out of "archive/report.txt") than to help.
+            pool = files if action == "EDIT" else files + folders
+            matched = next(
+                (c for c in pool if c.lower() == target.lower() or c.lower() in target.lower()),
+                None,
+            )
+            target = matched or target
+
+        if action in ("RENAME", "MOVE"):
+            if not instructions:
+                raise EditError(f"{action} needs a destination path in INSTRUCTIONS")
+            # A real path is rarely more than a few words even counting
+            # spaces in a real filename -- catches the small on-device
+            # model occasionally writing a whole descriptive sentence
+            # ("Move old.txt to the new filename") where a bare
+            # destination path belongs, before that sentence gets used as
+            # a literal filename.
+            if len(instructions.split()) > 6:
+                raise EditError(
+                    f"the destination for {action} looks like a sentence, "
+                    f"not a path: {instructions!r}"
+                )
+
+    if action in ("GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH") and not target:
+        raise EditError(f"{action} needs a branch name in TARGET")
+
+    if action == "GIT_COMMIT" and not instructions:
+        instructions = "automated changes"
+
+    return {"action": action, "target": target, "instructions": instructions}
 
 
 def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
@@ -1236,9 +1541,9 @@ class ChatApp(App):
         background: #1b2126;
     }
     #palette > .option-list--option-highlighted { background: #2a3138; }
-    #inputbar { height: 3; border: round #7b838a; margin: 0 2 0 2; padding: 0 1; }
-    #prompt-glyph { width: 2; content-align: center middle; }
-    #input { border: none; background: transparent; }
+    #inputbar { height: 3; border: round #7b838a; margin: 0 2 0 2; padding: 0 1; background: #232a31; }
+    #prompt-glyph { width: 2; content-align: center middle; background: #232a31; }
+    #input { border: none; background: #232a31; }
     #input:focus { border: none; }
     #statusbar { height: auto; margin: 0 2 1 2; }
     #status { width: 1fr; padding: 0 1; content-align: left middle; }
@@ -1548,12 +1853,31 @@ class ChatApp(App):
 
     UNDO_STACK_MAX = 20
 
-    def _push_undo(self, path: str, label: str, original: str, existed_before: bool = True) -> None:
-        self._undo_stack.append(
-            {"path": path, "label": label, "original": original, "existed_before": existed_before}
-        )
+    def _cap_undo_stack(self) -> None:
         if len(self._undo_stack) > self.UNDO_STACK_MAX:
             self._undo_stack.pop(0)
+
+    def _push_undo(self, path: str, label: str, original: str, existed_before: bool = True) -> None:
+        self._undo_stack.append(
+            {
+                "kind": "write", "path": path, "label": label,
+                "original": original, "existed_before": existed_before,
+            }
+        )
+        self._cap_undo_stack()
+
+    def _push_undo_folder(self, path: str, label: str) -> None:
+        self._undo_stack.append({"kind": "folder", "path": path, "label": label})
+        self._cap_undo_stack()
+
+    def _push_undo_move(self, src_path: str, dest_path: str, src_label: str, dest_label: str) -> None:
+        self._undo_stack.append(
+            {
+                "kind": "move", "src_path": src_path, "dest_path": dest_path,
+                "src_label": src_label, "dest_label": dest_label,
+            }
+        )
+        self._cap_undo_stack()
 
     def _add_message(self, message: Message) -> MessageWidget:
         log = self.query_one("#log", VerticalScroll)
@@ -1576,6 +1900,8 @@ class ChatApp(App):
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
         "push": "commit and push the current changes to git",
+        "pull": "pull the latest changes from git",
+        "branch": "create or switch git branches: /branch create <name> | /branch switch <name>",
         "update": "check for a newer version of fm-pcc",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
@@ -1667,6 +1993,10 @@ class ChatApp(App):
             self._run_task(arg)
         elif name == "push":
             self._handle_push()
+        elif name == "pull":
+            self._handle_pull()
+        elif name == "branch":
+            self._handle_branch(arg)
         elif name == "update":
             self.query_one(Input).disabled = True
             self._run_manual_update_check()
@@ -1714,13 +2044,11 @@ class ChatApp(App):
         self._loop_running = True
         self._loop_cancel_requested = False
         history: list[str] = []
-        recent_instructions: list[str] = []
+        recent_steps: list[tuple[str, str]] = []  # (action, "target:instructions")
+        recent_moves: list[tuple[str, str]] = []  # (target, instructions) for RENAME/MOVE only
         start_time = time.monotonic()
         try:
-            candidates = sorted(
-                f for f in os.listdir(cwd)
-                if os.path.isfile(os.path.join(cwd, f)) and not f.startswith(".")
-            )
+            files, folders = gather_task_tree(cwd)
 
             for step in range(1, self.TASK_MAX_STEPS + 1):
                 if self._loop_cancel_requested:
@@ -1731,7 +2059,7 @@ class ChatApp(App):
                     self._log_progress, f"step {step}: deciding what to do next…"
                 )
                 plan = plan_next_step(
-                    task, candidates, cwd, history, self.backend, self.subagent_roles["planning"]
+                    task, files, folders, cwd, history, self.backend, self.subagent_roles["planning"]
                 )
                 if plan is None:
                     if history:
@@ -1741,48 +2069,137 @@ class ChatApp(App):
                     self.call_from_thread(self._log_progress, done_message)
                     break
 
-                filename, instructions = plan["file"], plan["instructions"]
+                action, target, instructions = plan["action"], plan["target"], plan["instructions"]
+                # Only compare against recent steps with the SAME action --
+                # e.g. CREATE_FOLDER test and CREATE_FILE test/path.txt look
+                # textually similar (same target prefix) but are completely
+                # different operations making real progress, not a repeat.
+                stall_key = f"{target}:{instructions}"
+                same_action_recent = [key for a, key in recent_steps if a == action]
 
-                if is_stalling(instructions, recent_instructions):
+                if is_stalling(stall_key, same_action_recent):
                     self.call_from_thread(
                         self._log_progress,
                         f"stopped: step {step} looks like a repeat of a recent "
-                        f"step, not real progress -- {filename}: {instructions}",
+                        f"step, not real progress -- {action} {target}: {instructions}",
                     )
                     break
-                recent_instructions.append(instructions)
+
+                if action in ("RENAME", "MOVE") and (instructions, target) in recent_moves:
+                    # Textually this looks like a *different* step (the
+                    # is_stalling check above won't catch it), but it's
+                    # exactly reversing a move/rename from a few steps
+                    # ago -- seen for real: after correctly moving a file
+                    # into a new folder, on-device sometimes "helpfully"
+                    # proposes moving the whole folder back out instead of
+                    # recognizing the task is done.
+                    self.call_from_thread(
+                        self._log_progress,
+                        f"stopped: step {step} would undo a recent move/rename "
+                        f"({instructions} was just moved to {target}) -- the "
+                        f"task looks done",
+                    )
+                    break
+
+                recent_steps.append((action, stall_key))
+                if action in ("RENAME", "MOVE"):
+                    recent_moves.append((target, instructions))
 
                 self.call_from_thread(
-                    self._log_progress, f"step {step}: {filename} — {instructions}"
+                    self._log_progress,
+                    f"step {step}: {action} {target} — {instructions}".rstrip(" —"),
                 )
 
-                creating = not os.path.isfile(os.path.join(cwd, filename))
+                if action in TASK_GIT_CONFIRM_GATED:
+                    suggestion = {
+                        "GIT_PUSH": "/push",
+                        "GIT_PULL": "/pull",
+                        "GIT_BRANCH_CREATE": f"/branch create {target}",
+                        "GIT_BRANCH_SWITCH": f"/branch switch {target}",
+                    }[action]
+                    self.call_from_thread(
+                        self._log_progress,
+                        f"task wants to run {suggestion} -- that needs your explicit "
+                        f"confirmation, so /task is stopping here. Run {suggestion} "
+                        f"yourself, then re-run /task to continue.",
+                    )
+                    break
+
+                if action == "GIT_ADD":
+                    git_add_all(cwd)
+                    history.append("staged all current changes (git add)")
+                    self.call_from_thread(self._log_progress, "staged all changes")
+                    continue
+
+                if action == "GIT_COMMIT":
+                    # Stage first regardless of whether the plan included a
+                    # separate GIT_ADD step -- on-device doesn't always
+                    # reliably plan both steps in order, and a commit with
+                    # nothing staged just fails outright. "Commit" already
+                    # implies "including whatever changed" for most users
+                    # anyway (the same assumption /push's add-then-commit
+                    # already makes).
+                    if git_status_porcelain(cwd).strip():
+                        git_add_all(cwd)
+                    git_commit(instructions, cwd)
+                    history.append(f"committed locally with message: {instructions}")
+                    self.call_from_thread(self._log_progress, f"committed: {instructions}")
+                    continue
+
+                if action == "CREATE_FOLDER":
+                    result = create_folder(target, cwd)
+                    self._push_undo_folder(result["path"], result["label"])
+                    if target not in folders:
+                        folders.append(target)
+                    history.append(f"{target}: created folder")
+                    self.call_from_thread(self._log_progress, f"created folder {result['label']}")
+                    continue
+
+                if action in ("RENAME", "MOVE"):
+                    result = move_or_rename(target, instructions, cwd)
+                    self._push_undo_move(
+                        result["src_path"], result["dest_path"],
+                        result["src_label"], result["dest_label"],
+                    )
+                    if target in files:
+                        files.remove(target)
+                        files.append(instructions)
+                    elif target in folders:
+                        folders.remove(target)
+                        folders.append(instructions)
+                    history.append(result["summary"])
+                    self.call_from_thread(self._log_progress, result["summary"])
+                    continue
+
+                # EDIT / CREATE_FILE
+                creating = action == "CREATE_FILE"
                 if creating:
-                    proposal = propose_new_file(filename, instructions, cwd)
+                    proposal = propose_new_file(target, instructions, cwd)
                 else:
-                    with open(os.path.join(cwd, filename), "r", errors="replace") as f:
+                    with open(os.path.join(cwd, target), "r", errors="replace") as f:
                         content = f.read()
-                    sections = split_sections(content, filename)
+                    sections = split_sections(content, target)
                     section = pick_section(
-                        instructions, filename, sections, self.backend, self.subagent_roles["planning"]
+                        instructions, target, sections, self.backend, self.subagent_roles["planning"]
                     )
                     proposal = propose_edit(
-                        filename, instructions, cwd, line_range=(section["start"], section["end"])
+                        target, instructions, cwd, line_range=(section["start"], section["end"])
                     )
 
+                os.makedirs(os.path.dirname(proposal["path"]), exist_ok=True)
                 with open(proposal["path"], "w") as f:
                     f.write(proposal["updated"])
                 self._push_undo(
                     proposal["path"], proposal["label"], proposal["original"],
                     existed_before=not creating,
                 )
-                if creating and filename not in candidates:
-                    candidates = sorted(candidates + [filename])
+                if creating and target not in files:
+                    files.append(target)
 
                 diff = diff_preview(proposal["original"], proposal["updated"])
                 self.call_from_thread(self._task_step_applied, proposal, diff)
                 verb = "created" if creating else "edited"
-                history.append(f"{filename}: {verb} -- {proposal['summary']}")
+                history.append(f"{target}: {verb} -- {proposal['summary']}")
             else:
                 self.call_from_thread(
                     self._log_progress,
@@ -1903,32 +2320,42 @@ class ChatApp(App):
             self._add_message(Message("system", "nothing to undo"))
             return
         entry = self._undo_stack.pop()
+        kind = entry.get("kind", "write")
         try:
-            if entry.get("existed_before", True):
-                with open(entry["path"], "w") as f:
-                    f.write(entry["original"])
-                self._add_message(Message("system", f"reverted {entry['label']}"))
-            else:
-                os.remove(entry["path"])
-                self._add_message(Message("system", f"removed {entry['label']} (undid its creation)"))
+            if kind == "write":
+                if entry.get("existed_before", True):
+                    with open(entry["path"], "w") as f:
+                        f.write(entry["original"])
+                    self._add_message(Message("system", f"reverted {entry['label']}"))
+                else:
+                    os.remove(entry["path"])
+                    self._add_message(Message("system", f"removed {entry['label']} (undid its creation)"))
+            elif kind == "folder":
+                os.rmdir(entry["path"])
+                self._add_message(Message("system", f"removed folder {entry['label']} (undid its creation)"))
+            elif kind == "move":
+                shutil.move(entry["dest_path"], entry["src_path"])
+                self._add_message(
+                    Message("system", f"moved {entry['dest_label']} back to {entry['src_label']}")
+                )
         except OSError as e:
-            self._add_message(Message("system", f"couldn't undo the change to {entry['label']}: {e}"))
+            label = entry.get("label") or entry.get("dest_label", "?")
+            self._add_message(Message("system", f"couldn't undo the change to {label}: {e}"))
 
     def _handle_push(self) -> None:
         cwd = os.getcwd()
         try:
-            status = subprocess.run(
-                ["git", "-C", cwd, "status", "--porcelain"],
-                capture_output=True, text=True, timeout=10,
-            )
+            status = git_status_porcelain(cwd)
+        except EditError as e:
+            self._add_message(Message("system", str(e)))
+            return
         except (OSError, subprocess.TimeoutExpired) as e:
             self._add_message(Message("system", f"couldn't check git status: {e}"))
             return
-        if status.returncode != 0:
-            self._add_message(Message("system", "not a git repository here (or git isn't available)"))
-            return
-        if not status.stdout.strip():
-            self._add_message(Message("system", "nothing to push -- working tree is clean"))
+        if not status.strip() and not git_has_unpushed_commits(cwd):
+            self._add_message(
+                Message("system", "nothing to push -- working tree is clean and nothing is ahead of the remote")
+            )
             return
 
         self.query_one(Input).disabled = True
@@ -1940,30 +2367,15 @@ class ChatApp(App):
         cwd = os.getcwd()
         message = self._last_task_description or "automated changes"
         try:
-            add = subprocess.run(
-                ["git", "-C", cwd, "add", "-A"], capture_output=True, text=True, timeout=30
-            )
-            if add.returncode != 0:
-                self.call_from_thread(self._push_finished, False, add.stderr.strip())
-                return
-
-            commit = subprocess.run(
-                ["git", "-C", cwd, "commit", "-m", f"fm-pcc: {message}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if commit.returncode != 0:
-                detail = (commit.stderr or commit.stdout).strip()
-                self.call_from_thread(self._push_finished, False, detail)
-                return
-
-            push = subprocess.run(
-                ["git", "-C", cwd, "push"], capture_output=True, text=True, timeout=120
-            )
-            if push.returncode != 0:
-                detail = (push.stderr or push.stdout).strip()
-                self.call_from_thread(self._push_finished, False, detail)
-                return
-        except (OSError, subprocess.TimeoutExpired) as e:
+            # Only stage/commit if there's actually something dirty -- /task
+            # may have already committed everything itself (via GIT_ADD/
+            # GIT_COMMIT), leaving nothing to add and a `git commit` with
+            # nothing staged would fail before ever reaching the push.
+            if git_status_porcelain(cwd).strip():
+                git_add_all(cwd)
+                git_commit(f"fm-pcc: {message}", cwd)
+            git_push(cwd)
+        except (EditError, OSError, subprocess.TimeoutExpired) as e:
             self.call_from_thread(self._push_finished, False, str(e))
             return
 
@@ -1975,6 +2387,57 @@ class ChatApp(App):
             self._add_message(Message("system", "pushed."))
         else:
             self._add_message(Message("system", f"push failed: {detail[:300]}"))
+
+    def _handle_pull(self) -> None:
+        self.query_one(Input).disabled = True
+        self._add_message(Message("system", "pulling…"))
+        self._run_pull()
+
+    @work(thread=True)
+    def _run_pull(self) -> None:
+        try:
+            output = git_pull(os.getcwd())
+        except (EditError, OSError, subprocess.TimeoutExpired) as e:
+            self.call_from_thread(self._pull_finished, False, str(e))
+            return
+        self.call_from_thread(self._pull_finished, True, output)
+
+    def _pull_finished(self, success: bool, detail: str) -> None:
+        self._enable_input()
+        if success:
+            self._add_message(Message("system", f"pulled.\n{detail}" if detail else "pulled."))
+        else:
+            self._add_message(Message("system", f"pull failed: {detail[:300]}"))
+
+    def _handle_branch(self, arg: str) -> None:
+        parts = arg.split(maxsplit=1)
+        if len(parts) != 2 or parts[0] not in ("create", "switch"):
+            self._add_message(Message("system", "usage: /branch create <name>, or /branch switch <name>"))
+            return
+        action, name = parts
+        self.query_one(Input).disabled = True
+        self._add_message(Message("system", f"{'creating' if action == 'create' else 'switching to'} branch {name}…"))
+        self._run_branch(action, name)
+
+    @work(thread=True)
+    def _run_branch(self, action: str, name: str) -> None:
+        cwd = os.getcwd()
+        try:
+            if action == "create":
+                git_create_branch(name, cwd)
+            else:
+                git_switch_branch(name, cwd)
+        except (EditError, OSError, subprocess.TimeoutExpired) as e:
+            self.call_from_thread(self._branch_finished, False, name, str(e))
+            return
+        self.call_from_thread(self._branch_finished, True, name, "")
+
+    def _branch_finished(self, success: bool, name: str, detail: str) -> None:
+        self._enable_input()
+        if success:
+            self._add_message(Message("system", f"now on branch {name}"))
+        else:
+            self._add_message(Message("system", f"branch operation failed: {detail[:300]}"))
 
     def _handle_subagents(self, arg: str) -> None:
         if not arg:

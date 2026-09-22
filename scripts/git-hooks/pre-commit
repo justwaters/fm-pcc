@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs tests/test_on_device_capabilities.py before every commit and blocks
+# the commit if it fails. Not active by default -- git only runs hooks from
+# a path you've explicitly told it to trust:
+#
+#   git config core.hooksPath scripts/git-hooks
+#
+# (one-time, per clone; see README's "Development" section). The test
+# script itself skips (exit 0) if no on-device model is available here,
+# rather than blocking commits on machines that can't run it at all.
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "pre-commit: running on-device capability tests…"
+uv run --with textual --with rich python3 tests/test_on_device_capabilities.py

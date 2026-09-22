@@ -80,6 +80,40 @@ to the next.
 For local development, install from a checkout instead:
 `uv tool install -e .`
 
+### Development
+
+`tests/test_on_device_capabilities.py` runs real `/task` runs against the
+actual on-device model in scratch temp directories — creating/renaming/
+moving files and folders, and git add/commit/push/branch behavior — since
+the bugs it guards against were all cases where the model's real behavior
+didn't match what the code assumed (a small on-device model asked to
+"create a folder" once created a *file* named `test` instead, because
+`/task` had no folder-creation action at all). Run it directly with
+`uv run tests/test_on_device_capabilities.py`; it exits 0 (including
+"skipped, no on-device model available" on a machine without one set up)
+or 1 on a real behavioral failure.
+
+It forces *both* of `/task`'s subagent roles to on-device, including
+planning — a real `/task` run defaults to Cloud Pro for planning and only
+executes on-device, which is meaningfully more reliable (a bigger model
+planning for a small one to execute). Testing the harder, fully-offline
+configuration on purpose surfaced several real on-device planner
+confusions this way (e.g. writing a whole sentence where a destination
+path belonged, or not recognizing a one-step task as complete and
+proposing a redundant follow-up) that got fixed with clearer prompting
+and, where prompting alone wasn't reliable enough, deterministic
+recovery/rejection in `plan_next_step` itself — catching a known bad
+pattern in code rather than continuing to hope the model avoids it.
+
+To have it block commits automatically, point git at this repo's tracked
+hooks directory (once per clone):
+
+```
+git config core.hooksPath scripts/git-hooks
+```
+
+Not on by default — git only trusts a hooks path you've explicitly set.
+
 ## Usage
 
 ```
@@ -141,8 +175,11 @@ Slash commands, same spirit as `fm chat`:
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
-| `/undo`                      | Revert the last file write (or creation) made by `/edit` or `/task` |
+| `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git             |
+| `/pull`                      | Pull the latest changes from git                        |
+| `/branch create <name>`      | Create a new git branch and switch to it                |
+| `/branch switch <name>`      | Switch to an existing git branch                        |
 | `/update`                    | Check for a newer version now, and say why if it can't tell |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
@@ -163,31 +200,52 @@ available there yet.
 single reviewed change: Cloud Pro plans, on-device executes and **writes
 immediately, with no per-step `/apply`** — closer to a subagent that Cloud
 Pro keeps dispatching to than a one-shot assistant. Each iteration, Cloud
-Pro sees the task, the full content of every file in the directory, and a
-running log of what's already been done, then either says the task is
-done or picks one concrete next step: a filename plus specific
-instructions for just that change. If the filename already exists, that
-file gets deterministically split into sections (real top-level blocks
-for brace languages like CSS/JS, fixed-size chunks otherwise — not
-model-summarized, since that's a mechanical task a parser gets right for
-free), Cloud Pro picks the relevant section, and on-device drafts and
-writes the edit scoped to it — the same machinery `/edit` uses. If the
-filename *doesn't* exist yet, on-device instead writes it from scratch —
-which is what makes `/task make me a website about <product>` work
-starting from an empty directory: the first step creates `index.html`,
-later steps can create `style.css` or edit either file further. New
-filenames are restricted to a plain name in the current directory (no
-subdirectories, no `..`) for both creating and editing. This repeats
-until Cloud Pro says done or a 15-step safety cap is hit. `Esc` `Esc`
-stops it between steps.
+Pro sees the task, the full content of every file in the directory, which
+folders already exist, and a running log of what's already been done,
+then either says the task is done or picks exactly one of:
 
-`/task` never touches git itself — when it finishes having made changes,
-it tells you to run `/push`, which stages everything, commits (using the
-task description as the commit message when there is one), and pushes to
-the current branch's upstream. This is a deliberate separation: file
-changes happen automatically as `/task` runs, but nothing leaves your
-machine until you explicitly ask it to, after you've had a chance to look
-at what got written.
+- **edit** an existing file (the same section-scoped, line-anchored
+  machinery `/edit` uses)
+- **create** a new file, optionally inside a folder that already exists
+  (or was created moments earlier in the same run) — this is what makes
+  `/task make me a website about <product>` work starting from an empty
+  directory: the first step creates `index.html`, later steps can create
+  `style.css` or edit either file further
+- **create** a new, empty folder
+- **rename** or **move** an existing file or folder
+- a **git** operation — see below
+
+Every path is restricted to somewhere inside the current directory (no
+absolute paths, no `..`) for all of these. This repeats until Cloud Pro
+says done or a 15-step safety cap is hit; a step that looks like a
+near-repeat of a recent one (compared only against other steps of the
+*same* kind, so e.g. creating a folder and then a file inside it never
+look like a false repeat of each other) stops the loop early rather than
+spiraling. `Esc` `Esc` stops it between steps.
+
+`/task` can plan git operations too, but treats them in two tiers. Staging
+and committing locally (`git add`, `git commit`) happen automatically, same
+as any other step — they're local and reversible. Pushing, pulling, and
+creating or switching branches never happen automatically: if the task
+calls for one, `/task` stops and tells you to run the matching command
+yourself (`/push`, `/pull`, `/branch create <name>`, `/branch switch
+<name>`) to confirm it, then re-run `/task` to continue. This mirrors how
+`/push` already worked before `/task` could touch git at all: file and
+local-commit changes happen automatically as `/task` runs, but nothing
+leaves your machine, and nothing switches you to a different branch,
+until you explicitly ask it to.
+
+All of `/task`'s actions (edit, create file, create folder, rename, move,
+each git operation) are implemented as a fixed, named vocabulary the
+planning model picks exactly one from per step, each backed by its own
+plain Python function that actually performs it — a deterministic
+"skills" dispatch, in effect. That's deliberate, not a placeholder for
+something fancier: `fm serve`'s OpenAI-style tool-calling was tried first
+and is broken on this OS build (it leaks raw, unparsed generation text
+instead of returning structured tool calls), and a model-invoked tool is
+a weaker guarantee anyway, since a model can simply choose not to call it
+and hallucinate regardless — the same failure mode a fixed-vocabulary
+planner avoids by construction.
 
 This is genuinely autonomous, so it can genuinely go wrong: on real
 testing, a task needing cleanup/consolidation (not just clean additions)
@@ -240,12 +298,15 @@ cloud/cloud-pro/Ollama. `/resume <name>` clears the screen and restores
 all of that; `/resume` with no name lists what's saved instead of
 resuming anything.
 
-`/undo` reverts the most recent file write made by `/apply` or `/task`,
-restoring that file's exact prior content — or, if that step *created*
-the file, removing it entirely rather than leaving an empty file behind.
-It's a stack — repeated `/undo` walks back further, up to the last 20
-writes across both commands — not a single-slot toggle, so it composes
-with a `/task` run that made several changes.
+`/undo` reverts the most recent change made by `/apply` or `/task` —
+restoring a file's exact prior content, removing a file or folder that
+step created rather than leaving an empty one behind, or moving a
+renamed/moved file or folder back where it came from. It's a stack —
+repeated `/undo` walks back further, up to the last 20 changes across
+both commands — not a single-slot toggle, so it composes with a `/task`
+run that made several changes. Undoing a folder's creation only works if
+it's still empty — if a later step put something inside it, that's left
+alone rather than silently deleting a whole tree of other changes.
 
 `/task` and `/ask` post a macOS notification when they finish, but only
 if the run took 5 seconds or longer — quick ones don't bother you. This
