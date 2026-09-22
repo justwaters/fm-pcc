@@ -667,6 +667,7 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
+STATE_PATH = os.path.expanduser("~/.fm-pcc/state.json")
 NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
 CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess
@@ -934,6 +935,29 @@ def ensure_shortcut_installed(
     return False
 
 
+def load_icloud_plus_unavailable() -> set[str]:
+    """Which cloud tiers are known to require iCloud+ this account doesn't
+    have -- persisted so this survives restarts and updates, not just the
+    current session (once seen, that error isn't going away until the
+    account itself changes).
+    """
+    try:
+        with open(STATE_PATH, "r") as f:
+            data = json.load(f)
+        return set(data.get("icloud_plus_unavailable", []))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def save_icloud_plus_unavailable(unavailable: set[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump({"icloud_plus_unavailable": sorted(unavailable)}, f, indent=2)
+    except OSError:
+        pass
+
+
 class Backend:
     """Talks to fm (on-device), Shortcuts (cloud, cloud pro), and Ollama."""
 
@@ -957,7 +981,7 @@ class Backend:
         self._ollama_history: dict[str, list[dict[str, str]]] = {}
         self._ollama_context_tokens: dict[str, int] = {}
         self._ollama_context_length: dict[str, int] = {}
-        self._icloud_plus_unavailable: set[str] = set()
+        self._icloud_plus_unavailable: set[str] = load_icloud_plus_unavailable()
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
@@ -1046,6 +1070,7 @@ class Backend:
                 detail = (result.stderr or result.stdout or "").strip()
                 if "icloud+" in detail.lower():
                     self._icloud_plus_unavailable.add(model)
+                    save_icloud_plus_unavailable(self._icloud_plus_unavailable)
                     raise ICloudPlusRequired(detail)
                 raise RuntimeError(
                     f"Shortcut '{shortcut}' failed: {detail}\n"
@@ -1376,12 +1401,25 @@ class ChatApp(App):
             self._add_message(
                 Message(
                     "system",
-                    f"{model_label(model)} requires iCloud+ on this account — not switching",
+                    f"{model_label(model)} requires iCloud+ on this account — not "
+                    f"switching (run /model reset if that's changed)",
                 )
             )
             return
         self.model = model
         self._add_message(Message("system", f"switched to {model_label(self.model)}"))
+
+    def _reset_icloud_plus_unavailable(self) -> None:
+        if not self.backend._icloud_plus_unavailable:
+            self._add_message(Message("system", "no models are currently marked as requiring iCloud+"))
+            return
+        cleared = sorted(self.backend._icloud_plus_unavailable)
+        self.backend._icloud_plus_unavailable.clear()
+        save_icloud_plus_unavailable(self.backend._icloud_plus_unavailable)
+        labels = ", ".join(model_label(m) for m in cleared)
+        self._add_message(
+            Message("system", f"cleared the iCloud+ restriction for: {labels} — they'll be retried")
+        )
 
     def _open_model_picker(self) -> None:
         palette = self.query_one("#palette", OptionList)
@@ -1472,7 +1510,7 @@ class ChatApp(App):
 
     COMMANDS = {
         "help": "show this help",
-        "model": "open a menu to switch models, or /model <name> directly",
+        "model": "open a menu to switch models, /model <name> directly, or /model reset to clear iCloud+ restrictions",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
         "task": "run a multi-step edit loop, writing as it goes: /task <description>",
         "ask": "research a question via cloud/core subagents: /ask <question>",
@@ -1522,6 +1560,8 @@ class ChatApp(App):
         elif name == "model":
             if not arg:
                 self._open_model_picker()
+            elif arg == "reset":
+                self._reset_icloud_plus_unavailable()
             elif arg in MODEL_LABELS or arg.startswith("ollama:"):
                 self._select_model(arg)
             else:

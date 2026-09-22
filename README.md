@@ -62,8 +62,12 @@ iCloud+ — if it doesn't, Apple's own "Use Model" action fails with an
 error naming that requirement (this doesn't seem to apply to plain
 Cloud). fm-pcc recognizes that specific error, switches you back to
 whichever model you were on before it failed, and greys out the
-affected tier in `/model` (labeled "Requires iCloud+") for the rest of
-the session so it doesn't keep failing the same way.
+affected tier in `/model` (labeled "Requires iCloud+") so it doesn't
+keep failing the same way. This is remembered in `~/.fm-pcc/state.json`,
+not just for the rest of the session — it survives quitting, updating,
+and relaunching fm-pcc, so an update doesn't bring back a tier that's
+already known to be a dead end. If the account's iCloud+ status changes,
+`/model reset` clears it so affected tiers get retried.
 
 For local development, install from a checkout instead:
 `uv tool install -e .`
@@ -109,6 +113,7 @@ Slash commands, same spirit as `fm chat`:
 |-----------------------------|-------------------------------------------------------|
 | `/model`                    | Open a menu to pick a model (`↑`/`↓`, `Enter`/`Tab`) — locally installed Ollama models are listed individually in a tree under `ollama` |
 | `/model <name>`             | Switch directly — `on-device`, `cloud`, `cloud-pro`, `ollama`, or `ollama:<name>` for a specific local model |
+| `/model reset`              | Clear any "requires iCloud+" restrictions and retry those tiers |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
 | `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
 | `/ask <question>`           | Research a question via cloud/core subagents (see below) |
