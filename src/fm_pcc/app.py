@@ -1394,6 +1394,16 @@ class ChatApp(App):
         next_index = (MODEL_ORDER.index(model_family(self.model)) + 1) % len(MODEL_ORDER)
         self._select_model(MODEL_ORDER[next_index])
 
+    def _ollama_available(self) -> bool:
+        """Live check -- covers both "ollama serve isn't running" and "it's
+        running but nothing is pulled," since either way there's nothing to
+        actually talk to.
+        """
+        try:
+            return bool(_ollama_list_models(self.backend.ollama_host))
+        except Exception:
+            return False
+
     def _select_model(self, model: str) -> None:
         if model == self.model:
             return
@@ -1403,6 +1413,15 @@ class ChatApp(App):
                     "system",
                     f"{model_label(model)} requires iCloud+ on this account — not "
                     f"switching (run /model reset if that's changed)",
+                )
+            )
+            return
+        if model_family(model) == "ollama" and not self._ollama_available():
+            self._add_message(
+                Message(
+                    "system",
+                    f"{model_label(model)} isn't reachable — Ollama doesn't seem "
+                    f"to be running, or has no models installed",
                 )
             )
             return
@@ -1445,10 +1464,15 @@ class ChatApp(App):
                 palette.add_option(Option("ollama", id="_header_ollama", disabled=True))
                 continue
             marker = "● " if entry == self.model else "○ "
-            unavailable = entry in self.backend._icloud_plus_unavailable
+            if entry in self.backend._icloud_plus_unavailable:
+                unavailable, note = True, "Requires iCloud+"
+            elif entry == "ollama" and not ollama_models:
+                unavailable, note = True, "Not running"
+            else:
+                unavailable, note = False, None
             label = model_label(entry)
-            if unavailable:
-                label = f"{label} (Requires iCloud+)"
+            if note:
+                label = f"{label} ({note})"
             if entry.startswith("ollama:"):
                 branch = "└─" if i == len(entries) - 1 else "├─"
                 palette.add_option(
@@ -2017,11 +2041,22 @@ class ChatApp(App):
         """
         self._loop_running = True
         self._loop_cancel_requested = False
+        ollama_available = self._ollama_available()
         try:
             for m in MODEL_ORDER:
                 if self._loop_cancel_requested:
                     self.call_from_thread(self._log_progress, "stopped")
                     return
+                if m in self.backend._icloud_plus_unavailable:
+                    self.call_from_thread(
+                        self._log_progress, f"skipping {model_label(m)} (requires iCloud+)"
+                    )
+                    continue
+                if m == "ollama" and not ollama_available:
+                    self.call_from_thread(
+                        self._log_progress, f"skipping {model_label(m)} (not running)"
+                    )
+                    continue
                 self.call_from_thread(self._log_progress, f"asking {model_label(m)}…")
                 try:
                     answer = self.backend.classify(question, m)
@@ -2213,12 +2248,16 @@ class ChatApp(App):
         self._history_index = None
         self._history_draft = ""
 
+        # Always echo what was actually typed, slash command or not -- a
+        # command's own response (e.g. /compare's "asking on-device…" log)
+        # otherwise appears with no visible record of what was asked.
+        self._add_message(Message("user", prompt))
+
         if prompt.startswith("/"):
             self._handle_command(prompt)
             return
 
         event.input.disabled = True
-        self._add_message(Message("user", prompt))
 
         expanded, attachments = expand_file_references(prompt, os.getcwd())
         if attachments:

@@ -69,6 +69,14 @@ and relaunching fm-pcc, so an update doesn't bring back a tier that's
 already known to be a dead end. If the account's iCloud+ status changes,
 `/model reset` clears it so affected tiers get retried.
 
+Ollama gets the same treatment for a different reason: if it isn't
+running, or is running with no models pulled, `/model` shows it greyed
+out too (labeled "Not running"), switching to it directly is refused,
+and `/compare` skips it rather than calling something already known to
+fail. Unlike the iCloud+ case this is checked live each time, not
+persisted, since whether Ollama is running can change from one moment
+to the next.
+
 For local development, install from a checkout instead:
 `uv tool install -e .`
 
@@ -206,8 +214,11 @@ help.
 ollama) the same question, one at a time, and shows each answer as it
 comes back — useful for seeing how they actually differ on a given
 prompt. Uses history-free calls for all of them, so it never affects any
-model's real conversation; if one model errors (e.g. Ollama isn't
-running), that shows up as its answer instead of aborting the rest.
+model's real conversation. It skips whichever models it already knows
+aren't reachable (a cloud tier flagged as requiring iCloud+, or Ollama
+when it isn't running/has no models) rather than pointlessly calling
+them to watch them fail; anything else that errors mid-run still shows
+up as that model's answer instead of aborting the rest.
 
 `/save <name>` writes the current conversation to
 `~/.fm-pcc/sessions/<name>.json` — every message shown on screen, which
