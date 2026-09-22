@@ -57,25 +57,27 @@ installed yet, `fm-pcc` opens its iCloud share link for you —
 — tap **Add Shortcut** in the sheet that appears, and it'll pick up from
 there. On-device chat works with no setup at all.
 
-Cloud Pro in particular also requires the signed-in account to have
-iCloud+ — if it doesn't, Apple's own "Use Model" action fails with an
-error naming that requirement (this doesn't seem to apply to plain
-Cloud). fm-pcc recognizes that specific error, switches you back to
-whichever model you were on before it failed, and greys out the
-affected tier in `/model` (labeled "Requires iCloud+") so it doesn't
-keep failing the same way. This is remembered in `~/.fm-pcc/state.json`,
-not just for the rest of the session — it survives quitting, updating,
-and relaunching fm-pcc, so an update doesn't bring back a tier that's
-already known to be a dead end. If the account's iCloud+ status changes,
-`/model reset` clears it so affected tiers get retried.
+**Cloud tiers fail sometimes** — a usage limit, a network blip, Cloud
+Pro specifically also requires the signed-in account to have iCloud+
+(this doesn't seem to apply to plain Cloud) — and fm-pcc handles this by
+falling back rather than just showing an error: **cloud-pro → cloud →
+on-device**, in that order, stopping at the first tier that actually
+works. This applies to normal chat and to `/task`'s and `/ask`'s
+planning role (which defaults to Cloud Pro) — `/compare` is the one
+exception, since it deliberately wants each tier's own real answer (or a
+clear skip) rather than a substituted one. Whichever tier actually
+answered becomes the active model (and, for `/task`/`/ask`, the new
+planning role) going forward, with a message explaining why.
 
-Ollama gets the same treatment for a different reason: if it isn't
-running, or is running with no models pulled, `/model` shows it greyed
-out too (labeled "Not running"), switching to it directly is refused,
-and `/compare` skips it rather than calling something already known to
-fail. Unlike the iCloud+ case this is checked live each time, not
-persisted, since whether Ollama is running can change from one moment
-to the next.
+A tier that's failed gets greyed out in `/model` so it isn't retried on
+every single message. iCloud+ specifically is remembered in
+`~/.fm-pcc/state.json` — not just for the session, but across quitting,
+updating, and relaunching fm-pcc, since it's a real, persistent account
+fact. Everything else (usage limits, network trouble, Ollama not
+running) is only tracked for the current session, since those are
+transient and a permanent memory of them would eventually be wrong —
+restarting fm-pcc, or running `/model reset`, clears all of it and lets
+those tiers be tried again.
 
 For local development, install from a checkout instead:
 `uv tool install -e .`
@@ -285,10 +287,14 @@ ollama) the same question, one at a time, and shows each answer as it
 comes back — useful for seeing how they actually differ on a given
 prompt. Uses history-free calls for all of them, so it never affects any
 model's real conversation. It skips whichever models it already knows
-aren't reachable (a cloud tier flagged as requiring iCloud+, or Ollama
-when it isn't running/has no models) rather than pointlessly calling
-them to watch them fail; anything else that errors mid-run still shows
-up as that model's answer instead of aborting the rest.
+aren't reachable (a cloud tier flagged as requiring iCloud+ or otherwise
+unavailable this session, or Ollama when it isn't running/has no
+models) rather than pointlessly calling them to watch them fail —
+deliberately *not* falling back the way chat/`/task`/`/ask` do, since
+the whole point here is seeing each tier's own real answer, not a
+substituted one wearing the wrong label. Anything else that errors
+mid-run still shows up as that model's answer instead of aborting the
+rest.
 
 `/save <name>` writes the current conversation to
 `~/.fm-pcc/sessions/<name>.json` — every message shown on screen, which

@@ -723,7 +723,8 @@ def plan_next_step(
         + ("\n\n".join(listing) if listing else "(no files yet)")
         + f"\n\nSteps already taken:\n{progress}"
     )
-    reply = backend.classify(prompt, model).strip()
+    reply, model_used = backend.classify_with_fallback(prompt, model)
+    reply = reply.strip()
     if reply.upper().startswith("DONE"):
         return None
 
@@ -838,7 +839,7 @@ def plan_next_step(
     if action == "GIT_COMMIT" and not instructions:
         instructions = "automated changes"
 
-    return {"action": action, "target": target, "instructions": instructions}
+    return {"action": action, "target": target, "instructions": instructions, "model_used": model_used}
 
 
 def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
@@ -851,7 +852,8 @@ def pick_section(task: str, filename: str, sections: list[dict], backend: "Backe
         f"Which section number is most relevant to this task? "
         f"Reply with just the number, nothing else."
     )
-    reply = backend.classify(prompt, model).strip()
+    reply, _model_used = backend.classify_with_fallback(prompt, model)
+    reply = reply.strip()
     match = re.search(r"\d+", reply)
     index = int(match.group()) if match else -1
     if not (0 <= index < len(sections)):
@@ -880,11 +882,12 @@ def decompose_question(question: str, backend: "Backend", model: str) -> dict:
         "1. <sub-question>\n2. <sub-question>\n"
         f"(as many as needed, no more than {ASK_MAX_SUBQUESTIONS})"
     )
-    reply = backend.classify(prompt, model).strip()
+    reply, model_used = backend.classify_with_fallback(prompt, model)
+    reply = reply.strip()
     upper = reply.upper()
 
     if upper.startswith("ANSWER:"):
-        return {"answer": reply.split(":", 1)[1].strip()}
+        return {"answer": reply.split(":", 1)[1].strip(), "model_used": model_used}
 
     if upper.startswith("SUBQUESTIONS:"):
         # Numbering was requested but isn't always honored -- treat every
@@ -896,9 +899,9 @@ def decompose_question(question: str, backend: "Backend", model: str) -> dict:
             if line:
                 subquestions.append(line)
         if subquestions:
-            return {"subquestions": subquestions[:ASK_MAX_SUBQUESTIONS]}
+            return {"subquestions": subquestions[:ASK_MAX_SUBQUESTIONS], "model_used": model_used}
 
-    return {"answer": reply}
+    return {"answer": reply, "model_used": model_used}
 
 
 def synthesize_answer(
@@ -911,7 +914,8 @@ def synthesize_answer(
         "Using this research, write one clear, complete final answer to the "
         "original question."
     )
-    return backend.classify(prompt, model).strip()
+    text, _model_used = backend.classify_with_fallback(prompt, model)
+    return text.strip()
 
 
 def _gradient(text: str, start: str, end: str) -> Text:
@@ -938,6 +942,17 @@ class ICloudPlusRequired(RuntimeError):
     the signed-in account lacks iCloud+ -- Apple's "Use Model" action's own
     error text for this ("...you must be signed in to an iCloud+ account
     to use the <tier> model") is specific enough to match on reliably.
+    """
+    pass
+
+
+class CloudTierUnavailable(RuntimeError):
+    """Raised for any OTHER Shortcuts-backed cloud tier failure -- usage
+    limit reached, network trouble, a missing/broken shortcut, etc. Unlike
+    ICloudPlusRequired (a permanent account fact, persisted to disk), this
+    is treated as transient and only tracked for the current session: a
+    usage limit resets on its own, so remembering it forever would be
+    actively wrong, not just unhelpful.
     """
     pass
 
@@ -1295,6 +1310,9 @@ def save_icloud_plus_unavailable(unavailable: set[str]) -> None:
         pass
 
 
+FALLBACK_CHAIN = {"cloud-pro": "cloud", "cloud": "on-device"}
+
+
 class Backend:
     """Talks to fm (on-device), Shortcuts (cloud, cloud pro), and Ollama."""
 
@@ -1319,6 +1337,10 @@ class Backend:
         self._ollama_context_tokens: dict[str, int] = {}
         self._ollama_context_length: dict[str, int] = {}
         self._icloud_plus_unavailable: set[str] = load_icloud_plus_unavailable()
+        # model -> short reason, NOT persisted (unlike iCloud+) since these
+        # are transient -- a usage limit resets on its own, so remembering
+        # one forever across restarts would be actively wrong.
+        self._session_unavailable: dict[str, str] = {}
 
     def shortcut_name(self, model: str) -> str:
         return self._shortcut_overrides.get(model, CLOUD_SHORTCUTS[model]["name"])
@@ -1330,12 +1352,38 @@ class Backend:
             history.clear()
         self._ollama_history.clear()
 
-    def respond(self, prompt: str, model: str) -> str:
-        if model == "on-device":
-            return self._respond_on_device(prompt)
-        if model == "ollama" or model.startswith("ollama:"):
-            return self._respond_ollama(prompt, model)
-        return self._respond_cloud(prompt, model)
+    def respond(self, prompt: str, model: str) -> tuple[str, str]:
+        """Dispatch `prompt` to `model`, cascading cloud-pro -> cloud ->
+        on-device on failure (any reason: iCloud+, usage limit, network,
+        a missing shortcut) instead of surfacing a raw error the moment a
+        cloud tier turns out to be unusable. Returns (answer, model
+        actually used) since that can differ from `model` when a fallback
+        happens -- the caller decides whether/how to reflect that.
+
+        A tier already known to be unavailable (iCloud+-restricted this
+        session or persisted, or flagged unavailable earlier this
+        session) is skipped without even attempting it.
+        """
+        current = model
+        while True:
+            if current in self._icloud_plus_unavailable or current in self._session_unavailable:
+                fallback = FALLBACK_CHAIN.get(current)
+                if fallback is None:
+                    reason = self._session_unavailable.get(current, "requires iCloud+")
+                    raise RuntimeError(f"{model_label(current)} is unavailable ({reason})")
+                current = fallback
+                continue
+            try:
+                if current == "on-device":
+                    return self._respond_on_device(prompt), current
+                if current == "ollama" or current.startswith("ollama:"):
+                    return self._respond_ollama(prompt, current), current
+                return self._respond_cloud(prompt, current), current
+            except (ICloudPlusRequired, CloudTierUnavailable):
+                fallback = FALLBACK_CHAIN.get(current)
+                if fallback is None:
+                    raise
+                current = fallback
 
     def _resolve_ollama_model(self, model: str = "ollama") -> str:
         """`model` is either the generic "ollama" (auto-resolve) or a
@@ -1409,13 +1457,16 @@ class Backend:
                     self._icloud_plus_unavailable.add(model)
                     save_icloud_plus_unavailable(self._icloud_plus_unavailable)
                     raise ICloudPlusRequired(detail)
-                raise RuntimeError(
+                reason = "usage limit reached" if "usage limit" in detail.lower() else "unavailable this session"
+                self._session_unavailable[model] = reason
+                raise CloudTierUnavailable(
                     f"Shortcut '{shortcut}' failed: {detail}\n"
                     f"Check it exists ('shortcuts list') and its 'Use Model' "
                     f"action is bound to Shortcut Input."
                 )
             if not os.path.exists(out_path):
-                raise RuntimeError(f"Shortcut '{shortcut}' produced no output.")
+                self._session_unavailable[model] = "unavailable this session"
+                raise CloudTierUnavailable(f"Shortcut '{shortcut}' produced no output.")
 
             return subprocess.run(
                 ["textutil", "-convert", "txt", "-stdout", out_path],
@@ -1437,6 +1488,31 @@ class Backend:
             )
             return text
         return self._run_shortcut(model, prompt)
+
+    def classify_with_fallback(self, prompt: str, model: str) -> tuple[str, str]:
+        """Like classify(), but cascades cloud-pro -> cloud -> on-device on
+        a cloud-tier failure, same as respond(). Used by /task's and
+        /ask's planning role so an exhausted Cloud Pro quota doesn't just
+        break them outright. /compare deliberately does NOT use this --
+        it wants each tier's own real answer or a clear skip, never a
+        different tier's answer silently mislabeled as this one's.
+        """
+        current = model
+        while True:
+            if current in self._icloud_plus_unavailable or current in self._session_unavailable:
+                fallback = FALLBACK_CHAIN.get(current)
+                if fallback is None:
+                    reason = self._session_unavailable.get(current, "requires iCloud+")
+                    raise RuntimeError(f"{model_label(current)} is unavailable ({reason})")
+                current = fallback
+                continue
+            try:
+                return self.classify(prompt, current), current
+            except (ICloudPlusRequired, CloudTierUnavailable):
+                fallback = FALLBACK_CHAIN.get(current)
+                if fallback is None:
+                    raise
+                current = fallback
 
     def _respond_cloud(self, prompt: str, model: str) -> str:
         history = self._cloud_history[model]
@@ -1753,6 +1829,16 @@ class ChatApp(App):
                 )
             )
             return
+        if model in self.backend._session_unavailable:
+            self._add_message(
+                Message(
+                    "system",
+                    f"{model_label(model)} {self.backend._session_unavailable[model]} — "
+                    f"not switching (this clears automatically on restart, or once it's "
+                    f"reachable again)",
+                )
+            )
+            return
         if model_family(model) == "ollama" and not self._ollama_available():
             self._add_message(
                 Message(
@@ -1766,15 +1852,16 @@ class ChatApp(App):
         self._add_message(Message("system", f"switched to {model_label(self.model)}"))
 
     def _reset_icloud_plus_unavailable(self) -> None:
-        if not self.backend._icloud_plus_unavailable:
-            self._add_message(Message("system", "no models are currently marked as requiring iCloud+"))
+        cleared = sorted(self.backend._icloud_plus_unavailable | set(self.backend._session_unavailable))
+        if not cleared:
+            self._add_message(Message("system", "no models are currently marked as unavailable"))
             return
-        cleared = sorted(self.backend._icloud_plus_unavailable)
         self.backend._icloud_plus_unavailable.clear()
         save_icloud_plus_unavailable(self.backend._icloud_plus_unavailable)
+        self.backend._session_unavailable.clear()
         labels = ", ".join(model_label(m) for m in cleared)
         self._add_message(
-            Message("system", f"cleared the iCloud+ restriction for: {labels} — they'll be retried")
+            Message("system", f"cleared the unavailable status for: {labels} — they'll be retried")
         )
 
     def _open_model_picker(self) -> None:
@@ -1803,6 +1890,9 @@ class ChatApp(App):
             marker = "● " if entry == self.model else "○ "
             if entry in self.backend._icloud_plus_unavailable:
                 unavailable, note = True, "Requires iCloud+"
+            elif entry in self.backend._session_unavailable:
+                unavailable = True
+                note = self.backend._session_unavailable[entry].capitalize()
             elif entry == "ollama" and not ollama_models:
                 unavailable, note = True, "Not running"
             else:
@@ -1890,7 +1980,7 @@ class ChatApp(App):
 
     COMMANDS = {
         "help": "show this help",
-        "model": "open a menu to switch models, /model <name> directly, or /model reset to clear iCloud+ restrictions",
+        "model": "open a menu to switch models, /model <name> directly, or /model reset to clear unavailable-model restrictions",
         "edit": "propose an edit: /edit <path> <instructions> (on-device only)",
         "task": "run a multi-step edit loop, writing as it goes: /task <description>",
         "ask": "research a question via cloud/core subagents: /ask <question>",
@@ -2069,6 +2159,7 @@ class ChatApp(App):
                     self.call_from_thread(self._log_progress, done_message)
                     break
 
+                self._note_planning_fallback(plan["model_used"])
                 action, target, instructions = plan["action"], plan["target"], plan["instructions"]
                 # Only compare against recent steps with the SAME action --
                 # e.g. CREATE_FOLDER test and CREATE_FILE test/path.txt look
@@ -2224,6 +2315,23 @@ class ChatApp(App):
 
     def _log_progress(self, text: str) -> None:
         self._add_message(Message("system", text))
+
+    def _note_planning_fallback(self, model_used: str) -> None:
+        """If a /task or /ask planning call actually used a different
+        model than the configured "planning" role (Backend fell back
+        internally), keep that role pointed at what's actually working for
+        the rest of this run instead of re-attempting a known-dead tier
+        every single step, and say so once. Safe to call from a worker
+        thread -- plain dict mutation, same as the rest of /task's state.
+        """
+        if model_used != self.subagent_roles["planning"]:
+            previous = self.subagent_roles["planning"]
+            self.subagent_roles["planning"] = model_used
+            self.call_from_thread(
+                self._log_progress,
+                f"{model_label(previous)} unavailable — planning role switched to "
+                f"{model_label(model_used)}",
+            )
 
     @staticmethod
     def _sanitize_session_name(name: str) -> str:
@@ -2487,6 +2595,8 @@ class ChatApp(App):
                 self._log_progress, f"{model_label(planning_model)} is thinking this through…"
             )
             plan = decompose_question(question, self.backend, planning_model)
+            self._note_planning_fallback(plan["model_used"])
+            planning_model = self.subagent_roles["planning"]
 
             if "answer" in plan:
                 self.call_from_thread(self._ask_answered, plan["answer"])
@@ -2545,6 +2655,12 @@ class ChatApp(App):
                 if m in self.backend._icloud_plus_unavailable:
                     self.call_from_thread(
                         self._log_progress, f"skipping {model_label(m)} (requires iCloud+)"
+                    )
+                    continue
+                if m in self.backend._session_unavailable:
+                    self.call_from_thread(
+                        self._log_progress,
+                        f"skipping {model_label(m)} ({self.backend._session_unavailable[m]})",
                     )
                     continue
                 if m == "ollama" and not ollama_available:
@@ -2770,41 +2886,41 @@ class ChatApp(App):
     def _respond(self, prompt: str) -> None:
         model = self.model
         try:
-            text = self.backend.respond(prompt, model)
-            self.call_from_thread(self._finish_turn, text, None)
+            text, model_used = self.backend.respond(prompt, model)
+            fell_back = (model, model_used) if model_used != model else None
+            self.call_from_thread(self._finish_turn, text, None, fell_back)
         except GenerationCancelled:
             self.call_from_thread(self._finish_cancelled)
-        except ICloudPlusRequired as e:
-            self.call_from_thread(self._finish_icloud_plus_required, model, str(e))
         except Exception as e:
-            self.call_from_thread(self._finish_turn, None, str(e))
+            self.call_from_thread(self._finish_turn, None, str(e), None)
 
-    def _finish_turn(self, text: str | None, error: str | None) -> None:
+    def _unavailable_reason_text(self, model: str) -> str:
+        if model in self.backend._icloud_plus_unavailable:
+            return "requires iCloud+ on this account"
+        return self.backend._session_unavailable.get(model, "is unavailable")
+
+    def _finish_turn(
+        self, text: str | None, error: str | None, fell_back: tuple[str, str] | None = None
+    ) -> None:
         if self._thinking is not None:
             self._thinking.remove()
             self._thinking = None
+        if fell_back is not None:
+            requested, used = fell_back
+            self.model = used
+            self._add_message(
+                Message(
+                    "system",
+                    f"{model_label(requested)} {self._unavailable_reason_text(requested)} "
+                    f"— switched to {model_label(used)}",
+                )
+            )
         if error is not None:
             self._add_message(Message("system", f"error: {error}"))
         else:
             self.turn += 1
             self._add_message(Message("assistant", text))
             self._update_chrome()
-        self._enable_input()
-
-    def _finish_icloud_plus_required(self, failed_model: str, error: str) -> None:
-        if self._thinking is not None:
-            self._thinking.remove()
-            self._thinking = None
-        fallback = self._previous_model if self._previous_model != failed_model else None
-        fallback = fallback or "on-device"
-        self._add_message(
-            Message(
-                "system",
-                f"error: {model_label(failed_model)} requires iCloud+ on this "
-                f"account ({error}) — switching back to {model_label(fallback)}",
-            )
-        )
-        self.model = fallback
         self._enable_input()
 
     def _enable_input(self) -> None:
@@ -2903,7 +3019,13 @@ def main() -> None:
         backend = Backend(
             _shortcut_overrides(args), ollama_model=args.ollama_model, ollama_host=args.ollama_host
         )
-        print(backend.respond(expanded, args.model))
+        text, model_used = backend.respond(expanded, args.model)
+        if model_used != args.model:
+            print(
+                f"[{model_label(args.model)} unavailable, used {model_label(model_used)} instead]",
+                file=sys.stderr,
+            )
+        print(text)
         return
 
     ChatApp(
