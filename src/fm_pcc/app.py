@@ -670,12 +670,7 @@ SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
 NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
 CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess
-UPDATE_CHECK_URL = "https://raw.githubusercontent.com/justwaters/fm-pcc/master/src/fm_pcc/__init__.py"
-
-
-def _parse_version(text: str) -> str | None:
-    match = re.search(r'__version__\s*=\s*"([^"]+)"', text)
-    return match.group(1) if match else None
+UPDATE_CHECK_URL = "https://api.github.com/repos/justwaters/fm-pcc/releases/latest"
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
@@ -692,19 +687,26 @@ def is_newer(candidate: str, current: str) -> bool:
     return _version_tuple(candidate) > _version_tuple(current)
 
 
-def fetch_latest_version(url: str = UPDATE_CHECK_URL, timeout: float = 4.0) -> str | None:
-    """Best-effort check for a newer version, by reading __version__ straight
-    out of __init__.py on the repo's default branch -- no release/tag system
-    to query, and this needs no auth and isn't subject to API rate limits.
-    Never raises; returns None on any failure (offline, timeout, unexpected
-    content) so a failed check just means no update button, not a crash.
+def fetch_latest_version(
+    url: str = UPDATE_CHECK_URL, timeout: float = 4.0
+) -> tuple[str | None, str | None]:
+    """Check GitHub's "latest release" for this repo. Returns (version,
+    None) on success or (None, error) on failure (offline, timeout, no
+    releases yet, unexpected content) -- never raises, so the startup check
+    can just skip showing a button on failure, while /update can surface
+    the actual error for a human to debug instead of failing silently.
     """
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            text = resp.read().decode("utf-8", "replace")
-    except Exception:
-        return None
-    return _parse_version(text)
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        return None, str(e)
+    tag = data.get("tag_name") or ""
+    version = tag[1:] if tag.startswith("v") else tag
+    if not version:
+        return None, f"unexpected response: {data!r}"[:200]
+    return version, None
 
 
 def _git_repo_name(cwd: str) -> str | None:
@@ -1271,7 +1273,7 @@ class ChatApp(App):
 
     @work(thread=True)
     def _check_for_update(self) -> None:
-        latest = fetch_latest_version()
+        latest, _error = fetch_latest_version()
         if latest and is_newer(latest, __version__):
             self.call_from_thread(self._show_update_button, latest)
 
@@ -1280,6 +1282,21 @@ class ChatApp(App):
         button = self.query_one("#update-button", Button)
         button.label = f"Update (v{__version__} -> v{latest})"
         button.display = True
+
+    @work(thread=True)
+    def _run_manual_update_check(self) -> None:
+        latest, error = fetch_latest_version()
+        self.call_from_thread(self._manual_update_check_finished, latest, error)
+
+    def _manual_update_check_finished(self, latest: str | None, error: str | None) -> None:
+        self._enable_input()
+        if error:
+            self._add_message(Message("system", f"update check failed: {error}"))
+        elif latest and is_newer(latest, __version__):
+            self._show_update_button(latest)
+            self._add_message(Message("system", f"update available: v{__version__} -> v{latest}"))
+        else:
+            self._add_message(Message("system", f"up to date (v{__version__})"))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "update-button":
@@ -1465,6 +1482,7 @@ class ChatApp(App):
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
         "push": "commit and push the current changes to git",
+        "update": "check for a newer version of fm-pcc",
         "apply": "write the pending proposed edit",
         "discard": "discard the pending proposed edit",
         "clear": "start a new conversation",
@@ -1553,6 +1571,9 @@ class ChatApp(App):
             self._run_task(arg)
         elif name == "push":
             self._handle_push()
+        elif name == "update":
+            self.query_one(Input).disabled = True
+            self._run_manual_update_check()
         elif name == "apply":
             self._apply_pending_edit()
         elif name == "discard":

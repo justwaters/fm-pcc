@@ -118,6 +118,7 @@ Slash commands, same spirit as `fm chat`:
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
 | `/undo`                      | Revert the last file write (or creation) made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git             |
+| `/update`                    | Check for a newer version now, and say why if it can't tell |
 | `/apply`                    | Write the pending edit proposed by `/edit`             |
 | `/discard`                  | Discard the pending edit proposed by `/edit`           |
 | `/clear`                    | Start a new conversation                               |
@@ -248,13 +249,17 @@ rough indicator, not a reliable count, for those two tiers specifically.
 
 Next to the statusline, on the right, an **Update (vX.XX -> vY.YY)**
 button appears whenever a newer version is available — checked once at
-startup by reading `__version__` straight out of `__init__.py` on the
-repo's default branch (no release/tag system to query). It's invisible
-the rest of the time, when you're already up to date. Clicking it runs
-`uv tool upgrade fm-pcc` in the background and reports success or
-failure as a message; since the running process already has its own
-code loaded in memory, you'll need to restart fm-pcc afterward to
-actually use the new version.
+startup against this repo's [latest GitHub
+release](https://github.com/justwaters/fm-pcc/releases/latest). It's
+invisible the rest of the time, when you're already up to date. Clicking
+it runs `uv tool upgrade fm-pcc` in the background and reports success or
+failure as a message; since the running process already has its own code
+loaded in memory, you'll need to restart fm-pcc afterward to actually use
+the new version. `/update` re-runs that same check on demand and always
+reports something — up to date, an update found (which also shows the
+button), or the actual error if the check itself failed (offline, GitHub
+unreachable, etc.) — since the startup check stays silent on failure by
+design and gives you no way to tell why nothing showed up.
 
 ### Keybindings (TUI)
 
