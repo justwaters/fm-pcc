@@ -14,6 +14,7 @@ assert m._version_tuple("0.34") == (0, 34)
 assert m.is_newer("0.34", "0.33") is True
 assert m.is_newer("0.33", "0.33") is False
 assert m.is_newer("0.32", "0.33") is False
+assert m.is_newer("0.47.1", "0.47") and m.is_newer("0.48", "0.47.1") and not m.is_newer("0.47", "0.47.1")
 print("version helpers OK")
 
 class FakeResp:
