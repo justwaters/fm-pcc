@@ -1018,8 +1018,11 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 OLLAMA_HOST_DEFAULT = "http://localhost:11434"
-SESSIONS_DIR = os.path.expanduser("~/.fm-pcc/sessions")
-STATE_PATH = os.path.expanduser("~/.fm-pcc/state.json")
+# FM_PCC_HOME relocates saved sessions and state -- tests/run.sh points it
+# at a temp dir so tests never read or write the real ~/.fm-pcc.
+FM_PCC_HOME = os.environ.get("FM_PCC_HOME") or os.path.expanduser("~/.fm-pcc")
+SESSIONS_DIR = os.path.join(FM_PCC_HOME, "sessions")
+STATE_PATH = os.path.join(FM_PCC_HOME, "state.json")
 NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
 CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess

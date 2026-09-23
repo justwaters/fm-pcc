@@ -40,6 +40,11 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Every commit already ran the fast suite (pre-commit hook); the slow
+# real-model suite only gates releases, since it takes minutes.
+echo "release: running full test suite before tagging ${tag}…"
+tests/run.sh all
+
 notes_file=$(mktemp)
 trap 'rm -f "$notes_file"' EXIT
 

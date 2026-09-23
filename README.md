@@ -84,31 +84,42 @@ For local development, install from a checkout instead:
 
 ### Development
 
-`tests/test_on_device_capabilities.py` runs real `/task` runs against the
-actual on-device model in scratch temp directories — creating/renaming/
-moving files and folders, and git add/commit/push/branch behavior — since
-the bugs it guards against were all cases where the model's real behavior
-didn't match what the code assumed (a small on-device model asked to
-"create a folder" once created a *file* named `test` instead, because
-`/task` had no folder-creation action at all). Run it directly with
-`uv run tests/test_on_device_capabilities.py`; it exits 0 (including
-"skipped, no on-device model available" on a machine without one set up)
-or 1 on a real behavioral failure.
+Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
 
-It forces *both* of `/task`'s subagent roles to on-device, including
-planning — a real `/task` run defaults to Cloud Pro for planning and only
-executes on-device, which is meaningfully more reliable (a bigger model
-planning for a small one to execute). Testing the harder, fully-offline
-configuration on purpose surfaced several real on-device planner
-confusions this way (e.g. writing a whole sentence where a destination
-path belonged, or not recognizing a one-step task as complete and
-proposing a redundant follow-up) that got fixed with clearer prompting
-and, where prompting alone wasn't reliable enough, deterministic
-recovery/rejection in `plan_next_step` itself — catching a known bad
-pattern in code rather than continuing to hope the model avoids it.
+- **`tests/fast/`** — mocked, offline tests of the TUI and backends
+  (Textual's headless `run_test()` harness, fake shortcut/`fm`/git
+  results, throwaway temp git repos). About 15 seconds total; no model
+  calls.
+- **`tests/slow/`** — real `/task` runs against the actual on-device
+  model in scratch temp directories: creating/renaming/moving files and
+  folders, and git add/commit/push/branch behavior. About 30 seconds.
+  These guard against cases where the model's real behavior didn't match
+  what the code assumed (a small on-device model asked to "create a
+  folder" once created a *file* named `test` instead, because `/task` had
+  no folder-creation action at all). They pass as "skipped" on a machine
+  without an on-device model set up.
 
-To have it block commits automatically, point git at this repo's tracked
-hooks directory (once per clone):
+The slow suite forces *both* of `/task`'s subagent roles to on-device,
+including planning — a real `/task` run defaults to Cloud Pro for
+planning and only executes on-device, which is meaningfully more
+reliable (a bigger model planning for a small one to execute). Testing
+the harder, fully-offline configuration on purpose surfaced several real
+on-device planner confusions (e.g. writing a whole sentence where a
+destination path belonged, or not recognizing a one-step task as
+complete and proposing a redundant follow-up) that got fixed with
+clearer prompting and, where prompting alone wasn't reliable enough,
+deterministic recovery/rejection in `plan_next_step` itself — catching a
+known bad pattern in code rather than continuing to hope the model
+avoids it.
+
+Every test runs with `FM_PCC_HOME` pointed at its own temp directory, so
+tests never read or write your real `~/.fm-pcc` (saved sessions, and
+remembered unavailable tiers that would otherwise change outcomes).
+
+The fast suite runs before every commit, and `scripts/release.sh` runs
+both suites before tagging — a failure blocks either one. To enable the
+commit hook, point git at this repo's tracked hooks directory (once per
+clone):
 
 ```
 git config core.hooksPath scripts/git-hooks

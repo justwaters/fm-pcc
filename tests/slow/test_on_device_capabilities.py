@@ -12,12 +12,12 @@ assumes (that's exactly how the reported bugs this file guards against were
 found: a small on-device model given "create a folder" created a file named
 "test" instead, because /task's code had no folder-creation action at all).
 
-Run directly: uv run tests/test_on_device_capabilities.py
+Run directly: uv run tests/slow/test_on_device_capabilities.py
 Exit code 0 = all good (including "skipped, no on-device model available").
 Exit code 1 = a real behavioral failure.
 
-Wired up as this repo's pre-commit hook (see scripts/git-hooks/pre-commit) --
-every commit runs this first and is blocked if it fails.
+Too slow to run on every commit (dozens of real model calls) -- run via
+`tests/run.sh slow`, and scripts/release.sh runs it before tagging.
 """
 
 import asyncio
@@ -28,7 +28,7 @@ import sys
 import tempfile
 import unittest.mock as mock
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import fm_pcc.app as m  # noqa: E402
