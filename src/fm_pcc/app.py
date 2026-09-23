@@ -1567,7 +1567,9 @@ class ChatApp(App):
     #banner { padding: 1 2 0 2; }
     #subtitle { padding: 0 2 1 2; color: #7b838a; }
     #log { padding: 0 2; }
-    .msg-user { margin: 1 0 0 0; }
+    /* Sent messages sit on a gray band, like Claude Code's CLI, so your
+       side of the conversation is easy to pick out when scrolling back. */
+    .msg-user { margin: 1 0 0 0; padding: 0 1; background: #2a3138; }
     .msg-assistant { margin: 1 0 0 0; }
     .msg-system { margin: 1 0 0 0; }
     .msg-thinking { margin: 1 0 0 0; }
@@ -1580,9 +1582,9 @@ class ChatApp(App):
         background: #1b2126;
     }
     #palette > .option-list--option-highlighted { background: #2a3138; }
-    #inputbar { height: 3; border: round #7b838a; margin: 0 2 0 2; padding: 0 1; background: #232a31; }
-    #prompt-glyph { width: 2; content-align: center middle; background: #232a31; }
-    #input { border: none; background: #232a31; }
+    #inputbar { height: 3; border: round #7b838a; margin: 0 2 0 2; padding: 0 1; }
+    #prompt-glyph { width: 2; content-align: center middle; }
+    #input { border: none; background: transparent; }
     #input:focus { border: none; }
     #statusbar { height: auto; margin: 0 2 1 2; }
     #status { width: 1fr; padding: 0 1; content-align: left middle; }

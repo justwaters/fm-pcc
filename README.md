@@ -142,6 +142,9 @@ fm-pcc --model ollama --ollama-model llama3.2   # ...or a specific one
 
 ### In the chat
 
+Messages you've sent sit on a gray band, like in Claude Code's CLI, so
+your side of the conversation is easy to spot when scrolling back.
+
 On startup, if the current directory is a git repo and/or has a README,
 fm-pcc shows a one-line orientation note (repo name, file count, the
 README's first line) — no model call involved, just local filesystem
