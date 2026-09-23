@@ -150,7 +150,7 @@ message that `/task` fully understands on its own ("can you please commit
 and push", "rename app.js to main.js", "add a comment to app.js…") is run
 as `/task` directly. A message that reads like a change request but isn't
 fully understood ("i want the ui to have a green and yellow theme") gets a
-normal chat reply plus a tip; replying "do it" / "yes, do that" then runs
+normal chat reply plus a tip; replying "do it", "you do it", or "yes, do that" then runs
 that request as `/task`. Questions ("what happens if I rename…?") always
 stay chat, so talking *about* a change never makes one.
 
@@ -202,6 +202,7 @@ Slash commands, same spirit as `fm chat`:
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
+| `/export [file\|copy]`       | Export the transcript as Markdown (or `.txt`/`.json`), or copy it |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
 | `/pull`                      | Pull the latest changes from git                        |
@@ -340,6 +341,15 @@ the whole point here is seeing each tier's own real answer, not a
 substituted one wearing the wrong label. Anything else that errors
 mid-run still shows up as that model's answer instead of aborting the
 rest.
+
+`/export` writes everything shown on screen — your messages, replies,
+and `/task`'s plans and diffs — to `fm-pcc-transcript-<timestamp>.md` in
+the current directory, readable as-is or on GitHub (diffs in `diff`
+blocks). `/export <file>` picks the name, with the format from its
+extension: `.md`, `.txt` (plain text, like the screen), or `.json`.
+`/export copy` puts the Markdown on the clipboard instead. It never
+overwrites an existing file. Unlike `/save`, an export is for reading or
+sharing, not for `/resume`.
 
 `/save <name>` writes the current conversation to
 `~/.fm-pcc/sessions/<name>.json` — every message shown on screen, which

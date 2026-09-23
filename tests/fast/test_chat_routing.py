@@ -60,9 +60,9 @@ async def main():
                 assert any('reply "do it"' in t for t in texts(app)), texts(app)
                 print("vague change request goes to chat, with a do-it tip OK")
 
-                await say(app, pilot, "yes, do that")
+                await say(app, pilot, "you do it")
                 assert tasks[-1] == "i want the ui to have a green and yellow theme", tasks
-                print('"yes, do that" runs the discussed change as /task OK')
+                print('"you do it" runs the discussed change as /task OK')
 
                 await say(app, pilot, "yes")
                 assert len(tasks) == 2 and len(chats) == 3, (tasks, chats)

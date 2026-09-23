@@ -1637,6 +1637,46 @@ class Backend:
         return chars // 4, CLOUD_CONTEXT_TOKENS_ESTIMATE
 
 
+_EXPORT_STATUS_PREFIXES = (
+    "exported ", "copied the transcript", "nothing to export", "couldn't export", "couldn't copy",
+)
+
+
+def render_transcript(messages: list["Message"], fmt: str, header: dict) -> str:
+    """The transcript as Markdown ("md"), plain text ("txt"), or JSON."""
+    if fmt == "json":
+        return json.dumps(
+            {**header, "messages": [{"role": m.role, "text": m.text} for m in messages]}, indent=2
+        ) + "\n"
+    if fmt == "txt":
+        out = [f"fm-pcc transcript -- {header['exported']} -- {header['directory']}", ""]
+        for m in messages:
+            prefix = {"user": "you › ", "assistant": "fm-pcc › "}.get(m.role, "")
+            out += [prefix + m.text, ""]
+        return "\n".join(out)
+
+    out = [
+        "# fm-pcc transcript",
+        "",
+        f"Exported {header['exported']} from `{header['directory']}` "
+        f"(fm-pcc v{header['version']}, model: {header['model']})",
+        "",
+    ]
+    for m in messages:
+        if m.role == "user":
+            out += ["---", "", f"**you ›** {m.text}", ""]
+        elif m.role == "assistant":
+            out += ["**fm-pcc ›**", "", m.text, ""]
+        elif "\n" in m.text:
+            # /task plans, file diffs, errors: keep them verbatim.
+            lang = "diff" if re.search(r"^(?:---|\+\+\+|@@)", m.text, re.MULTILINE) else "text"
+            fence = "````" if "```" in m.text else "```"
+            out += [f"{fence}{lang}", m.text, fence, ""]
+        else:
+            out += [f"> {m.text}", ""]
+    return "\n".join(out).rstrip() + "\n"
+
+
 @dataclass
 class Message:
     role: str  # "user" | "assistant" | "system" | "thinking"
@@ -1747,6 +1787,10 @@ class ChatApp(App):
         self._loop_cancel_requested = False
         self.subagent_roles: dict[str, str] = {"planning": "cloud-pro", "building": "on-device"}
         self._message_log: list[Message] = []
+        # Everything shown on screen (user, assistant, and system lines like
+        # /task plans and diffs) for /export -- _message_log is just the
+        # conversation /save needs to restore.
+        self._transcript: list[Message] = []
         self._undo_stack: list[dict] = []
         self._branch = git_branch(os.getcwd())
         self._previous_model: str | None = None
@@ -1997,6 +2041,7 @@ class ChatApp(App):
         self.backend.reset()
         self.turn = 0
         self._message_log = []
+        self._transcript = []
         self.query_one("#log", VerticalScroll).remove_children()
         self._update_chrome()
         self._add_message(Message("system", "conversation reset"))
@@ -2046,6 +2091,8 @@ class ChatApp(App):
         log.scroll_end(animate=False)
         if message.role in ("user", "assistant"):
             self._message_log.append(message)
+        if message.role != "thinking":
+            self._transcript.append(message)
         return widget
 
     COMMANDS = {
@@ -2057,6 +2104,7 @@ class ChatApp(App):
         "subagents": "show or set the planning/building roles: /subagents [planning|building] <model>",
         "compare": "ask every model the same question: /compare <question>",
         "save": "save the conversation: /save <name>",
+        "export": "export the transcript: /export [file.md|file.txt|file.json|copy]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
         "push": "commit and push the current changes to git",
@@ -2129,6 +2177,8 @@ class ChatApp(App):
             self._run_compare(arg)
         elif name == "save":
             self._handle_save(arg)
+        elif name == "export":
+            self._handle_export(arg)
         elif name == "resume":
             self._handle_resume(arg)
         elif name == "undo":
@@ -2409,6 +2459,58 @@ class ChatApp(App):
             return
         self._add_message(Message("system", f"saved session '{name}'"))
 
+    def _handle_export(self, arg: str) -> None:
+        """Write everything on screen to a file (Markdown by default; .txt
+        and .json by extension) or, with "copy", to the clipboard. Unlike
+        /save, this is for reading or sharing, not for /resume."""
+        # Leave out /export's own bookkeeping: the echoed commands and
+        # their status lines, from this export and any earlier ones.
+        messages = [
+            msg for msg in self._transcript
+            if not (msg.role == "user" and msg.text.startswith("/export"))
+            and not (msg.role == "system" and msg.text.startswith(_EXPORT_STATUS_PREFIXES))
+        ]
+        if not messages:
+            self._add_message(Message("system", "nothing to export yet"))
+            return
+        target = arg.strip()
+        cwd = os.getcwd()
+        header = {
+            "exported": time.strftime("%Y-%m-%d %H:%M"),
+            "directory": cwd,
+            "model": model_label(self.model),
+            "version": __version__,
+        }
+
+        if target.lower() in ("copy", "clipboard"):
+            text = render_transcript(messages, "md", header)
+            try:
+                subprocess.run(["pbcopy"], input=text, text=True, check=True, timeout=10)
+            except (OSError, subprocess.SubprocessError) as e:
+                self._add_message(Message("system", f"couldn't copy to the clipboard: {e}"))
+                return
+            self._add_message(Message("system", f"copied the transcript ({len(messages)} messages) to the clipboard"))
+            return
+
+        if not target:
+            target = f"fm-pcc-transcript-{time.strftime('%Y%m%d-%H%M%S')}.md"
+        path = os.path.abspath(os.path.join(cwd, os.path.expanduser(target)))
+        ext = os.path.splitext(path)[1].lower()
+        fmt = {".txt": "txt", ".json": "json"}.get(ext, "md")
+        if not ext:
+            path += ".md"
+        if os.path.exists(path):
+            self._add_message(Message("system", f"couldn't export: {path} already exists -- pick another name"))
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(render_transcript(messages, fmt, header))
+        except OSError as e:
+            self._add_message(Message("system", f"couldn't export: {e}"))
+            return
+        self._add_message(Message("system", f"exported {len(messages)} messages to {path}"))
+
     def _handle_resume(self, arg: str) -> None:
         name = arg.strip()
         if not name:
@@ -2453,6 +2555,7 @@ class ChatApp(App):
 
         self.query_one("#log", VerticalScroll).remove_children()
         self._message_log = []
+        self._transcript = []
         for m in snapshot.get("messages", []):
             self._add_message(Message(m["role"], m["text"]))
 

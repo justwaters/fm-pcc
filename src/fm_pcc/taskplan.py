@@ -1589,8 +1589,10 @@ def check_relevant(instructions: str, original: str, updated: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _AFFIRM_RE = re.compile(
-    r"^(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|go\s+ahead|do\s+(?:it|that|this|so)|make\s+it\s+so|"
-    r"sounds\s+good|let'?s\s+do\s+(?:it|that)|go\s+for\s+it|y|thanks?)\b[\s,.!]*)+$",
+    r"^(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|go\s+ahead|make\s+it\s+so|sounds\s+good|"
+    r"(?:(?:can|could|would|will)\s+)?you\s+(?:do|make|change|apply)\s+(?:it|that|this|them|those|the\s+change)|"
+    r"(?:do|apply|make)\s+(?:it|that|this|so|them|those|the\s+changes?)|let'?s\s+do\s+(?:it|that)|"
+    r"go\s+for\s+it|for\s+me|yourself|then|now|y|thanks?)\b[\s,.!?]*)+$",
     _I,
 )
 _ACTION_CUE_RE = re.compile(
