@@ -137,18 +137,13 @@ async def main():
         def sync_call_from_thread(fn, *a, **kw):
             return fn(*a, **kw)
 
-        calls = {"n": 0}
         def fake_classify_with_fallback(prompt, model):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # simulate: asked for cloud-pro, backend fell back to cloud
-                return "ACTION: GIT_ADD\nTARGET: \nINSTRUCTIONS: ", "cloud"
-            return "DONE", "cloud"
+            # simulate: asked for cloud-pro, backend fell back to cloud
+            return '{"steps": []}', "cloud"
 
         with mock.patch.object(app, "call_from_thread", side_effect=sync_call_from_thread), \
              mock.patch.object(m, "notify"), \
-             mock.patch.object(app.backend, "classify_with_fallback", side_effect=fake_classify_with_fallback), \
-             mock.patch.object(m, "git_add_all"):
+             mock.patch.object(app.backend, "classify_with_fallback", side_effect=fake_classify_with_fallback):
             app._run_task.__wrapped__(app, "do something")
         assert app.subagent_roles["planning"] == "cloud", app.subagent_roles
         print("/task planning role updates after a fallback OK")

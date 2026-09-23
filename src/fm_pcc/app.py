@@ -42,7 +42,7 @@ from textual.reactive import reactive
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__
+from . import __version__, taskplan
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -230,34 +230,98 @@ def resolve_safe_path(path: str, cwd: str) -> str:
     return full
 
 
-_EDIT_SCHEMA_ARGS = [
-    "schema", "object", "--name", "EditProposal",
-    "--string", "summary", "--description", "One-sentence summary of the change",
-    "--integer", "anchor_line",
-    "--description", "The 1-based line number (from the numbered listing) to act on",
-    "--boolean", "insert_after",
-    "--description", "true to insert new_lines after anchor_line, false to replace anchor_line with new_lines",
-    "--string", "new_lines", "--description", "The new line(s) of text, freshly written (not copied)",
-]
+_REWRITE_SCHEMA = {
+    "type": "object", "title": "Rewrite", "additionalProperties": False,
+    "properties": {"content": {"type": "string", "description": "The complete updated text"}},
+    "required": ["content"], "x-order": ["content"],
+}
+_NEW_FILE_SCHEMA = {
+    "type": "object", "title": "NewFile", "additionalProperties": False,
+    "properties": {"content": {"type": "string", "description": "The complete contents of the new file"}},
+    "required": ["content"], "x-order": ["content"],
+}
+# The file appears in both the prompt and the reply, and on-device has a
+# 4096-token context -- past this, edit one section at a time instead.
+REWRITE_MAX_CHARS = 4000
+# First attempt is greedy (deterministic); retries sample, with the
+# previous attempt's problem spelled out, since a greedy retry of the
+# same prompt would just reproduce the same mistake.
+EDIT_ATTEMPTS = 4
+# No new attempt starts after this long -- a runaway generation can take
+# over a minute on its own.
+EDIT_TIME_BUDGET_SECONDS = 90
+
+
+def fm_structured(schema: dict, prompt: str, greedy: bool = True) -> dict:
+    """One on-device call constrained to `schema` (guided generation), so
+    the reply is always parseable and enum fields can't hold anything
+    outside their allowed values."""
+    with tempfile.TemporaryDirectory() as tmp:
+        schema_path = os.path.join(tmp, "schema.json")
+        with open(schema_path, "w") as f:
+            json.dump(schema, f)
+        args = ["fm", "respond", "--model", "system", "--no-stream", "--schema", schema_path]
+        if greedy:
+            args.append("--greedy")
+        result = _run([*args, prompt])
+    if result.returncode != 0:
+        raise EditError(result.stderr.strip() or "fm respond failed")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise EditError(f"model didn't return valid structured output: {result.stdout[:200]!r}")
+
+
+def _generate_checked(
+    prompt: str,
+    schema: dict,
+    check: Callable[[str], list[str]],
+    original: str = "",
+    repair: Callable[[str], str] = lambda text: text,
+) -> str:
+    """Generate text with fm_structured, retrying with feedback until
+    `check` finds no problems. Raises EditError if no attempt passes --
+    a wrong change is never returned as if it were right.
+    """
+    problems: list[str] = []
+    deadline = time.monotonic() + EDIT_TIME_BUDGET_SECONDS
+    for attempt in range(EDIT_ATTEMPTS):
+        if attempt and time.monotonic() > deadline:
+            break
+        feedback = ""
+        if problems:
+            feedback = (
+                "\n\nA previous attempt was rejected: " + "; ".join(problems)
+                + ". Fix that this time."
+            )
+        try:
+            reply = fm_structured(schema, prompt + feedback, greedy=attempt == 0)
+        except EditError as e:
+            # Seen for real: a sampled retry that never stops generating
+            # until it overflows the context. That's one failed attempt,
+            # not a reason to give up on the rest.
+            problems = [f"the model's reply failed ({e})"]
+            continue
+        text = repair(taskplan.strip_code_fence(reply.get("content") or "", original))
+        problems = check(text)
+        if not problems:
+            return text
+    raise EditError(f"couldn't produce a correct change after {EDIT_ATTEMPTS} tries: {'; '.join(problems)}")
 
 
 def propose_edit(
     path: str, instructions: str, cwd: str, line_range: tuple[int, int] | None = None
 ) -> dict:
-    """Ask the on-device model for a line-anchored edit to `path`.
+    """Ask the on-device model to rewrite `path` (or just `line_range` of
+    it, 1-based inclusive) with `instructions` applied.
 
-    Guided generation on a small on-device model is unreliable at copying
-    multi-line source text verbatim into a JSON string -- it reliably mangles
-    escaping and truncates. So instead of asking for an old/new text snippet,
-    this shows the file as numbered lines and asks for a line number plus
-    freshly-*written* replacement text, which the model is much better at.
-    We do the actual line lookup ourselves, so there's no verbatim-matching
-    step to fail. On-device only for now -- Cloud Pro (via Shortcuts) has no
-    schema control to constrain output the same way.
-
-    `line_range` (1-based, inclusive) restricts both what's shown to the
-    model and where it's allowed to anchor, so a large file can be edited a
-    section at a time without the whole thing needing to fit in context.
+    Measured on the real model, rewriting the text outright is far more
+    reliable than the alternatives tried: line-anchored single edits
+    couldn't delete or change more than one line, and structured line
+    operations (replace/insert/delete by number) routinely overwrote the
+    wrong line. Rewriting gets the change right in most cases, and the
+    rest are caught by taskplan.check_edit() (derived from the request
+    itself) and retried rather than written.
     """
     full_path = os.path.expanduser(path)
     if not os.path.isabs(full_path):
@@ -273,97 +337,64 @@ def propose_edit(
 
     lines = original.splitlines()
     lo, hi = line_range if line_range else (1, len(lines))
-    excerpt_lines = lines[lo - 1 : hi]
-    numbered = "\n".join(f"{lo + i}: {line}" for i, line in enumerate(excerpt_lines))
-
-    if len(numbered) > MAX_FILE_CHARS:
+    excerpt = "\n".join(lines[lo - 1 : hi])
+    if len(excerpt) > REWRITE_MAX_CHARS:
         raise EditError(
             f"{label}{f' (lines {lo}-{hi})' if line_range else ''} is too "
-            f"large to edit on-device (over {MAX_FILE_CHARS} characters)"
+            f"large to edit on-device (over {REWRITE_MAX_CHARS} characters)"
         )
 
-    schema = subprocess.run(
-        ["fm", *_EDIT_SCHEMA_ARGS], capture_output=True, text=True, check=True
-    ).stdout
-
-    with tempfile.TemporaryDirectory() as tmp:
-        schema_path = os.path.join(tmp, "schema.json")
-        with open(schema_path, "w") as f:
-            f.write(schema)
-
-        prompt = (
-            f"Here is {label}, with line numbers:\n\n{numbered}\n\n"
-            f"Apply this change: {instructions}\n\n"
-            f"Pick the single line number (anchor_line) this change belongs "
-            f"at. Set insert_after to true to add new_lines after that line "
-            f"and leave it in place, or false to replace that line with "
-            f"new_lines. Write new_lines yourself -- don't copy existing "
-            f"lines verbatim unless they belong in the result."
-        )
-        result = _run(
-            ["fm", "respond", "--model", "system", "--no-stream", "--greedy",
-             "--schema", schema_path, prompt]
-        )
-
-    if result.returncode != 0:
-        raise EditError(result.stderr.strip() or "fm respond failed")
-
-    try:
-        proposal = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        raise EditError("model didn't return a valid edit proposal")
-
-    anchor = proposal.get("anchor_line")
-    insert_after = bool(proposal.get("insert_after"))
-    new_lines = proposal.get("new_lines") or ""
-    summary = proposal.get("summary") or "(no summary)"
-
-    if not isinstance(anchor, int) or not (lo <= anchor <= max(hi, lo)):
-        raise EditError(f"model picked an out-of-range line ({anchor!r})")
-
-    # When inserting after a line (e.g. after a `def` line), new lines belong
-    # at the block's body indent -- best approximated by the line that
-    # already follows, not the anchor line itself.
-    indent_source = lines[anchor] if insert_after and anchor < len(lines) else lines[anchor - 1]
-    anchor_indent = re.match(r"[ \t]*", indent_source).group() if lines else ""
-    new_split = [
-        line if line.startswith((" ", "\t")) or not line else anchor_indent + line
-        for line in new_lines.splitlines()
-    ]
-
-    if insert_after:
-        updated_lines = lines[:anchor] + new_split + lines[anchor:]
+    if line_range:
+        what = f"lines {lo}-{hi} of {label} (the rest of the file is unchanged)"
+        noun = "version of just these lines"
     else:
-        updated_lines = lines[: anchor - 1] + new_split + lines[anchor:]
-    updated = "\n".join(updated_lines) + ("\n" if original.endswith("\n") else "")
+        what = f"the file {label}"
+        noun = "file"
+    prompt = (
+        f"Here is {what}:\n\n{excerpt}\n\n"
+        f"Change request: {instructions}\n\n"
+        f"Write the complete updated {noun}. Keep every existing line exactly "
+        f"as it is unless the change request is about it, and make the "
+        f"requested change."
+    )
+    literal = taskplan.literal_edit(instructions, excerpt)
+    if literal is not None and not taskplan.check_edit(instructions, excerpt, literal):
+        new_excerpt = literal
+    else:
+        new_excerpt = _generate_checked(
+            prompt, _REWRITE_SCHEMA,
+            lambda text: taskplan.check_edit(instructions, excerpt, text),
+            original=excerpt,
+            repair=lambda text: (
+                taskplan.restore_layout(excerpt, text) if taskplan.looks_reflowed(excerpt, text) else text
+            ),
+        )
+
+    updated_lines = lines[: lo - 1] + new_excerpt.splitlines() + lines[hi:]
+    updated = "\n".join(updated_lines)
+    if original.endswith("\n") or not original:
+        updated += "\n"
 
     return {
         "path": full_path,
         "label": label,
         "original": original,
         "updated": updated,
-        "summary": summary,
+        "summary": f"edited {label}: {instructions}",
     }
 
 
-_NEW_FILE_SCHEMA_ARGS = [
-    "schema", "object", "--name", "NewFileProposal",
-    "--string", "summary", "--description", "One-sentence summary of the new file",
-    "--string", "content", "--description", "The complete contents of the new file, freshly written",
-]
-
-
 def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
-    """Ask the on-device model to write a brand new file from scratch.
+    """Write a brand new file -- empty if `instructions` is blank (no model
+    call needed), otherwise written by the on-device model and checked
+    against the request ("containing the word hello" -> it does).
 
     Returns the same shape propose_edit() does (path, label, original,
     updated, summary), with `original` always "", so /task's write/diff/undo
     plumbing doesn't need to distinguish creating a file from editing one.
     `path` may be nested (e.g. "test/path.txt") -- any missing parent
-    directories are created automatically, so the model doesn't have to get
-    the ordering right relative to a separate folder-creation step. Refuses
-    to escape `cwd`, and refuses to clobber a file that already exists
-    (that's /edit's or /task's edit path's job, not this one's).
+    directories are created by the caller. Refuses to escape `cwd`, and
+    refuses to clobber a file that already exists.
     """
     full_path = resolve_safe_path(path, cwd)
     label = os.path.relpath(full_path, cwd)
@@ -371,42 +402,27 @@ def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
     if os.path.exists(full_path):
         raise EditError(f"{label} already exists -- edit it instead of creating it")
 
-    schema = subprocess.run(
-        ["fm", *_NEW_FILE_SCHEMA_ARGS], capture_output=True, text=True, check=True
-    ).stdout
+    if not instructions.strip():
+        return {"path": full_path, "label": label, "original": "", "updated": "",
+                "summary": f"created empty file {label}"}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        schema_path = os.path.join(tmp, "schema.json")
-        with open(schema_path, "w") as f:
-            f.write(schema)
-
-        prompt = (
-            f"Create a new file at {label}.\n\n"
-            f"Instructions: {instructions}\n\n"
-            f"Write the complete contents of this file, from scratch."
-        )
-        result = _run(
-            ["fm", "respond", "--model", "system", "--no-stream", "--greedy",
-             "--schema", schema_path, prompt]
-        )
-
-    if result.returncode != 0:
-        raise EditError(result.stderr.strip() or "fm respond failed")
-
-    try:
-        proposal = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        raise EditError("model didn't return a valid file proposal")
-
-    content = proposal.get("content") or ""
-    summary = proposal.get("summary") or "(no summary)"
-
+    prompt = (
+        f"Create a new file at {label}.\n\n"
+        f"What it should contain: {instructions}\n\n"
+        f"Write the complete contents of this file -- only the file's own "
+        f"contents, no commentary."
+    )
+    content = _generate_checked(
+        prompt, _NEW_FILE_SCHEMA, lambda text: taskplan.check_new_file(instructions, text)
+    )
+    if content and not content.endswith("\n"):
+        content += "\n"
     return {
         "path": full_path,
         "label": label,
         "original": "",
         "updated": content,
-        "summary": summary,
+        "summary": f"created {label}",
     }
 
 
@@ -574,27 +590,6 @@ def _split_top_level_braces(lines: list[str]) -> list[dict]:
     return sections
 
 
-STALL_SIMILARITY_THRESHOLD = 0.6
-STALL_LOOKBACK = 3
-
-
-def is_stalling(instructions: str, recent_instructions: list[str]) -> bool:
-    """True if `instructions` looks like a near-repeat of a recent step.
-
-    Empirically, a /task loop that isn't converging (e.g. a cleanup task
-    where each step only adds more instead of removing the mess from the
-    last one) shows up as Cloud Pro asking for essentially the same fix
-    again with slightly different wording, not identical text. A fuzzy
-    similarity check against the last few steps' instructions catches that
-    where an exact match wouldn't.
-    """
-    lowered = instructions.lower()
-    for prior in recent_instructions[-STALL_LOOKBACK:]:
-        if difflib.SequenceMatcher(None, lowered, prior.lower()).ratio() > STALL_SIMILARITY_THRESHOLD:
-            return True
-    return False
-
-
 _TASK_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
 TASK_MAX_CANDIDATES = 50
 
@@ -620,232 +615,197 @@ def gather_task_tree(cwd: str) -> tuple[list[str], list[str]]:
     return files[:TASK_MAX_CANDIDATES], folders[:TASK_MAX_CANDIDATES]
 
 
-TASK_ACTIONS = {
-    "EDIT", "CREATE_FILE", "CREATE_FOLDER", "RENAME", "MOVE",
-    "GIT_ADD", "GIT_COMMIT", "GIT_PUSH", "GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH", "GIT_PULL",
-}
 # /push already requires an explicit, separate action from the user rather
 # than firing automatically -- these four get the same treatment: /task can
 # plan them, but never executes them itself, only surfaces the matching
 # command (/push, /branch create|switch, /pull) for the user to run.
-TASK_GIT_CONFIRM_GATED = {"GIT_PUSH", "GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH", "GIT_PULL"}
-_TASK_ACTIONS_NEEDING_PATH = {"EDIT", "CREATE_FILE", "CREATE_FOLDER", "RENAME", "MOVE"}
+TASK_CONFIRM_GATED = {"PUSH", "BRANCH_CREATE", "BRANCH_SWITCH", "PULL"}
+
+_PLAN_SCHEMA = {
+    "type": "object", "title": "Plan", "additionalProperties": False,
+    "properties": {"steps": {"type": "array", "items": {"$ref": "#/$defs/Step"}}},
+    "required": ["steps"], "x-order": ["steps"],
+    "$defs": {"Step": {
+        "type": "object", "title": "Step", "additionalProperties": False,
+        "properties": {
+            "action": {"type": "string", "enum": taskplan.MODEL_ACTIONS},
+            "path": {"type": "string", "description":
+                     "The existing file/folder acted on, the new path for CREATE_*, or the branch name"},
+            "destination": {"type": "string", "description": "RENAME/MOVE only: the new path. Otherwise empty."},
+            "details": {"type": "string", "description":
+                        "EDIT/CREATE_FILE: what to change or write. COMMIT: the commit message. Otherwise empty."},
+        },
+        "required": ["action", "path", "destination", "details"],
+        "x-order": ["action", "path", "destination", "details"],
+    }},
+}
 
 
-def plan_next_step(
-    task: str,
-    files: list[str],
-    folders: list[str],
-    cwd: str,
-    history: list[str],
-    backend: "Backend",
-    model: str,
-) -> dict | None:
-    """Ask a cloud model to pick the next single step, or declare done.
-
-    This is the orchestrator half of the /task loop: it sees the whole task,
-    the full content of every candidate file, the folders that already
-    exist, and a running log of what's already been changed, and decides
-    either that nothing more is needed or exactly one concrete next step.
-    The on-device model never sees this -- it only ever executes one
-    bounded, already-decided step at a time.
-
-    A path for CREATE_FILE/CREATE_FOLDER doesn't have to already exist --
-    that's how an empty directory gets bootstrapped from nothing, and how a
-    file can land inside a folder created moments earlier in the same run.
-    """
-    listing = []
-    for name in files:
-        try:
-            with open(os.path.join(cwd, name), "r", errors="replace") as f:
-                content = f.read(MAX_FILE_CHARS)
-        except OSError:
-            content = "(unreadable)"
-        listing.append(f"--- {name} ---\n{content}")
-
-    progress = "\n".join(f"- {h}" for h in history) if history else "(nothing yet)"
-    folders_line = ", ".join(folders) if folders else "(none)"
-
-    prompt = (
-        f"Task: {task}\n\n"
-        "Reply with exactly ONE next step, in exactly this three-line "
-        "format (or exactly DONE if the task is now fully complete). "
-        "Check the \"Steps already taken\" log below FIRST: if it shows "
-        "the exact thing the task asked for has already happened, reply "
-        "DONE immediately -- do not propose another step that "
-        "re-does, undoes, reverts, or \"improves\" something already "
-        "completed. A short task (e.g. one rename, one move, one new "
-        "file) is normally DONE after a single successful step.\n\n"
-        "ACTION: <one of EDIT, CREATE_FILE, CREATE_FOLDER, RENAME, MOVE, "
-        "GIT_ADD, GIT_COMMIT, GIT_PUSH, GIT_BRANCH_CREATE, GIT_BRANCH_SWITCH, GIT_PULL>\n"
-        "TARGET: <depends on ACTION, see below>\n"
-        "INSTRUCTIONS: <depends on ACTION, see below -- can be blank>\n\n"
-        "IMPORTANT: if the task's own words mention committing, staging, "
-        "pushing, pulling, or branches, that means a GIT_* action -- pick "
-        "one of those, don't reinterpret \"commit\" as writing text into a "
-        "file. Once every file change the task calls for is done, GIT_ADD "
-        "then GIT_COMMIT (in that order, one per step) are usually the "
-        "right next steps if the task mentioned git at all. Never pick a "
-        "GIT_* action for a task that never mentioned git/commit/push/pull/"
-        "branch.\n\n"
-        "What TARGET/INSTRUCTIONS mean per action:\n"
-        "- EDIT: TARGET is the existing file to change; INSTRUCTIONS "
-        "describes the change.\n"
-        "- CREATE_FILE: TARGET is the new file's path -- use the exact "
-        "filename the task asks for. Only put it inside a folder (e.g. "
-        "assets/logo.png) if the task itself says to, or an earlier step "
-        "already created that folder for this purpose -- never invent a "
-        "folder to put a plain file in. INSTRUCTIONS describes its "
-        "contents.\n"
-        "- CREATE_FOLDER: TARGET is the new folder's path; INSTRUCTIONS is "
-        "unused.\n"
-        "- RENAME or MOVE: TARGET is the CURRENT (old) path, INSTRUCTIONS "
-        "is the NEW (destination) path -- just the path itself, never a "
-        "sentence describing the move. TARGET is always the file/folder "
-        "that already exists right now; INSTRUCTIONS is always where it "
-        "should end up, even if that means combining a folder name with "
-        "the original filename yourself. Worked examples:\n"
-        "  \"rename report.txt to report_final.txt\" -> "
-        "ACTION: RENAME, TARGET: report.txt, INSTRUCTIONS: report_final.txt\n"
-        "  \"move report.txt into the archive folder\" -> "
-        "ACTION: MOVE, TARGET: report.txt, INSTRUCTIONS: archive/report.txt\n"
-        "- GIT_ADD, GIT_PUSH, GIT_PULL: TARGET and INSTRUCTIONS are unused.\n"
-        "- GIT_COMMIT: INSTRUCTIONS is the commit message; TARGET is "
-        "unused.\n"
-        "- GIT_BRANCH_CREATE or GIT_BRANCH_SWITCH: TARGET is the branch "
-        "name; INSTRUCTIONS is unused.\n\n"
-        "Every path (TARGET or a destination in INSTRUCTIONS) must be "
-        "relative to the current directory shown below -- never an "
-        "absolute path (no leading /) and never a home-directory path "
-        "like /Users/... or ~/...\n\n"
-        f"Folders that already exist: {folders_line}\n\n"
-        f"Files in this directory:\n\n"
-        + ("\n\n".join(listing) if listing else "(no files yet)")
-        + f"\n\nSteps already taken:\n{progress}"
+def _plan_prompt(request: str, task: str, files: list[str], folders: list[str]) -> str:
+    context = f"Overall task: {task}\nPart to plan now: {request}\n\n" if request != task else f"Task: {task}\n\n"
+    return (
+        context
+        + f"Existing files: {', '.join(files) or '(none)'}\n"
+        + f"Existing folders: {', '.join(folders) or '(none)'}\n\n"
+        "List the steps that carry out exactly this request, in order -- "
+        "nothing it didn't ask for.\n"
+        "- EDIT: path = existing file to change; details = the change.\n"
+        "- CREATE_FILE: path = new file; details = what it should contain.\n"
+        "- CREATE_FOLDER: path = new folder.\n"
+        "- RENAME: path = current path; destination = new path.\n"
+        "- MOVE: path = current path; destination = full new path (folder/filename).\n"
+        "- COMMIT: details = the commit message. Commits all changes.\n"
+        "- PUSH, PULL: no fields.\n"
+        "- BRANCH_CREATE, BRANCH_SWITCH: path = branch name.\n"
+        "All paths are relative to the current directory.\n\n"
+        "Examples (different files, same kinds of request):\n"
+        '- "notes.txt should be called todo.txt" -> RENAME path=notes.txt destination=todo.txt\n'
+        '- "get report.pdf out of the old folder" (it is at old/report.pdf) -> '
+        "MOVE path=old/report.pdf destination=report.pdf\n"
+        '- "the css files belong in styles" (a.css and b.css exist) -> MOVE path=a.css '
+        "destination=styles/a.css, MOVE path=b.css destination=styles/b.css\n"
+        "For RENAME/MOVE, path is always something that exists now, and destination is "
+        "always different from path."
     )
-    reply, model_used = backend.classify_with_fallback(prompt, model)
-    reply = reply.strip()
-    if reply.upper().startswith("DONE"):
+
+
+def _parse_json_plan(reply: str) -> list[dict] | None:
+    match = re.search(r"\{.*\}", reply or "", re.DOTALL)
+    if not match:
         return None
+    try:
+        steps = json.loads(match.group()).get("steps")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    return steps if isinstance(steps, list) else None
 
-    action_match = re.search(r"ACTION:\s*(\S+)", reply)
-    # [ \t]*, not \s* -- \s* would swallow the newline when TARGET is blank
-    # (a valid case for several actions) and bleed into the next line.
-    target_match = re.search(r"TARGET:[ \t]*(.*)", reply)
-    instr_match = re.search(r"INSTRUCTIONS:[ \t]*(.*)", reply, re.DOTALL)
-    if not action_match:
-        raise EditError(f"couldn't parse the next step from the model's reply: {reply!r}")
 
-    if instr_match:
-        # Defensive: the model occasionally echoes the whole ACTION/TARGET/
-        # INSTRUCTIONS template a second time inside its own INSTRUCTIONS
-        # value instead of just answering it -- cut that off if present
-        # rather than treating the echoed template as real instructions.
-        instr_value = instr_match.group(1)
-        echo = re.search(r"\n\s*ACTION:", instr_value)
-        if echo:
-            instr_match = re.match(r"(.*)", instr_value[: echo.start()], re.DOTALL)
+def plan_with_model(
+    request: str, task: str, files: list[str], folders: list[str], backend: "Backend", model: str
+) -> tuple[list[dict], str]:
+    """Ask the planning model for raw steps (not yet normalized). A cloud
+    model gets asked for JSON in plain text (Shortcuts has no schema
+    support); on-device -- directly, or because the cloud tiers fell back
+    to it -- uses guided generation, so its action is always one of the
+    allowed ones. Returns (steps, model actually used).
+    """
+    prompt = _plan_prompt(request, task, files, folders)
+    if model != "on-device":
+        reply, used = backend.classify_with_fallback(
+            prompt + '\n\nReply with only JSON: {"steps": [{"action": ..., "path": ..., '
+            '"destination": ..., "details": ...}]}',
+            model,
+        )
+        if used != "on-device":
+            steps = _parse_json_plan(reply)
+            if steps is not None:
+                return steps, used
+        model = used
+    return fm_structured(_PLAN_SCHEMA, prompt).get("steps") or [], model
 
-    action = action_match.group(1).strip().upper().strip("`'\",.:;")
-    if action not in TASK_ACTIONS:
-        raise EditError(f"model picked an unknown action: {action!r}")
 
-    target = target_match.group(1).strip().strip("`'\" .") if target_match else ""
-    instructions = instr_match.group(1).strip() if instr_match else ""
+def plan_task(
+    task: str, files: list[str], folders: list[str], backend: "Backend", model: str
+) -> tuple[list[dict], str | None]:
+    """The whole plan for `task`, up front: deterministic where the request
+    has a recognizable shape (taskplan.parse_task), the planning model for
+    any part that doesn't. Returns (steps, planning model used or None).
+    A part the model can't turn into any valid step comes back as an
+    UNSUPPORTED step, so it's reported rather than silently skipped.
+    """
+    parsed = taskplan.parse_task(task, files, folders)
+    unparsed = [s for s in parsed if s["action"] == "UNPARSED"]
+    if not unparsed:
+        return parsed, None
 
-    # Defensive: the model occasionally crams TARGET and INSTRUCTIONS onto
-    # one line (e.g. "TARGET: scratch, INSTRUCTIONS: ") instead of separate
-    # lines -- strip the embedded label (and anything after it) off TARGET.
-    # The separate INSTRUCTIONS search above still finds the real value
-    # fine either way, since it matches that label from anywhere in the
-    # reply, not just its own line.
-    target = re.sub(r"[,\s]*INSTRUCTIONS:.*$", "", target, flags=re.IGNORECASE | re.DOTALL)
-    target = target.strip().strip("`'\" .")
+    whole = len(unparsed) == len(parsed)
+    steps: list[dict] = []
+    model_used: str | None = None
+    for s in parsed:
+        if s["action"] != "UNPARSED":
+            steps.append(s)
+            continue
+        request = task if whole else s["details"]
+        now_files, now_folders = s.get("files", files), s.get("folders", folders)
+        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model)
+        try:
+            planned = taskplan.normalize_model_steps(raw, request, now_files, now_folders)
+        except ValueError as e:
+            planned = [taskplan.step("UNSUPPORTED", details=f"{request!r} ({e})")]
+        steps.extend(planned or [taskplan.step("UNSUPPORTED", details=f"work out how to do {request!r}")])
+        if whole:
+            break
+    return steps, model_used
 
-    if action in _TASK_ACTIONS_NEEDING_PATH:
-        if not target or os.path.isabs(target) or target in (".", ".."):
-            raise EditError(f"model picked an invalid path for {action}: {target!r}")
 
-        if action in ("CREATE_FOLDER", "CREATE_FILE"):
-            parent = os.path.dirname(target)
-            if parent and os.path.basename(parent) == os.path.basename(target):
-                # Seen for real: right after correctly creating a folder,
-                # on-device sometimes proposes creating "X/X" -- a
-                # same-named duplicate nested inside the folder it just
-                # made, instead of recognizing the task is done. A
-                # legitimate nested file always differs from its parent's
-                # name (has an extension, etc.), so this pattern is only
-                # ever this specific confusion, not a real request.
-                raise EditError(
-                    f"refusing to create {target!r} -- looks like a "
-                    f"confused duplicate of the folder it would sit "
-                    f"inside, not a real request"
-                )
+def describe_step(s: dict) -> str:
+    action, path, dest, details = s["action"], s["path"], s["destination"], s["details"]
+    if action in ("RENAME", "MOVE"):
+        return f"{action.lower()} {path} → {dest}"
+    if action == "EDIT":
+        return f"edit {path}: {details}"
+    if action == "CREATE_FILE":
+        return f"create file {path}" + (f": {details}" if details else "")
+    if action == "CREATE_FOLDER":
+        return f"create folder {path}"
+    if action == "COMMIT":
+        return f"commit: {details}" if details else "commit"
+    if action == "STAGE":
+        return "stage all changes"
+    if action in ("BRANCH_CREATE", "BRANCH_SWITCH"):
+        return f"{'create' if action == 'BRANCH_CREATE' else 'switch to'} branch {path}"
+    if action == "UNSUPPORTED":
+        return f"can't do: {details}"
+    return action.lower()
 
-        if action in ("RENAME", "MOVE") and not instructions and "/" in target:
-            # Common on-device confusion for "move X into Y folder": it
-            # combines the whole destination into TARGET (e.g.
-            # "archive/report.txt") instead of splitting old/new paths
-            # correctly, leaving INSTRUCTIONS blank. If TARGET's basename
-            # matches something that actually exists, recover: that's the
-            # real source, and the original TARGET is the real
-            # destination -- deterministic, since we can check the
-            # filesystem ourselves rather than needing the model to get
-            # this right.
-            basename = os.path.basename(target)
-            first_component = target.split("/", 1)[0]
-            if basename in files or basename in folders:
-                target, instructions = basename, target
-            elif first_component in files or first_component in folders:
-                # A second confusion, mostly seen for RENAME: TARGET ends
-                # up holding "old/new" as shorthand for "rename old to
-                # new" (e.g. "draft/final") rather than two separate
-                # fields -- the giveaway is that the FIRST component is
-                # something that already exists, not the last.
-                target, instructions = target.split("/", 1)
 
-        if action in ("EDIT", "RENAME", "MOVE") and "/" not in target:
-            # Tolerate the model naming something close to (rather than
-            # exactly) an existing file/folder, same as the old FILE: field
-            # used to for EDIT. Skipped once TARGET has a "/" -- substring
-            # matching a multi-component path against single-component
-            # candidates is more likely to corrupt it (e.g. matching just
-            # "archive" out of "archive/report.txt") than to help.
-            pool = files if action == "EDIT" else files + folders
-            matched = next(
-                (c for c in pool if c.lower() == target.lower() or c.lower() in target.lower()),
-                None,
-            )
-            target = matched or target
+def choose_edit_range(
+    content: str, filename: str, instructions: str, backend: "Backend", model: str
+) -> tuple[int, int] | None:
+    """None if the whole file fits in one on-device rewrite; otherwise the
+    section to edit -- picked deterministically when the request names
+    something (a function, a heading) that only one section contains, and
+    by the planning model otherwise.
+    """
+    if len(content) <= REWRITE_MAX_CHARS:
+        return None
+    sections = split_sections(content, filename)
+    lines = content.splitlines()
+    words = {w.lower() for w in re.findall(r"[A-Za-z_][\w\-]{2,}", instructions)}
+    words -= {w.lower() for w in re.findall(r"[\w.\-]+", filename)}
+    scored = []
+    for s in sections:
+        body = "\n".join(lines[s["start"] - 1 : s["end"]]).lower()
+        scored.append((sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", body)), s))
+    best = max(score for score, _ in scored)
+    winners = [s for score, s in scored if score == best]
+    section = winners[0] if best > 0 and len(winners) == 1 else pick_section(
+        instructions, filename, sections, backend, model
+    )
+    return section["start"], section["end"]
 
-        if action in ("RENAME", "MOVE"):
-            if not instructions:
-                raise EditError(f"{action} needs a destination path in INSTRUCTIONS")
-            # A real path is rarely more than a few words even counting
-            # spaces in a real filename -- catches the small on-device
-            # model occasionally writing a whole descriptive sentence
-            # ("Move old.txt to the new filename") where a bare
-            # destination path belongs, before that sentence gets used as
-            # a literal filename.
-            if len(instructions.split()) > 6:
-                raise EditError(
-                    f"the destination for {action} looks like a sentence, "
-                    f"not a path: {instructions!r}"
-                )
 
-    if action in ("GIT_BRANCH_CREATE", "GIT_BRANCH_SWITCH") and not target:
-        raise EditError(f"{action} needs a branch name in TARGET")
-
-    if action == "GIT_COMMIT" and not instructions:
-        instructions = "automated changes"
-
-    return {"action": action, "target": target, "instructions": instructions, "model_used": model_used}
+def default_commit_message(summaries: list[str], cwd: str) -> str:
+    """A descriptive message when the request didn't give one: what this
+    /task run did, or else which files changed."""
+    if summaries:
+        first = summaries[0][0].upper() + summaries[0][1:]
+        return first if len(summaries) == 1 else f"{first} (+{len(summaries) - 1} more changes)"
+    changed = [line[3:].strip().strip('"') for line in git_status_porcelain(cwd).splitlines() if line.strip()]
+    names = ", ".join(os.path.basename(c.split(" -> ")[-1]) for c in changed[:3])
+    more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
+    return f"Update {names}{more}" if names else "Update files"
 
 
 def pick_section(task: str, filename: str, sections: list[dict], backend: "Backend", model: str) -> dict:
     """Ask a cloud model which (deterministically-split) section to edit."""
+    if len(sections) == 1:
+        return sections[0]
+    # Numbered from 1: small models answer "1" for "the first one" far more
+    # often than "0", which with 0-based numbering silently picked the
+    # wrong section (or, for a one-section file, none at all).
     listing = "\n".join(
-        f"{i}: {s['name']} (lines {s['start']}-{s['end']})" for i, s in enumerate(sections)
+        f"{i}: {s['name']} (lines {s['start']}-{s['end']})" for i, s in enumerate(sections, 1)
     )
     prompt = (
         f"Task: {task}\n\n{filename} has these sections:\n{listing}\n\n"
@@ -855,7 +815,7 @@ def pick_section(task: str, filename: str, sections: list[dict], backend: "Backe
     reply, _model_used = backend.classify_with_fallback(prompt, model)
     reply = reply.strip()
     match = re.search(r"\d+", reply)
-    index = int(match.group()) if match else -1
+    index = int(match.group()) - 1 if match else -1
     if not (0 <= index < len(sections)):
         raise EditError(f"couldn't tell which section to edit from the model's reply: {reply!r}")
     return sections[index]
@@ -2111,7 +2071,16 @@ class ChatApp(App):
     @work(thread=True)
     def _propose_edit(self, path: str, instructions: str) -> None:
         try:
-            proposal = propose_edit(path, instructions, os.getcwd())
+            cwd = os.getcwd()
+            full = os.path.join(cwd, os.path.expanduser(path))
+            line_range = None
+            if os.path.isfile(full):  # else propose_edit reports "no such file"
+                with open(full, "r", errors="replace") as f:
+                    content = f.read()
+                line_range = choose_edit_range(
+                    content, path, instructions, self.backend, self.subagent_roles["planning"]
+                )
+            proposal = propose_edit(path, instructions, cwd, line_range=line_range)
         except GenerationCancelled:
             self.call_from_thread(self._finish_cancelled)
             return
@@ -2124,181 +2093,66 @@ class ChatApp(App):
         diff = diff_preview(proposal["original"], proposal["updated"])
         self.call_from_thread(self._show_edit_proposal, proposal, diff)
 
-    TASK_MAX_STEPS = 15
-
     @work(thread=True)
     def _run_task(self, task: str) -> None:
-        """Orchestrator/worker loop: Cloud Pro plans each step, on-device
-        executes and writes it immediately -- no per-step /apply. Stops when
-        Cloud Pro says the task is done, Esc-Esc is pressed, or a safety cap
-        on step count is hit.
+        """Plan the whole task up front (plan_task), show the plan, then
+        execute it step by step, writing as it goes -- no per-step /apply.
+        Stops at the first step that needs the user's confirmation (push,
+        pull, branch changes), at an error, or on Esc-Esc.
         """
         cwd = os.getcwd()
         self._loop_running = True
         self._loop_cancel_requested = False
-        history: list[str] = []
-        recent_steps: list[tuple[str, str]] = []  # (action, "target:instructions")
-        recent_moves: list[tuple[str, str]] = []  # (target, instructions) for RENAME/MOVE only
+        summaries: list[str] = []
         start_time = time.monotonic()
         try:
             files, folders = gather_task_tree(cwd)
+            self.call_from_thread(self._log_progress, "planning…")
+            steps, model_used = plan_task(
+                task, files, folders, self.backend, self.subagent_roles["planning"]
+            )
+            if model_used:
+                self._note_planning_fallback(model_used)
+            if not steps:
+                self.call_from_thread(self._log_progress, "nothing to do -- task already satisfied.")
+                return
+            self.call_from_thread(
+                self._log_progress,
+                "plan:\n" + "\n".join(f"{i}. {describe_step(s)}" for i, s in enumerate(steps, 1)),
+            )
 
-            for step in range(1, self.TASK_MAX_STEPS + 1):
+            for number, s in enumerate(steps, 1):
                 if self._loop_cancel_requested:
                     self.call_from_thread(self._log_progress, "stopped")
-                    break
-
-                self.call_from_thread(
-                    self._log_progress, f"step {step}: deciding what to do next…"
-                )
-                plan = plan_next_step(
-                    task, files, folders, cwd, history, self.backend, self.subagent_roles["planning"]
-                )
-                if plan is None:
-                    if history:
-                        done_message = f"done after {step - 1} step(s) -- run /push to commit and push these changes."
-                    else:
-                        done_message = "nothing to do -- task already satisfied."
-                    self.call_from_thread(self._log_progress, done_message)
-                    break
-
-                self._note_planning_fallback(plan["model_used"])
-                action, target, instructions = plan["action"], plan["target"], plan["instructions"]
-                # Only compare against recent steps with the SAME action --
-                # e.g. CREATE_FOLDER test and CREATE_FILE test/path.txt look
-                # textually similar (same target prefix) but are completely
-                # different operations making real progress, not a repeat.
-                stall_key = f"{target}:{instructions}"
-                same_action_recent = [key for a, key in recent_steps if a == action]
-
-                if is_stalling(stall_key, same_action_recent):
+                    return
+                action = s["action"]
+                if action == "UNSUPPORTED":
                     self.call_from_thread(
                         self._log_progress,
-                        f"stopped: step {step} looks like a repeat of a recent "
-                        f"step, not real progress -- {action} {target}: {instructions}",
+                        f"stopped at step {number}: /task can't {s['details']}"
+                        + (f" -- steps 1-{number - 1} were done." if number > 1 else "."),
                     )
-                    break
-
-                if action in ("RENAME", "MOVE") and (instructions, target) in recent_moves:
-                    # Textually this looks like a *different* step (the
-                    # is_stalling check above won't catch it), but it's
-                    # exactly reversing a move/rename from a few steps
-                    # ago -- seen for real: after correctly moving a file
-                    # into a new folder, on-device sometimes "helpfully"
-                    # proposes moving the whole folder back out instead of
-                    # recognizing the task is done.
-                    self.call_from_thread(
-                        self._log_progress,
-                        f"stopped: step {step} would undo a recent move/rename "
-                        f"({instructions} was just moved to {target}) -- the "
-                        f"task looks done",
-                    )
-                    break
-
-                recent_steps.append((action, stall_key))
-                if action in ("RENAME", "MOVE"):
-                    recent_moves.append((target, instructions))
-
-                self.call_from_thread(
-                    self._log_progress,
-                    f"step {step}: {action} {target} — {instructions}".rstrip(" —"),
-                )
-
-                if action in TASK_GIT_CONFIRM_GATED:
+                    return
+                if action in TASK_CONFIRM_GATED:
                     suggestion = {
-                        "GIT_PUSH": "/push",
-                        "GIT_PULL": "/pull",
-                        "GIT_BRANCH_CREATE": f"/branch create {target}",
-                        "GIT_BRANCH_SWITCH": f"/branch switch {target}",
+                        "PUSH": "/push",
+                        "PULL": "/pull",
+                        "BRANCH_CREATE": f"/branch create {s['path']}",
+                        "BRANCH_SWITCH": f"/branch switch {s['path']}",
                     }[action]
                     self.call_from_thread(
                         self._log_progress,
                         f"task wants to run {suggestion} -- that needs your explicit "
                         f"confirmation, so /task is stopping here. Run {suggestion} "
-                        f"yourself, then re-run /task to continue.",
+                        f"yourself, then re-run /task for anything after it.",
                     )
-                    break
+                    return
+                self.call_from_thread(self._log_progress, f"step {number}: {describe_step(s)}")
+                summary = self._execute_task_step(s, cwd, summaries)
+                summaries.append(summary)
+                self.call_from_thread(self._log_progress, summary)
 
-                if action == "GIT_ADD":
-                    git_add_all(cwd)
-                    history.append("staged all current changes (git add)")
-                    self.call_from_thread(self._log_progress, "staged all changes")
-                    continue
-
-                if action == "GIT_COMMIT":
-                    # Stage first regardless of whether the plan included a
-                    # separate GIT_ADD step -- on-device doesn't always
-                    # reliably plan both steps in order, and a commit with
-                    # nothing staged just fails outright. "Commit" already
-                    # implies "including whatever changed" for most users
-                    # anyway (the same assumption /push's add-then-commit
-                    # already makes).
-                    if git_status_porcelain(cwd).strip():
-                        git_add_all(cwd)
-                    git_commit(instructions, cwd)
-                    history.append(f"committed locally with message: {instructions}")
-                    self.call_from_thread(self._log_progress, f"committed: {instructions}")
-                    continue
-
-                if action == "CREATE_FOLDER":
-                    result = create_folder(target, cwd)
-                    self._push_undo_folder(result["path"], result["label"])
-                    if target not in folders:
-                        folders.append(target)
-                    history.append(f"{target}: created folder")
-                    self.call_from_thread(self._log_progress, f"created folder {result['label']}")
-                    continue
-
-                if action in ("RENAME", "MOVE"):
-                    result = move_or_rename(target, instructions, cwd)
-                    self._push_undo_move(
-                        result["src_path"], result["dest_path"],
-                        result["src_label"], result["dest_label"],
-                    )
-                    if target in files:
-                        files.remove(target)
-                        files.append(instructions)
-                    elif target in folders:
-                        folders.remove(target)
-                        folders.append(instructions)
-                    history.append(result["summary"])
-                    self.call_from_thread(self._log_progress, result["summary"])
-                    continue
-
-                # EDIT / CREATE_FILE
-                creating = action == "CREATE_FILE"
-                if creating:
-                    proposal = propose_new_file(target, instructions, cwd)
-                else:
-                    with open(os.path.join(cwd, target), "r", errors="replace") as f:
-                        content = f.read()
-                    sections = split_sections(content, target)
-                    section = pick_section(
-                        instructions, target, sections, self.backend, self.subagent_roles["planning"]
-                    )
-                    proposal = propose_edit(
-                        target, instructions, cwd, line_range=(section["start"], section["end"])
-                    )
-
-                os.makedirs(os.path.dirname(proposal["path"]), exist_ok=True)
-                with open(proposal["path"], "w") as f:
-                    f.write(proposal["updated"])
-                self._push_undo(
-                    proposal["path"], proposal["label"], proposal["original"],
-                    existed_before=not creating,
-                )
-                if creating and target not in files:
-                    files.append(target)
-
-                diff = diff_preview(proposal["original"], proposal["updated"])
-                self.call_from_thread(self._task_step_applied, proposal, diff)
-                verb = "created" if creating else "edited"
-                history.append(f"{target}: {verb} -- {proposal['summary']}")
-            else:
-                self.call_from_thread(
-                    self._log_progress,
-                    f"stopped after {self.TASK_MAX_STEPS} steps (safety limit)",
-                )
+            self.call_from_thread(self._log_progress, f"done after {len(steps)} step(s).")
         except GenerationCancelled:
             self.call_from_thread(self._log_progress, "stopped")
         except EditError as e:
@@ -2310,6 +2164,60 @@ class ChatApp(App):
             self.call_from_thread(self._enable_input)
             if time.monotonic() - start_time >= NOTIFY_MIN_SECONDS:
                 notify("fm-pcc", f"/task finished: {task}")
+
+    def _execute_task_step(self, s: dict, cwd: str, summaries: list[str]) -> str:
+        """Carry out one planned, non-gated step. Returns a one-line summary
+        of what happened; raises EditError if it can't be done."""
+        action, path, destination, details = s["action"], s["path"], s["destination"], s["details"]
+
+        if action == "STAGE":
+            git_add_all(cwd)
+            return "staged all changes"
+
+        if action == "COMMIT":
+            if not git_status_porcelain(cwd).strip():
+                return "nothing to commit -- the working tree is already clean"
+            message = details or default_commit_message(summaries, cwd)
+            git_add_all(cwd)
+            git_commit(message, cwd)
+            return f"committed: {message}"
+
+        if action == "CREATE_FOLDER":
+            result = create_folder(path, cwd)
+            self._push_undo_folder(result["path"], result["label"])
+            return f"created folder {result['label']}"
+
+        if action in ("RENAME", "MOVE"):
+            result = move_or_rename(path, destination, cwd)
+            self._push_undo_move(
+                result["src_path"], result["dest_path"], result["src_label"], result["dest_label"],
+            )
+            verb = "renamed" if action == "RENAME" else "moved"
+            return f"{verb} {result['src_label']} to {result['dest_label']}"
+
+        if action == "CREATE_FILE":
+            proposal = propose_new_file(path, details, cwd)
+        elif action == "EDIT":
+            full = resolve_safe_path(path, cwd)
+            with open(full, "r", errors="replace") as f:
+                content = f.read()
+            line_range = choose_edit_range(
+                content, path, details, self.backend, self.subagent_roles["planning"]
+            )
+            proposal = propose_edit(path, details, cwd, line_range=line_range)
+        else:
+            raise EditError(f"unknown step: {action}")
+
+        os.makedirs(os.path.dirname(proposal["path"]), exist_ok=True)
+        with open(proposal["path"], "w") as f:
+            f.write(proposal["updated"])
+        self._push_undo(
+            proposal["path"], proposal["label"], proposal["original"],
+            existed_before=action == "EDIT",
+        )
+        diff = diff_preview(proposal["original"], proposal["updated"])
+        self.call_from_thread(self._task_step_applied, proposal, diff)
+        return proposal["summary"]
 
     def _task_step_applied(self, proposal: dict, diff: str) -> None:
         self._add_message(

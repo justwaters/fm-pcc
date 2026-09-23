@@ -91,8 +91,13 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   results, throwaway temp git repos). About 15 seconds total; no model
   calls.
 - **`tests/slow/`** — real `/task` runs against the actual on-device
-  model in scratch temp directories: creating/renaming/moving files and
-  folders, and git add/commit/push/branch behavior. About 30 seconds.
+  model in scratch temp directories. `test_task_reliability.py` is a
+  corpus of 93 requests — edits, renames, moves, commits, and
+  combinations, in varied phrasings — each checked against the resulting
+  files and git history; most batches of it were written and run *before*
+  tuning anything for them, as an honest measure of how new phrasings
+  fare. `test_on_device_capabilities.py` covers create/rename/move and
+  the push/branch gating. About a minute in total.
   These guard against cases where the model's real behavior didn't match
   what the code assumed (a small on-device model asked to "create a
   folder" once created a *file* named `test` instead, because `/task` had
@@ -101,16 +106,13 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
 
 The slow suite forces *both* of `/task`'s subagent roles to on-device,
 including planning — a real `/task` run defaults to Cloud Pro for
-planning and only executes on-device, which is meaningfully more
-reliable (a bigger model planning for a small one to execute). Testing
-the harder, fully-offline configuration on purpose surfaced several real
-on-device planner confusions (e.g. writing a whole sentence where a
-destination path belonged, or not recognizing a one-step task as
-complete and proposing a redundant follow-up) that got fixed with
-clearer prompting and, where prompting alone wasn't reliable enough,
-deterministic recovery/rejection in `plan_next_step` itself — catching a
-known bad pattern in code rather than continuing to hope the model
-avoids it.
+planning. Testing the harder, fully-offline configuration on purpose is
+what showed that asking the on-device model to plan step by step wasn't
+fixable with prompting, and led to the plan-up-front design described
+under `/task` below: its real failure modes (swapped source and
+destination, commentary pasted into paths and commit messages, never
+noticing a task was done, turning a rename request into a rewrite of the
+file) are now caught or avoided in code rather than hoped away.
 
 Every test runs with `FM_PCC_HOME` pointed at its own temp directory, so
 tests never read or write your real `~/.fm-pcc` (saved sessions, and
@@ -182,7 +184,7 @@ Slash commands, same spirit as `fm chat`:
 | `/model <name>`             | Switch directly — `on-device`, `cloud`, `cloud-pro`, `ollama`, or `ollama:<name>` for a specific local model |
 | `/model reset`              | Clear any "requires iCloud+" restrictions and retry those tiers |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
-| `/task <description>`       | Multi-step edit loop that writes as it goes (see below) |
+| `/task <description>`       | Plan and carry out a multi-step change, writing as it goes (see below) |
 | `/ask <question>`           | Research a question via cloud/core subagents (see below) |
 | `/subagents [planning\|building] <model>` | Show or set which model plays each subagent role  |
 | `/compare <question>`       | Ask every model the same question, one at a time       |
@@ -201,83 +203,88 @@ Slash commands, same spirit as `fm chat`:
 | `/quit`                     | Exit                                                   |
 
 `/edit` shows a diff and waits for `/apply` before touching disk — nothing
-is written automatically. It only works on-device: it uses guided
-generation (`fm respond --schema`) to get a structured line-anchored edit
-(a line number plus freshly-written replacement/insertion text) rather than
-asking the model to reproduce file content verbatim, which the on-device
-model is unreliable at for anything spanning more than one line. Neither
-cloud tier has equivalent schema control via Shortcuts, so editing isn't
-available there yet.
+is written automatically. It uses the same editing machinery as `/task`
+(below): unambiguous literal changes are made directly in code, anything
+else is rewritten by the on-device model with guided generation (`fm
+respond --schema`) and checked before it's shown. Editing only works
+on-device — neither cloud tier has equivalent schema control via
+Shortcuts.
 
-`/task <description>` runs an orchestrator/worker loop instead of `/edit`'s
-single reviewed change: Cloud Pro plans, on-device executes and **writes
-immediately, with no per-step `/apply`** — closer to a subagent that Cloud
-Pro keeps dispatching to than a one-shot assistant. Each iteration, Cloud
-Pro sees the task, the full content of every file in the directory, which
-folders already exist, and a running log of what's already been done,
-then either says the task is done or picks exactly one of:
+`/task <description>` plans the whole task up front, shows the plan, then
+carries it out step by step and **writes immediately, with no per-step
+`/apply`** (`/undo` reverts any step). A plan is made of these steps:
 
-- **edit** an existing file (the same section-scoped, line-anchored
-  machinery `/edit` uses)
-- **create** a new file, optionally inside a folder that already exists
-  (or was created moments earlier in the same run) — this is what makes
-  `/task make me a website about <product>` work starting from an empty
-  directory: the first step creates `index.html`, later steps can create
-  `style.css` or edit either file further
-- **create** a new, empty folder
-- **rename** or **move** an existing file or folder
-- a **git** operation — see below
+- **edit** an existing file
+- **create** a new file (optionally inside a folder), or a new empty folder
+- **rename** or **move** a file or folder
+- **stage** or **commit** changes — and push, pull, or branch changes,
+  which are gated (see below)
 
 Every path is restricted to somewhere inside the current directory (no
-absolute paths, no `..`) for all of these. This repeats until Cloud Pro
-says done or a 15-step safety cap is hit; a step that looks like a
-near-repeat of a recent one (compared only against other steps of the
-*same* kind, so e.g. creating a folder and then a file inside it never
-look like a false repeat of each other) stops the loop early rather than
-spiraling. `Esc` `Esc` stops it between steps.
+absolute paths, no `..`). `Esc` `Esc` stops it between steps.
 
-`/task` can plan git operations too, but treats them in two tiers. Staging
-and committing locally (`git add`, `git commit`) happen automatically, same
-as any other step — they're local and reversible. Pushing, pulling, and
-creating or switching branches never happen automatically: if the task
-calls for one, `/task` stops and tells you to run the matching command
-yourself (`/push`, `/pull`, `/branch create <name>`, `/branch switch
-<name>`) to confirm it, then re-run `/task` to continue. This mirrors how
-`/push` already worked before `/task` could touch git at all: file and
-local-commit changes happen automatically as `/task` runs, but nothing
-leaves your machine, and nothing switches you to a different branch,
-until you explicitly ask it to.
+**Why it works this way.** The on-device model is good at *language* —
+rewriting a file to add a line — and bad at *bookkeeping*: telling a
+rename's source from its destination, noticing a task is already done,
+keeping commentary out of a filename. An earlier design had a model pick
+one step at a time and decide when it was finished; measured on the real
+on-device model, that failed every case of the reliability suite below.
+So `/task` now does the bookkeeping in code (`src/fm_pcc/taskplan.py`):
 
-All of `/task`'s actions (edit, create file, create folder, rename, move,
-each git operation) are implemented as a fixed, named vocabulary the
-planning model picks exactly one from per step, each backed by its own
-plain Python function that actually performs it — a deterministic
-"skills" dispatch, in effect. That's deliberate, not a placeholder for
-something fancier: `fm serve`'s OpenAI-style tool-calling was tried first
-and is broken on this OS build (it leaks raw, unparsed generation text
-instead of returning structured tool calls), and a model-invoked tool is
-a weaker guarantee anyway, since a model can simply choose not to call it
-and hallucinate regardless — the same failure mode a fixed-vocabulary
-planner avoids by construction.
+- **Planning is deterministic where the request has a recognizable
+  shape.** The request is split into clauses ("rename a.txt to b.txt, move
+  it into docs, and commit as 'tidy'"), and the common English forms of
+  rename, move, commit, push/pull, branch, and create requests are read
+  directly — including declaratives like "config.toml should be called
+  settings.toml", "utils.py should go in lib", "get data.csv out of tmp",
+  and "record these changes in git as 'snapshot'". Every path is resolved
+  against the real directory tree (and against earlier steps of the same
+  plan, so "rename a.txt to b.txt and move it into docs" works). A clause
+  phrased as an instruction to change contents ("add…", "fix…", "in x.txt,
+  replace…") that names one file becomes an edit of that file.
+- **Anything else goes to the planning model**, asked for the whole plan
+  at once as structured output (a fixed action vocabulary it can't step
+  outside). Its plan is then grounded the same way: steps the request
+  never asked for are dropped (an unrequested commit, an edit when the
+  request never asked to change contents), swapped or missing source and
+  destination paths are repaired against what actually exists, and a
+  missing destination folder is added. A request it still can't turn
+  into valid steps is reported, not guessed at.
+- **Edits are checked before they're written.** Unambiguous literal
+  changes don't need a model at all and are made exactly in code:
+  removing a named line or word, "replace A with B" / "change A to B",
+  setting `key = value` in config files, deleting a named function or
+  class, and whole-file case changes. Everything else is rewritten by the
+  on-device model (guided generation; large files one section at a time),
+  then checked against expectations derived from the request itself —
+  "remove X" means X is gone, "add…" means no existing line was lost,
+  "…saying Y" means Y is present, and the file must actually change. If
+  the model collapses the file's formatting, the original layout is
+  restored around its changes. A failed check is retried with the problem
+  spelled out; if no attempt passes, the step fails with an error and
+  nothing is written.
 
-This is genuinely autonomous, so it can genuinely go wrong: on real
-testing, a task needing cleanup/consolidation (not just clean additions)
-made the loop spiral — each step only had room to insert or replace one
-line-anchored region, so instead of removing stray content from an
-earlier step it kept adding more, without ever converging. To catch this,
-each step's instructions are compared against the last few for suspicious
-similarity (Cloud Pro asking for essentially the same fix again, worded
-slightly differently is what non-convergence actually looked like in
-practice) — if it looks like a repeat, the loop stops immediately with a
-"not making progress" message instead of grinding to the step cap and
-compounding the damage. It's a mitigation, not a fix for the underlying
-cause: `/task` is best suited to clean, additive changes, and worth
-watching (or interrupting) on anything that requires cleanup.
+`/task` treats git operations in two tiers. Staging and committing locally
+happen automatically, same as any other step — they're local and
+reversible (a commit with no message gets a descriptive one, and
+committing an already-clean tree is a no-op, not an error). Pushing,
+pulling, and creating or switching branches never happen automatically:
+if the plan reaches one, `/task` stops and tells you to run the matching
+command yourself (`/push`, `/pull`, `/branch create <name>`, `/branch
+switch <name>`), then re-run `/task` for anything after it. Deleting files
+isn't something `/task` does; it says so instead of trying.
+
+`fm serve`'s OpenAI-style tool-calling was tried as an alternative to this
+fixed vocabulary and is broken on this OS build (it leaks raw, unparsed
+generation text instead of returning structured tool calls) — and a
+model-invoked tool is a weaker guarantee anyway, since a model can simply
+choose not to call it.
 
 `/subagents` controls which model plays each of two roles, **planning**
 (planning/judgment calls — defaults to `cloud-pro`) and **building**
 (fast/local execution — defaults to `on-device`), used by both `/task`
-(its planning and section-picking) and `/ask` (below). Either role can be
+(planning whatever the parser can't read, and picking which section of a
+large file to edit) and `/ask` (below). Either role can be
 set to any model, including a specific `ollama:<name>`. One thing this
 *doesn't* change: `/task`'s actual file-writing step always runs on-device
 regardless of the "building" setting, since it's the only backend with the

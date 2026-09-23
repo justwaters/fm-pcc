@@ -10,13 +10,15 @@ async def main():
             return fn(*a, **kw)
 
         captured_models = []
-        def fake_plan_next_step(task, files, folders, cwd, history, backend, model):
+        def fake_plan_with_model(request, task, files, folders, backend, model):
             captured_models.append(model)
-            return None  # done immediately
+            return [], model  # nothing planned
 
+        # "do something" has no shape the deterministic parser recognizes,
+        # so it has to go to the planning model.
         with mock.patch.object(app, "call_from_thread", side_effect=sync_call_from_thread), \
              mock.patch.object(m, "notify"), \
-             mock.patch.object(m, "plan_next_step", side_effect=fake_plan_next_step):
+             mock.patch.object(m, "plan_with_model", side_effect=fake_plan_with_model):
             app._run_task.__wrapped__(app, "do something")
         assert captured_models == ["cloud-pro"], captured_models
         print("task uses planning role OK")
