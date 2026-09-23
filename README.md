@@ -400,8 +400,10 @@ rough indicator, not a reliable count, for those two tiers specifically.
 Next to the statusline, on the right, an **Update (vX.XX -> vY.YY)**
 button appears whenever a newer version is available — checked once at
 startup against this repo's [latest GitHub
-release](https://github.com/justwaters/fm-pcc/releases/latest). It's
-invisible the rest of the time, when you're already up to date. Clicking
+release](https://github.com/justwaters/fm-pcc/releases/latest), read from
+where that page redirects (which, unlike GitHub's API, has no hourly
+rate limit), with the API as a fallback. It's invisible the rest of the
+time, when you're already up to date. Clicking
 it runs `uv tool upgrade fm-pcc` in the background and reports success or
 failure as a message; since the running process already has its own code
 loaded in memory, you'll need to restart fm-pcc afterward to actually use

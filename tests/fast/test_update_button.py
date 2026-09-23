@@ -17,10 +17,13 @@ assert m.is_newer("0.32", "0.33") is False
 print("version helpers OK")
 
 class FakeResp:
-    def __init__(self, body):
+    def __init__(self, body, url=""):
         self.body = body.encode()
+        self.url = url
     def read(self):
         return self.body
+    def geturl(self):
+        return self.url
     def __enter__(self):
         return self
     def __exit__(self, *a):
@@ -37,6 +40,23 @@ with mock.patch("urllib.request.urlopen", return_value=FakeResp('{"tag_name": "v
     assert latest == "9.99", latest
     assert error is None
 print("fetch_latest_version success-path (v-prefixed tag) OK")
+
+# the web redirect is tried first and needs no API call at all
+web = FakeResp("", url="https://github.com/justwaters/fm-pcc/releases/tag/v1.23")
+with mock.patch("urllib.request.urlopen", return_value=web) as urlopen:
+    latest, error = m.fetch_latest_version()
+    assert (latest, error) == ("1.23", None), (latest, error)
+    assert urlopen.call_count == 1
+print("latest version read from the web redirect OK")
+
+# API rate-limited but the web page works -> still fine (the real bug)
+def web_ok_api_limited(req, timeout):
+    if "api.github.com" in req.full_url:
+        raise OSError("HTTP Error 403: rate limit exceeded")
+    return FakeResp("", url="https://github.com/justwaters/fm-pcc/releases/tag/v2.00")
+with mock.patch("urllib.request.urlopen", side_effect=web_ok_api_limited):
+    assert m.fetch_latest_version() == ("2.00", None)
+print("API rate limit doesn't break the update check OK")
 
 with mock.patch("urllib.request.urlopen", return_value=FakeResp('{"message": "Not Found"}')):
     latest, error = m.fetch_latest_version()

@@ -1089,6 +1089,12 @@ NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
 CLOUD_CONTEXT_TOKENS_ESTIMATE = 32000  # no published figure for cloud/cloud-pro -- a guess
 UPDATE_CHECK_URL = "https://api.github.com/repos/justwaters/fm-pcc/releases/latest"
+# The plain web page for the latest release redirects to
+# .../releases/tag/v<version>. Unlike the API, it isn't limited to 60
+# unauthenticated requests an hour per IP -- which /update hit for real
+# ("HTTP Error 403: rate limit exceeded") on a network shared with other
+# GitHub tooling -- so it's tried first.
+UPDATE_CHECK_WEB_URL = "https://github.com/justwaters/fm-pcc/releases/latest"
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
@@ -1105,26 +1111,44 @@ def is_newer(candidate: str, current: str) -> bool:
     return _version_tuple(candidate) > _version_tuple(current)
 
 
-def fetch_latest_version(
-    url: str = UPDATE_CHECK_URL, timeout: float = 4.0
-) -> tuple[str | None, str | None]:
-    """Check GitHub's "latest release" for this repo. Returns (version,
-    None) on success or (None, error) on failure (offline, timeout, no
-    releases yet, unexpected content) -- never raises, so the startup check
-    can just skip showing a button on failure, while /update can surface
-    the actual error for a human to debug instead of failing silently.
-    """
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception as e:
-        return None, str(e)
+def _latest_version_from_web(url: str, timeout: float) -> str:
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": f"fm-pcc/{__version__}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        final = resp.geturl()
+    match = re.search(r"/releases/tag/v?([^/?#]+)$", final or "")
+    if not match:
+        raise ValueError(f"latest-release page didn't redirect to a tag ({final})")
+    return urllib.parse.unquote(match.group(1))
+
+
+def _latest_version_from_api(url: str, timeout: float) -> str:
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
     tag = data.get("tag_name") or ""
     version = tag[1:] if tag.startswith("v") else tag
     if not version:
-        return None, f"unexpected response: {data!r}"[:200]
-    return version, None
+        raise ValueError(f"unexpected response: {data!r}"[:200])
+    return version
+
+
+def fetch_latest_version(
+    url: str = UPDATE_CHECK_URL, timeout: float = 4.0, web_url: str = UPDATE_CHECK_WEB_URL
+) -> tuple[str | None, str | None]:
+    """Find the latest GitHub release's version: first from where the web
+    "latest release" page redirects (no rate limit), then from the API.
+    Returns (version, None) on success or (None, error) if both fail --
+    never raises, so the startup check can just skip showing a button on
+    failure, while /update can surface the actual errors.
+    """
+    errors = []
+    for source, fetch in (("github.com", lambda: _latest_version_from_web(web_url, timeout)),
+                          ("GitHub API", lambda: _latest_version_from_api(url, timeout))):
+        try:
+            return fetch(), None
+        except Exception as e:
+            errors.append(f"{source}: {e}")
+    return None, "; ".join(errors)
 
 
 def _git_repo_name(cwd: str) -> str | None:
