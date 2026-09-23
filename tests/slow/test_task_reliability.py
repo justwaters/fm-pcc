@@ -419,6 +419,17 @@ CASES = [
     ("b6/combo-edit-commit-please", lambda: git_repo({"todo.txt": "- a\n"}),
      "please add a line saying - b to todo.txt and commit it with the message 'more todos'",
      lambda: contains("todo.txt", "- a", "- b") + committed("more todos")),
+    # ---- from real use: a vague theme request over a real stylesheet ----
+    ("theme/green-yellow", plain({
+        "index.html": "<html>\n<head>\n<link rel=\"stylesheet\" href=\"styles/main.css\" />\n</head>\n<body>\n<h1>Hi</h1>\n</body>\n</html>\n",
+        "styles/main.css": ":root {\n\t--blue-dark: #00296b;\n\t--blue-light: #00509d;\n\t--yellow-main: #fdc500;\n\t--bg-app: #f4f6f9;\n}\n\n"
+                           "/* header */\nheader {\n\tbackground-color: var(--blue-dark);\n\tcolor: white;\n}\n\n"
+                           "a {\n\tcolor: var(--blue-light);\n}\n",
+    }),
+     "make the ui a green and yellow theme",
+     lambda: contains("styles/main.css", "--blue-dark:", "--blue-light:", "var(--blue-dark)", "/* header */", "\tcolor: white;")
+     + lacks("styles/main.css", "#00296b", "#00509d")
+     + contains("index.html", "<h1>Hi</h1>", "</body>")),
     ("combo/create-folder-and-file", plain({}),
      'create a folder named "test" with the file "path.txt" inside it',
      lambda: (["test is not a directory"] if not os.path.isdir("test") else []) + exists("test/path.txt")),

@@ -246,4 +246,40 @@ eq(t.literal_edit("change the color in config.txt to blue", "color=red\n"), "col
 eq(t.literal_edit("change the heading to New Title", "# Old Title\n"), None)  # not literal: model's job
 print("literal change OK")
 
+# ---- theme recoloring ----
+css = ":root {\n\t--blue-dark: #00296b;\n\t--yellow-main: #fdc500;\n\t--bg: #ffffff;\n}\n" \
+      "header { background: var(--blue-dark); box-shadow: 0 4px 20px rgba(0, 41, 107, 0.08); }\n"
+assert t.is_theme_request("make the ui a green and yellow theme")
+assert not t.is_theme_request("change the header text to Welcome")
+out = t.recolor_theme(css, "make the ui a green and yellow theme")
+assert "--blue-dark: #006b24;" in out, out            # dark blue -> dark green (lightness kept)
+assert "--yellow-main: #fdc500;" in out, out          # already yellow: untouched
+assert "--bg: #ffffff;" in out and "rgba(0, 107, 36, 0.08)" in out, out
+assert t.recolor_theme("a { color: #333; }", "make it green") is None  # nothing chromatic
+assert t.color_matches_word("#006b24", "green") and not t.color_matches_word("#00296b", "green")
+print("theme recolor OK")
+
+# ---- structure / relevance / whitespace checks ----
+assert t.check_structure("a.css", "x", "a {\n}\n/* c */\n", "a {\n}\n/* c\n")          # unclosed comment
+assert t.check_structure("a.css", "x", ":root { --a: #fff; }", ":root { --b: #fff; }",
+                         whole_file=":root { --a: #fff; } p { color: var(--a); }")          # used var renamed
+assert t.check_structure("a.html", "x", "<div><p>hi</p></div>", "<div><p>hi</p></body></div>")
+eq(t.check_structure("a.html", "add a footer", "<body>\n</body>", "<body>\n<footer>f</footer>\n</body>"), [])
+eq(t.match_indentation("a {\n\tb: 1;\n}", "a {\n    b: 2;\n}"), "a {\n\tb: 2;\n}")
+assert t.check_edit("make it green", "<p>\n  hi\n</p>\n", "<p>\nhi\n\n</p>\n")  # whitespace only
+assert t.check_relevant("change the background color to green", "<p>hi</p>", "<p>hi</p></body>")
+eq(t.check_relevant("change the background color to green", "p {}", "p { background: #0a0; }"), [])
+print("structure checks OK")
+
+# ---- planner edits of files the request didn't name ----
+norm = t.normalize_model_steps(
+    [{"action": "EDIT", "path": "styles/liquidglass.css", "destination": "", "details": "green"},
+     {"action": "EDIT", "path": "index.html", "destination": "", "details": "green"}],
+    "make the ui a green and yellow theme", ["index.html", "styles/liquid_glass.css"], ["styles"])
+eq([(s["path"], s["optional"]) for s in norm], [("styles/liquid_glass.css", True), ("index.html", True)])
+eq(t.normalize_model_steps(
+    [{"action": "EDIT", "path": "b.txt", "destination": "", "details": "x"}],
+    "fix the typo in a.txt", ["a.txt", "b.txt"], []), [])  # named a file: only that file
+print("unnamed-file edits OK")
+
 print("ALL TASKPLAN TESTS PASSED")

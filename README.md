@@ -92,7 +92,7 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   calls.
 - **`tests/slow/`** — real `/task` runs against the actual on-device
   model in scratch temp directories. `test_task_reliability.py` is a
-  corpus of 93 requests — edits, renames, moves, commits, and
+  corpus of 94 requests — edits, renames, moves, commits, theming, and
   combinations, in varied phrasings — each checked against the resulting
   files and git history; most batches of it were written and run *before*
   tuning anything for them, as an honest measure of how new phrasings
@@ -145,6 +145,15 @@ fm-pcc --model ollama --ollama-model llama3.2   # ...or a specific one
 Messages you've sent sit on a gray band, like in Claude Code's CLI, so
 your side of the conversation is easy to spot when scrolling back.
 
+Chat itself can't change files or run git — only `/task` can — so a chat
+message that `/task` fully understands on its own ("can you please commit
+and push", "rename app.js to main.js", "add a comment to app.js…") is run
+as `/task` directly. A message that reads like a change request but isn't
+fully understood ("i want the ui to have a green and yellow theme") gets a
+normal chat reply plus a tip; replying "do it" / "yes, do that" then runs
+that request as `/task`. Questions ("what happens if I rename…?") always
+stay chat, so talking *about* a change never makes one.
+
 On startup, if the current directory is a git repo and/or has a README,
 fm-pcc shows a one-line orientation note (repo name, file count, the
 README's first line) — no model call involved, just local filesystem
@@ -194,7 +203,7 @@ Slash commands, same spirit as `fm chat`:
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
-| `/push`                      | Commit and push the current changes to git             |
+| `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
 | `/pull`                      | Pull the latest changes from git                        |
 | `/branch create <name>`      | Create a new git branch and switch to it                |
 | `/branch switch <name>`      | Switch to an existing git branch                        |
@@ -250,20 +259,35 @@ So `/task` now does the bookkeeping in code (`src/fm_pcc/taskplan.py`):
   outside). Its plan is then grounded the same way: steps the request
   never asked for are dropped (an unrequested commit, an edit when the
   request never asked to change contents), swapped or missing source and
-  destination paths are repaired against what actually exists, and a
-  missing destination folder is added. A request it still can't turn
+  destination paths are repaired against what actually exists (including
+  a misspelled filename), and a missing destination folder is added. When
+  the request names no file ("make the ui…"), the planner picks the files
+  to edit; any of those that turns out to need no change — say, an HTML
+  page with no colors in a theme change — is skipped with a note instead
+  of stopping the task, and a change to one must actually involve the
+  request to be written. A request it still can't turn
   into valid steps is reported, not guessed at.
 - **Edits are checked before they're written.** Unambiguous literal
   changes don't need a model at all and are made exactly in code:
   removing a named line or word, "replace A with B" / "change A to B",
   setting `key = value` in config files, deleting a named function or
-  class, and whole-file case changes. Everything else is rewritten by the
+  class, whole-file case changes, and whole-theme re-colors ("make the ui
+  a green and yellow theme": every color in a stylesheet shifts to the
+  requested hues keeping its lightness, so dark stays dark and contrast
+  survives; grays, and colors like an error red, are left alone). A
+  targeted color change to a stylesheet with color variables ("make the
+  accent teal") has the model pick new *values* for existing variable
+  names, which code substitutes. Everything else is rewritten by the
   on-device model (guided generation; large files one section at a time),
   then checked against expectations derived from the request itself —
   "remove X" means X is gone, "add…" means no existing line was lost,
   "…saying Y" means Y is present, and the file must actually change. If
   the model collapses the file's formatting, the original layout is
-  restored around its changes. A failed check is retried with the problem
+  restored around its changes. Rewrites of code, stylesheets, and HTML
+  are also checked for structure: comments and braces still balance, HTML
+  tags still pair up, CSS variables the rest of the file uses still exist,
+  and the original indentation style is kept; a change that only moves
+  whitespace around is rejected. A failed check is retried with the problem
   spelled out; if no attempt passes, the step fails with an error and
   nothing is written.
 

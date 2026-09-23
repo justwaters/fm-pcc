@@ -643,7 +643,8 @@ _SIGNALS = {
     # to git" as an EDIT of the only file, with "save to git" as the change.
     "EDIT": r"\b(?:add|append|prepend|insert|change|replace|remove|delete|edit|update|fix|set|rewrite|"
             r"modify|make|turn|put|write|include|sort|bump|increase|decrease|rename|convert|translate|"
-            r"capitali[sz]e|uppercase|lowercase|comment|document|refactor|clean|improve|correct)",
+            r"capitali[sz]e|uppercase|lowercase|comment|document|refactor|clean|improve|correct|style|"
+            r"theme|restyle|redesign|recolou?r|colou?r)(?:s|es|d|ed|ing)?\b",
     "PUSH": r"\bpush",
     "PULL": r"\bpull",
     "BRANCH_CREATE": r"\bbranch",
@@ -740,12 +741,19 @@ def normalize_model_steps(steps: list[dict], request: str, files: list[str], fol
         everything = state.files + state.folders
         if action == "EDIT":
             target = resolve_existing(path, state.files)
+            if target is None and path:
+                # Seen for real: "styles/liquidglass.css" for liquid_glass.css.
+                close = difflib.get_close_matches(path, state.files, n=1, cutoff=0.85)
+                target = close[0] if close else None
             if target is None or target in moved_sources:
                 continue
-            # Only edit a file the request actually talks about.
-            if target not in mentioned_files(restore_quotes(text, quotes), state.files) and len(state.files) > 1:
+            # A request that names files only edits those. One that names
+            # none ("make the ui a green and yellow theme") leaves the
+            # choice to the planner -- those edits are marked optional: a
+            # file that turns out to need no change is skipped, not fatal.
+            if request_files and target not in request_files:
                 continue
-            new = step("EDIT", target, details=details or request)
+            new = step("EDIT", target, details=details or request, optional=not request_files)
         elif action == "CREATE_FILE":
             if not path or os.path.isabs(path) or path in everything:
                 continue
@@ -949,6 +957,13 @@ def check_edit(instructions: str, original: str, updated: str) -> list[str]:
     problems: list[str] = []
     if _content_lines(updated) == _content_lines(original):
         return ["the file came back unchanged -- the requested change wasn't made"]
+    if updated.split() == original.split() and not re.search(
+        r"\b(?:format|indent|whitespace|spacing|spaces|tabs|blank\s+lines?|line\s+breaks?|wrap|tidy|pretty)\b",
+        instructions, _I,
+    ):
+        # Seen for real: a "make it green" rewrite of an HTML file that
+        # only reshuffled indentation and blank lines.
+        return ["only whitespace changed -- the requested change wasn't made"]
     if not updated.strip() and original.strip() and not _CLEAR_RE.search(instructions):
         return ["the file came back empty"]
 
@@ -1273,3 +1288,336 @@ def _is_literal_change(m: re.Match, quotes: list[str], original: str) -> bool:
     if not re.search(rf"(?<![\w]){re.escape(old)}(?![\w])", original):
         return False
     return not any(_key_line_re(old).match(line) for line in original.splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Structure checks for rewrites of code/stylesheets
+# ---------------------------------------------------------------------------
+
+_BRACE_EXTS = {".css", ".scss", ".less", ".js", ".jsx", ".ts", ".tsx", ".json", ".java", ".c", ".cpp", ".swift", ".go", ".rs"}
+_CSS_VAR_DEF_RE = re.compile(r"(--[\w-]+)\s*:")
+
+
+def check_structure(filename: str, instructions: str, original: str, updated: str, whole_file: str = "") -> list[str]:
+    """Problems that break a file no matter what was asked -- measured for
+    real on a stylesheet rewrite that renamed/dropped custom properties the
+    rest of the file still used and lost a comment's closing */.
+    `whole_file` is the full file when only a section is being rewritten,
+    so "still used elsewhere" can be checked."""
+    ext = os.path.splitext(filename)[1].lower()
+    problems = []
+    if ext in _BRACE_EXTS or ext in (".html", ".htm"):
+        if updated.count("/*") - updated.count("*/") != original.count("/*") - original.count("*/"):
+            problems.append("a /* comment */ was left unclosed (or a stray */ added)")
+    if ext in _BRACE_EXTS:
+        if updated.count("{") - updated.count("}") != original.count("{") - original.count("}"):
+            problems.append("the { } braces no longer balance")
+    if ext in (".html", ".htm", ".xml", ".svg", ".vue"):
+        def balance(text: str) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for closing, tag in re.findall(r"<(/?)([a-zA-Z][\w-]*)\b[^>]*?(?<!/)>", text):
+                out[tag.lower()] = out.get(tag.lower(), 0) + (-1 if closing else 1)
+            return out
+        before, after = balance(original), balance(updated)
+        off = [t for t in set(before) | set(after) if before.get(t, 0) != after.get(t, 0)
+               and t not in ("br", "hr", "img", "input", "meta", "link", "source", "wbr", "area", "col", "base")]
+        if off:
+            problems.append(f"HTML tags no longer balance: <{'>, <'.join(sorted(off)[:4])}>")
+    if ext in (".css", ".scss", ".less") and not re.search(r"\b(?:rename|remove|delete|drop)\b", instructions, _I):
+        context = whole_file or original
+        used = set(re.findall(r"var\(\s*(--[\w-]+)", context))
+        lost = [
+            name for name in dict.fromkeys(_CSS_VAR_DEF_RE.findall(original))
+            if name in used and name not in _CSS_VAR_DEF_RE.findall(updated)
+        ]
+        if lost:
+            problems.append(f"CSS variables still used elsewhere were renamed or removed: {', '.join(lost[:4])}")
+    return problems
+
+
+def match_indentation(original: str, updated: str) -> str:
+    """If `original` indents with tabs and the rewrite switched to spaces,
+    switch it back (4 or 2 spaces per level, whichever fits)."""
+    orig_tabs = sum(1 for line in original.splitlines() if line.startswith("\t"))
+    new_tabs = sum(1 for line in updated.splitlines() if line.startswith("\t"))
+    new_spaces = [len(line) - len(line.lstrip(" ")) for line in updated.splitlines() if line.startswith(" ")]
+    if not orig_tabs or new_tabs or not new_spaces:
+        return updated
+    unit = 4 if all(n % 4 == 0 for n in new_spaces) else 2
+    out = []
+    for line in updated.splitlines(keepends=True):
+        n = len(line) - len(line.lstrip(" "))
+        out.append("\t" * (n // unit) + " " * (n % unit) + line[n:] if n else line)
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Stylesheet palettes: the model picks values, code keeps the structure
+# ---------------------------------------------------------------------------
+
+_NAMED_COLORS = {
+    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0), "green": (0, 128, 0),
+    "blue": (0, 0, 255), "yellow": (255, 255, 0), "orange": (255, 165, 0), "purple": (128, 0, 128),
+    "pink": (255, 192, 203), "gray": (128, 128, 128), "grey": (128, 128, 128), "teal": (0, 128, 128),
+    "navy": (0, 0, 128), "gold": (255, 215, 0), "lime": (0, 255, 0), "olive": (128, 128, 0),
+    "brown": (165, 42, 42), "cyan": (0, 255, 255), "magenta": (255, 0, 255), "maroon": (128, 0, 0),
+    "transparent": None,
+}
+_HEX_RE = re.compile(r"^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$", _I)
+_FUNC_COLOR_RE = re.compile(r"^(?:rgb|rgba|hsl|hsla)\(\s*[\d.%\s,/-]+\)$", _I)
+_PALETTE_DECL_RE = re.compile(r"^(?P<pre>\s*(?P<name>--[\w-]+)\s*:\s*)(?P<val>[^;]+?)(?P<post>\s*;.*)$")
+
+
+def is_css_color(value: str) -> bool:
+    value = value.strip()
+    return bool(_HEX_RE.match(value) or _FUNC_COLOR_RE.match(value) or value.lower() in _NAMED_COLORS)
+
+
+def css_color_rgb(value: str) -> tuple[int, int, int] | None:
+    value = value.strip().lower()
+    if value in _NAMED_COLORS:
+        return _NAMED_COLORS[value]
+    if _HEX_RE.match(value):
+        h = value[1:]
+        if len(h) in (3, 4):
+            h = "".join(c * 2 for c in h[:3])
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    m = re.match(r"rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)", value)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    return None
+
+
+_HUE_RANGES = {  # color word -> hue ranges in degrees
+    "red": [(345, 360), (0, 15)], "orange": [(15, 40)], "yellow": [(40, 70)], "gold": [(40, 60)],
+    "green": [(70, 170)], "lime": [(70, 110)], "teal": [(160, 200)], "cyan": [(170, 200)],
+    "blue": [(195, 255)], "navy": [(215, 250)], "purple": [(255, 300)], "violet": [(255, 300)],
+    "pink": [(300, 345)], "magenta": [(285, 330)],
+}
+
+
+def color_matches_word(value: str, word: str) -> bool:
+    import colorsys
+    rgb = css_color_rgb(value)
+    if rgb is None:
+        return False
+    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+    word = word.lower()
+    if word in ("black", "white", "gray", "grey"):
+        return {"black": l < 0.2, "white": l > 0.9}.get(word, s < 0.15)
+    if s < 0.2 or l < 0.08 or l > 0.97:
+        return False
+    hue = h * 360
+    return any(lo <= hue < hi for lo, hi in _HUE_RANGES.get(word, []))
+
+
+def requested_color_words(instructions: str) -> list[str]:
+    words = re.findall(r"\b(" + "|".join(list(_HUE_RANGES) + ["black", "white", "gray", "grey"]) + r")\b",
+                       instructions, _I)
+    return list(dict.fromkeys(w.lower() for w in words))
+
+
+def palette_variables(content: str) -> list[tuple[int, str, str]]:
+    """(line index, --name, value) for every custom property whose value is
+    a plain color."""
+    out = []
+    for i, line in enumerate(content.splitlines()):
+        m = _PALETTE_DECL_RE.match(line)
+        if m and is_css_color(m.group("val")):
+            out.append((i, m.group("name"), m.group("val").strip()))
+    return out
+
+
+def apply_palette(content: str, new_values: dict[str, str]) -> str:
+    """Replace only the values of the named color variables -- names,
+    comments, and layout are untouched by construction."""
+    lines = content.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        m = _PALETTE_DECL_RE.match(line.rstrip("\n"))
+        if m and m.group("name") in new_values:
+            ending = "\n" if line.endswith("\n") else ""
+            lines[i] = m.group("pre") + new_values[m.group("name")] + m.group("post") + ending
+    return "".join(lines)
+
+
+def check_palette(instructions: str, old_values: dict[str, str], new_values: dict[str, str]) -> list[str]:
+    changed = {k: v for k, v in new_values.items() if k in old_values and v.strip().lower() != old_values[k].lower()}
+    if not changed:
+        return ["no colors were changed"]
+    bad = [f"{k}: {v!r}" for k, v in changed.items() if not is_css_color(v)]
+    if bad:
+        return [f"these aren't valid CSS colors: {', '.join(bad)}"]
+    final = {**old_values, **changed}
+    problems = []
+    for word in requested_color_words(instructions):
+        if not any(color_matches_word(v, word) for v in changed.values()):
+            if not any(color_matches_word(v, word) for v in final.values()):
+                problems.append(f"the palette should include {word}, but none of the new colors are {word}")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Whole-theme recoloring
+# ---------------------------------------------------------------------------
+
+_TARGET_HUE = {
+    "red": 0, "orange": 30, "yellow": 50, "gold": 48, "green": 140, "lime": 95, "teal": 180,
+    "cyan": 188, "blue": 215, "navy": 228, "purple": 275, "violet": 275, "pink": 330, "magenta": 305,
+}
+_FAMILIES = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink"]
+_COLOR_LITERAL_RE = re.compile(
+    r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3,4})(?![0-9a-zA-Z_-])"
+    r"|rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(?:,\s*[\d.]+%?\s*)?\)"
+)
+_THEME_WORDS_RE = re.compile(
+    r"\b(?:theme|themed|colou?r\s*scheme|palette|colou?rs|look|ui|site|website|app|page|design|style)\b", _I
+)
+
+
+def is_theme_request(instructions: str) -> bool:
+    """"make the ui a green and yellow theme", "use a purple color scheme"
+    -- a request to re-color everything, not one specific thing."""
+    words = [w for w in requested_color_words(instructions) if w in _TARGET_HUE]
+    return bool(words) and (bool(_THEME_WORDS_RE.search(instructions)) or len(words) >= 2)
+
+
+def _family(h: float) -> str:
+    hue = h * 360
+    for fam in _FAMILIES:
+        if any(lo <= hue < hi for lo, hi in _HUE_RANGES[fam]):
+            return fam
+    return "red"
+
+
+def recolor_theme(content: str, instructions: str) -> str | None:
+    """Shift every chromatic color in `content` to the requested theme
+    colors, keeping each color's lightness and saturation -- so dark stays
+    dark, light stays light, and contrast survives. The most common color
+    family goes to the first requested color, the next to the second, and
+    so on; a family that already *is* a requested color stays put, and
+    grays/whites/blacks and any leftover families (an error red) are left
+    alone. None if nothing would change. No model involved: a theme swap is
+    exactly the kind of consistent, file-wide bookkeeping a small model
+    gets wrong (measured: it re-colored a few variables at random and
+    produced white text on a light-green background).
+    """
+    import colorsys
+
+    wanted = [w for w in requested_color_words(instructions) if w in _TARGET_HUE]
+    if not wanted:
+        return None
+
+    def hls(rgb):
+        return colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+
+    counts: dict[str, int] = {}
+    for m in _COLOR_LITERAL_RE.finditer(content):
+        rgb = css_color_rgb(m.group())
+        if rgb is None:
+            continue
+        h, l, s = hls(rgb)
+        if s >= 0.2 and 0.08 < l < 0.97:
+            fam = _family(h)
+            counts[fam] = counts.get(fam, 0) + 1
+    if not counts:
+        return None
+
+    mapping: dict[str, str] = {}
+    remaining = list(wanted)
+    for fam in counts:
+        if fam in remaining:
+            mapping[fam] = fam
+            remaining.remove(fam)
+    for fam in sorted(counts, key=lambda f: -counts[f]):
+        if fam not in mapping and remaining:
+            mapping[fam] = remaining.pop(0)
+    if all(fam == target for fam, target in mapping.items()):
+        return None
+
+    def replace(m: re.Match) -> str:
+        text = m.group()
+        rgb = css_color_rgb(text)
+        if rgb is None:
+            return text
+        h, l, s = hls(rgb)
+        if not (s >= 0.2 and 0.08 < l < 0.97):
+            return text
+        target = mapping.get(_family(h))
+        if target is None or target == _family(h):
+            return text
+        r, g, b = (round(c * 255) for c in colorsys.hls_to_rgb(_TARGET_HUE[target] / 360, l, s))
+        if text.startswith("#"):
+            digits = text[1:]
+            alpha = digits[6:8] if len(digits) == 8 else (digits[3] * 2 if len(digits) == 4 else "")
+            out = f"#{r:02x}{g:02x}{b:02x}{alpha}"
+            return out.upper() if digits.isupper() else out
+        alpha = re.match(r"rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(,\s*[\d.]+%?\s*)?\)", text).group(1)
+        func = "rgba" if text.lower().startswith("rgba") else "rgb"
+        return f"{func}({r}, {g}, {b}{alpha.rstrip() if alpha else ''})"
+
+    updated = _COLOR_LITERAL_RE.sub(replace, content)
+    return updated if updated != content else None
+
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "into", "from", "make", "change", "update", "set",
+    "add", "use", "all", "its", "your", "you", "our", "them", "then", "text", "file", "files",
+}
+
+
+def check_relevant(instructions: str, original: str, updated: str) -> list[str]:
+    """For an edit the planner chose on its own (the request named no
+    file): the change has to actually involve the request -- one of its
+    words, or a color when colors were asked for. Seen for real: a "make
+    the ui green" rewrite of index.html that only moved tags around."""
+    old_tokens, new_tokens = original.split(), updated.split()
+    added = []
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False).get_opcodes():
+        if tag in ("replace", "insert"):
+            added.extend(new_tokens[j1:j2])
+    added_text = " ".join(added).lower()
+    keywords = {w.lower() for w in re.findall(r"[A-Za-z][\w-]{2,}", instructions)} - _STOPWORDS
+    if any(k in added_text for k in keywords):
+        return []
+    if requested_color_words(instructions) and _COLOR_LITERAL_RE.search(added_text):
+        return []
+    return ["the change doesn't touch anything the request is about"]
+
+
+# ---------------------------------------------------------------------------
+# Plain chat -> /task
+# ---------------------------------------------------------------------------
+
+_AFFIRM_RE = re.compile(
+    r"^(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|go\s+ahead|do\s+(?:it|that|this|so)|make\s+it\s+so|"
+    r"sounds\s+good|let'?s\s+do\s+(?:it|that)|go\s+for\s+it|y|thanks?)\b[\s,.!]*)+$",
+    _I,
+)
+_ACTION_CUE_RE = re.compile(
+    r"\b(?:commit|push|pull|branch|rename|move|create|make|add|append|change|edit|update|fix|replace|"
+    r"remove|delete|write|set|theme|restyle|recolou?r|style)\b|\bi\s+(?:want|need|would\s+like|'d\s+like)\b",
+    _I,
+)
+
+
+def is_affirmation(text: str) -> bool:
+    """"yes, do that", "go ahead", "ok do it" -- a go-ahead for whatever
+    change was just discussed."""
+    return bool(_AFFIRM_RE.match(text.strip()))
+
+
+def is_direct_action(text: str, files: list[str], folders: list[str]) -> bool:
+    """True if a plain chat message is a request /task fully understands
+    on its own ("can you please commit and push", "rename a.txt to
+    b.txt"). Questions, and anything with a part the parser can't read,
+    stay chat -- so talking *about* a change never makes one."""
+    if text.rstrip().endswith("?"):
+        return False
+    steps = parse_task(text, files, folders)
+    return bool(steps) and all(s["action"] != "UNPARSED" for s in steps)
+
+
+def looks_like_action(text: str) -> bool:
+    """A chat message that reads like a change request, but that the
+    parser couldn't fully read -- worth offering to run it as /task."""
+    return not text.rstrip().endswith("?") and bool(_ACTION_CUE_RE.search(text))

@@ -310,7 +310,11 @@ def _generate_checked(
 
 
 def propose_edit(
-    path: str, instructions: str, cwd: str, line_range: tuple[int, int] | None = None
+    path: str,
+    instructions: str,
+    cwd: str,
+    line_range: tuple[int, int] | None = None,
+    speculative: bool = False,
 ) -> dict:
     """Ask the on-device model to rewrite `path` (or just `line_range` of
     it, 1-based inclusive) with `instructions` applied.
@@ -322,6 +326,10 @@ def propose_edit(
     wrong line. Rewriting gets the change right in most cases, and the
     rest are caught by taskplan.check_edit() (derived from the request
     itself) and retried rather than written.
+
+    `speculative` marks an edit the planner chose on its own (the request
+    named no file): its change must also be relevant to the request, or
+    it's rejected rather than written.
     """
     full_path = os.path.expanduser(path)
     if not os.path.isabs(full_path):
@@ -334,6 +342,20 @@ def propose_edit(
 
     with open(full_path, "r", errors="replace") as f:
         original = f.read()
+
+    # A whole-theme re-color is done across the entire file in code, so
+    # it isn't limited to one section and needs no model call.
+    if taskplan.is_theme_request(instructions):
+        recolored = None
+        if os.path.splitext(label)[1].lower() in (".css", ".scss", ".less", ".html", ".htm", ".svg"):
+            recolored = taskplan.recolor_theme(original, instructions)
+        if recolored is not None:
+            return {
+                "path": full_path, "label": label, "original": original, "updated": recolored,
+                "summary": f"re-colored {label}: {instructions}",
+            }
+        if speculative:
+            raise EditError("it has no colors to change")
 
     lines = original.splitlines()
     lo, hi = line_range if line_range else (1, len(lines))
@@ -358,15 +380,20 @@ def propose_edit(
         f"requested change."
     )
     literal = taskplan.literal_edit(instructions, excerpt)
-    if literal is not None and not taskplan.check_edit(instructions, excerpt, literal):
+    if _is_palette_request(label, instructions, excerpt):
+        new_excerpt = _propose_palette(label, instructions, excerpt)
+    elif literal is not None and not taskplan.check_edit(instructions, excerpt, literal):
         new_excerpt = literal
     else:
         new_excerpt = _generate_checked(
             prompt, _REWRITE_SCHEMA,
-            lambda text: taskplan.check_edit(instructions, excerpt, text),
+            lambda text: taskplan.check_edit(instructions, excerpt, text)
+            + taskplan.check_structure(label, instructions, excerpt, text, whole_file=original)
+            + (taskplan.check_relevant(instructions, excerpt, text) if speculative else []),
             original=excerpt,
-            repair=lambda text: (
-                taskplan.restore_layout(excerpt, text) if taskplan.looks_reflowed(excerpt, text) else text
+            repair=lambda text: taskplan.match_indentation(
+                excerpt,
+                taskplan.restore_layout(excerpt, text) if taskplan.looks_reflowed(excerpt, text) else text,
             ),
         )
 
@@ -382,6 +409,60 @@ def propose_edit(
         "updated": updated,
         "summary": f"edited {label}: {instructions}",
     }
+
+
+def _is_palette_request(label: str, instructions: str, text: str) -> bool:
+    return (
+        os.path.splitext(label)[1].lower() in (".css", ".scss", ".less")
+        and bool(re.search(r"colou?r|theme|palette|accent|brand|dark\s+mode|light\s+mode", instructions, re.I)
+                 or taskplan.requested_color_words(instructions))
+        and len(taskplan.palette_variables(text)) >= 2
+    )
+
+
+def _propose_palette(label: str, instructions: str, text: str) -> str:
+    """Re-color a stylesheet through its color custom properties: the model
+    only picks new values for existing variable names (guided generation,
+    names constrained to an enum), and code substitutes them -- so the
+    rewrite can't rename or drop a variable or break a comment, which a
+    free-text rewrite of a real stylesheet did."""
+    variables = taskplan.palette_variables(text)
+    old_values = {name: value for _, name, value in variables}
+    schema = {
+        "type": "object", "title": "Palette", "additionalProperties": False,
+        "properties": {"colors": {"type": "array", "items": {"$ref": "#/$defs/Color"}}},
+        "required": ["colors"], "x-order": ["colors"],
+        "$defs": {"Color": {
+            "type": "object", "title": "Color", "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string", "enum": list(old_values)},
+                "value": {"type": "string", "description": "The new CSS color, as a hex code like #1f7a3a"},
+            },
+            "required": ["name", "value"], "x-order": ["name", "value"],
+        }},
+    }
+    listing = "\n".join(f"{name}: {value}" for name, value in old_values.items())
+    prompt = (
+        f"These are the color variables in {label}:\n\n{listing}\n\n"
+        f"Change request: {instructions}\n\n"
+        f"Give new hex colors for every variable that should change to carry out this "
+        f"request. Keep each variable's role: backgrounds stay light or dark as they are "
+        f"now, and text keeps enough contrast against its background."
+    )
+    problems: list[str] = []
+    for attempt in range(EDIT_ATTEMPTS):
+        feedback = f"\n\nA previous attempt was rejected: {'; '.join(problems)}." if problems else ""
+        try:
+            reply = fm_structured(schema, prompt + feedback, greedy=attempt == 0)
+        except EditError as e:
+            problems = [f"the model's reply failed ({e})"]
+            continue
+        new_values = {c["name"]: c["value"].strip() for c in reply.get("colors") or [] if c.get("name") in old_values}
+        problems = taskplan.check_palette(instructions, old_values, new_values)
+        if not problems:
+            changed = {k: v for k, v in new_values.items() if v.lower() != old_values[k].lower()}
+            return taskplan.apply_palette(text, changed)
+    raise EditError(f"couldn't produce a correct palette after {EDIT_ATTEMPTS} tries: {'; '.join(problems)}")
 
 
 def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
@@ -510,6 +591,15 @@ def git_pull(cwd: str) -> str:
 
 def git_push(cwd: str) -> str:
     result = git_run(["push"], cwd, timeout=120)
+    if result.returncode != 0 and "no upstream branch" in (result.stderr or ""):
+        # A branch that's never been pushed. The user already asked to
+        # push (/push is always explicit), so finish the job: publish it
+        # to the repo's remote -- "origin", or the only remote there is.
+        remotes = git_run(["remote"], cwd, timeout=10).stdout.split()
+        remote = "origin" if "origin" in remotes else (remotes[0] if len(remotes) == 1 else None)
+        branch = git_branch(cwd)
+        if remote and branch:
+            result = git_run(["push", "--set-upstream", remote, branch], cwd, timeout=120)
     if result.returncode != 0:
         raise EditError((result.stderr or result.stdout).strip())
     return result.stdout.strip()
@@ -771,6 +861,18 @@ def choose_edit_range(
         return None
     sections = split_sections(content, filename)
     lines = content.splitlines()
+    # A color/theme change to a stylesheet belongs in its custom-property
+    # palette (":root { --brand: ...; }") when it has one: one block that
+    # restyles everything, instead of one of hundreds of rules.
+    if os.path.splitext(filename)[1].lower() in (".css", ".scss", ".less") and re.search(
+        r"colou?r|theme|palette|background|accent|brand|dark\s+mode|light\s+mode|"
+        r"\b(?:red|green|blue|yellow|orange|purple|pink|black|white|gr[ae]y|teal|navy)\b",
+        instructions, re.IGNORECASE,
+    ):
+        for s in sections:
+            body = "\n".join(lines[s["start"] - 1 : s["end"]])
+            if s["name"].startswith(":root") and "--" in body and len(body) <= REWRITE_MAX_CHARS:
+                return s["start"], s["end"]
     words = {w.lower() for w in re.findall(r"[A-Za-z_][\w\-]{2,}", instructions)}
     words -= {w.lower() for w in re.findall(r"[\w.\-]+", filename)}
     scored = []
@@ -1633,6 +1735,9 @@ class ChatApp(App):
         self._pending_edit: dict | None = None
         self._model_picker_active = False
         self._history: list[str] = []
+        # The last plain-chat message that read like a change request, so
+        # "yes, do that" right after can run it as /task.
+        self._pending_action_request: str | None = None
         self._history_index: int | None = None
         self._history_draft = ""
         self._suppress_palette_once = False
@@ -2106,6 +2211,7 @@ class ChatApp(App):
         self._loop_running = True
         self._loop_cancel_requested = False
         summaries: list[str] = []
+        skipped: list[str] = []
         start_time = time.monotonic()
         try:
             files, folders = gather_task_tree(cwd)
@@ -2150,11 +2256,28 @@ class ChatApp(App):
                     )
                     return
                 self.call_from_thread(self._log_progress, f"step {number}: {describe_step(s)}")
-                summary = self._execute_task_step(s, cwd, summaries)
+                try:
+                    summary = self._execute_task_step(s, cwd, summaries)
+                except EditError as e:
+                    if not s.get("optional"):
+                        raise
+                    # A file the planner chose on its own (the request
+                    # named none) that turned out not to need this change.
+                    skipped.append(s["path"])
+                    reason = str(e) if len(str(e)) < 80 else "no suitable change found in it"
+                    self.call_from_thread(self._log_progress, f"skipped {s['path']}: {reason}")
+                    continue
                 summaries.append(summary)
                 self.call_from_thread(self._log_progress, summary)
 
-            self.call_from_thread(self._log_progress, f"done after {len(steps)} step(s).")
+            done = len(steps) - len(skipped)
+            if not done:
+                self.call_from_thread(
+                    self._log_progress, "stopped: none of the planned changes could be made."
+                )
+                return
+            note = f" (skipped {', '.join(skipped)})" if skipped else ""
+            self.call_from_thread(self._log_progress, f"done after {done} step(s){note}.")
         except GenerationCancelled:
             self.call_from_thread(self._log_progress, "stopped")
         except EditError as e:
@@ -2206,7 +2329,9 @@ class ChatApp(App):
             line_range = choose_edit_range(
                 content, path, details, self.backend, self.subagent_roles["planning"]
             )
-            proposal = propose_edit(path, details, cwd, line_range=line_range)
+            proposal = propose_edit(
+                path, details, cwd, line_range=line_range, speculative=bool(s.get("optional"))
+            )
         else:
             raise EditError(f"unknown step: {action}")
 
@@ -2781,6 +2906,9 @@ class ChatApp(App):
             self._handle_command(prompt)
             return
 
+        if self._route_chat_to_task(prompt):
+            return
+
         event.input.disabled = True
 
         expanded, attachments = expand_file_references(prompt, os.getcwd())
@@ -2794,6 +2922,30 @@ class ChatApp(App):
 
         self._thinking = self._add_message(Message("thinking", ""))
         self._respond(expanded)
+
+    def _route_chat_to_task(self, prompt: str) -> bool:
+        """Chat can't change files or run git -- only /task can -- and the
+        chat model will just say "I can't do that". So a plain message
+        /task fully understands ("can you please commit and push") runs as
+        /task directly, and "yes, do that" right after a change request
+        runs that request. Returns True if it was routed."""
+        request = None
+        if self._pending_action_request and taskplan.is_affirmation(prompt):
+            request = self._pending_action_request
+        else:
+            files, folders = gather_task_tree(os.getcwd())
+            if taskplan.is_direct_action(prompt, files, folders):
+                request = prompt
+        self._pending_action_request = None
+        if request is None:
+            if taskplan.looks_like_action(prompt):
+                self._pending_action_request = prompt
+            return False
+        self._add_message(Message("system", f"running as /task: {request}"))
+        self._last_task_description = request
+        self.query_one(Input).disabled = True
+        self._run_task(request)
+        return True
 
     @work(thread=True)
     def _respond(self, prompt: str) -> None:
@@ -2833,6 +2985,11 @@ class ChatApp(App):
         else:
             self.turn += 1
             self._add_message(Message("assistant", text))
+            if self._pending_action_request:
+                self._add_message(Message(
+                    "system",
+                    'to have fm-pcc make this change itself, reply "do it" (runs it as /task)',
+                ))
             self._update_chrome()
         self._enable_input()
 
