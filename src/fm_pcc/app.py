@@ -42,7 +42,7 @@ from textual.reactive import reactive
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__, taskplan
+from . import __version__, codework, taskplan
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -247,9 +247,67 @@ REWRITE_MAX_CHARS = 4000
 # previous attempt's problem spelled out, since a greedy retry of the
 # same prompt would just reproduce the same mistake.
 EDIT_ATTEMPTS = 4
+# Past this size, a request that names one function edits just that
+# function rather than rewriting the whole file.
+NAMED_FUNCTION_EDIT_MIN_CHARS = 1500
 # No new attempt starts after this long -- a runaway generation can take
 # over a minute on its own.
 EDIT_TIME_BUDGET_SECONDS = 90
+
+
+# Code is generated as plain text in a fenced block, not inside a JSON
+# string: measured on the same eight coding prompts, the on-device model
+# got 8/8 right in plain text and 5/8 through guided generation, and the
+# JSON route sometimes wrote literal "\n" sequences into source files.
+# Prose-like files keep guided generation, which has no fence to confuse
+# with a markdown file's own code blocks.
+PROSE_EXTS = {".md", ".markdown", ".txt", ".rst", ".cfg", ".ini", ".env", ".yml", ".yaml", ".toml", ".csv", ""}
+GENERATION_TIMEOUT_SECONDS = 75
+CONTEXT_BUDGET_ON_DEVICE = 3000   # characters of other files shown alongside an edit
+CONTEXT_BUDGET_CLOUD = 16000
+
+
+_FENCE_LANGS = {
+    ".py": "python", ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "jsx",
+    ".ts": "typescript", ".tsx": "tsx", ".swift": "swift", ".go": "go", ".rs": "rust", ".rb": "ruby",
+    ".java": "java", ".kt": "kotlin", ".c": "c", ".h": "c", ".cpp": "cpp", ".cs": "csharp", ".php": "php",
+    ".sh": "bash", ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss", ".json": "json",
+    ".sql": "sql",
+}
+
+
+def _is_prose(label: str) -> bool:
+    return os.path.splitext(label)[1].lower() in PROSE_EXTS
+
+
+def fm_code(prompt: str, greedy: bool = True) -> str:
+    """One on-device call answered in plain text; returns the code from its
+    fenced block."""
+    args = ["fm", "respond", "--model", "system", "--no-stream"]
+    if greedy:
+        args.append("--greedy")
+    result = _run(
+        [*args, prompt + "\n\nReply with only the complete code in one ``` code block, nothing else."],
+        timeout=GENERATION_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise EditError(result.stderr.strip() or "fm respond failed")
+    return taskplan.extract_code_block(result.stdout)
+
+
+def _generator(label: str) -> Callable[[str, bool], str]:
+    if _is_prose(label):
+        return lambda prompt, greedy: fm_structured(_REWRITE_SCHEMA, prompt, greedy).get("content") or ""
+    return fm_code
+
+
+def _context_block(context: str, task: str, instructions: str) -> str:
+    parts = []
+    if context:
+        parts.append(f"Other project files, for reference only (don't rewrite them):\n\n{context}\n")
+    if task and task.strip() != instructions.strip():
+        parts.append(f"The overall request this is part of: {task}\n")
+    return "\n".join(parts) + ("\n" if parts else "")
 
 
 def fm_structured(schema: dict, prompt: str, greedy: bool = True) -> dict:
@@ -263,7 +321,7 @@ def fm_structured(schema: dict, prompt: str, greedy: bool = True) -> dict:
         args = ["fm", "respond", "--model", "system", "--no-stream", "--schema", schema_path]
         if greedy:
             args.append("--greedy")
-        result = _run([*args, prompt])
+        result = _run([*args, prompt], timeout=GENERATION_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise EditError(result.stderr.strip() or "fm respond failed")
     try:
@@ -274,14 +332,17 @@ def fm_structured(schema: dict, prompt: str, greedy: bool = True) -> dict:
 
 def _generate_checked(
     prompt: str,
-    schema: dict,
+    generate: Callable[[str, bool], str],
     check: Callable[[str], list[str]],
     original: str = "",
     repair: Callable[[str], str] = lambda text: text,
+    sample_first: bool = False,
 ) -> str:
-    """Generate text with fm_structured, retrying with feedback until
-    `check` finds no problems. Raises EditError if no attempt passes --
-    a wrong change is never returned as if it were right.
+    """Generate text, retrying with feedback until `check` finds no
+    problems. Raises EditError if no attempt passes -- a wrong change is
+    never returned as if it were right. `sample_first` skips the greedy
+    first attempt (for fixing something a greedy attempt already got
+    wrong).
     """
     problems: list[str] = []
     deadline = time.monotonic() + EDIT_TIME_BUDGET_SECONDS
@@ -295,14 +356,15 @@ def _generate_checked(
                 + ". Fix that this time."
             )
         try:
-            reply = fm_structured(schema, prompt + feedback, greedy=attempt == 0)
+            reply = generate(prompt + feedback, attempt == 0 and not sample_first)
         except EditError as e:
             # Seen for real: a sampled retry that never stops generating
             # until it overflows the context. That's one failed attempt,
             # not a reason to give up on the rest.
             problems = [f"the model's reply failed ({e})"]
             continue
-        text = repair(taskplan.strip_code_fence(reply.get("content") or "", original))
+        reply = taskplan.unescape_literal_newlines(original, reply)
+        text = repair(taskplan.strip_code_fence(reply, original))
         problems = check(text)
         if not problems:
             return text
@@ -315,6 +377,10 @@ def propose_edit(
     cwd: str,
     line_range: tuple[int, int] | None = None,
     speculative: bool = False,
+    context: str = "",
+    task: str = "",
+    feedback: str = "",
+    expectations: bool = True,
 ) -> dict:
     """Ask the on-device model to rewrite `path` (or just `line_range` of
     it, 1-based inclusive) with `instructions` applied.
@@ -329,7 +395,10 @@ def propose_edit(
 
     `speculative` marks an edit the planner chose on its own (the request
     named no file): its change must also be relevant to the request, or
-    it's rejected rather than written.
+    it's rejected rather than written. `context` (other files), `task`
+    (the whole request this edit is part of), and `feedback` (e.g. a
+    failing test's output) go into the prompt only; the checks use
+    `instructions`.
     """
     full_path = os.path.expanduser(path)
     if not os.path.isabs(full_path):
@@ -357,6 +426,27 @@ def propose_edit(
         if speculative:
             raise EditError("it has no colors to change")
 
+    def result(updated: str, summary: str) -> dict:
+        return {"path": full_path, "label": label, "original": original, "updated": updated, "summary": summary}
+
+    # Adding or setting a key in JSON is done by parsing it, not by a model
+    # rewrite (which, measured, broke the closing brace).
+    if label.endswith(".json") and not line_range and (assignment := taskplan.json_assignment(instructions)):
+        try:
+            updated = codework.json_set(original, *assignment)
+        except (ValueError, TypeError, AttributeError):
+            updated = None
+        if updated is not None and updated != original:
+            return result(updated, f"set {assignment[0]} in {label}")
+
+    # "Add a docstring to every function": one function at a time -- asked
+    # to do all of them in one rewrite, the model returned the file
+    # unchanged, every time.
+    if not line_range and not _is_prose(label) and taskplan.applies_to_every_function(instructions):
+        updated = _edit_each_function(label, original, instructions, context, task)
+        if updated is not None:
+            return result(updated, f"edited {label}: {instructions}")
+
     lines = original.splitlines()
     lo, hi = line_range if line_range else (1, len(lines))
     excerpt = "\n".join(lines[lo - 1 : hi])
@@ -372,29 +462,50 @@ def propose_edit(
     else:
         what = f"the file {label}"
         noun = "file"
-    prompt = (
-        f"Here is {what}:\n\n{excerpt}\n\n"
-        f"Change request: {instructions}\n\n"
-        f"Write the complete updated {noun}. Keep every existing line exactly "
-        f"as it is unless the change request is about it, and make the "
-        f"requested change."
-    )
+    if _is_prose(label):
+        prompt = (
+            _context_block(context, task, instructions)
+            + f"Here is {what}:\n\n{excerpt}\n\n"
+            + f"Change request: {instructions}\n\n"
+            + (f"{feedback}\n\n" if feedback else "")
+            + f"Write the complete updated {noun}. Keep every existing line exactly "
+            f"as it is unless the change request is about it, and make the "
+            f"requested change."
+        )
+    else:
+        # Task first, and asking for a correct implementation rather than a
+        # minimal one: measured, "keep every existing line exactly as it
+        # is" pushed the model toward timid, wrong code changes (a
+        # parse_int that returned None for everything).
+        lang = _FENCE_LANGS.get(os.path.splitext(label)[1].lower(), "")
+        prompt = (
+            _context_block(context, task, instructions)
+            + f"Task: {instructions}\n\n"
+            + (f"{feedback}\n\n" if feedback else "")
+            + f"Current {what}:\n```{lang}\n{excerpt}\n```\n\n"
+            + f"Write the complete updated {noun} that does this. Make sure the code actually "
+            f"implements the request correctly; keep unrelated code unchanged."
+        )
     literal = taskplan.literal_edit(instructions, excerpt)
     if _is_palette_request(label, instructions, excerpt):
         new_excerpt = _propose_palette(label, instructions, excerpt)
-    elif literal is not None and not taskplan.check_edit(instructions, excerpt, literal):
+    elif literal is not None and not feedback and not taskplan.check_edit(instructions, excerpt, literal):
         new_excerpt = literal
     else:
         new_excerpt = _generate_checked(
-            prompt, _REWRITE_SCHEMA,
-            lambda text: taskplan.check_edit(instructions, excerpt, text)
+            prompt, _generator(label),
+            lambda text: taskplan.check_edit(
+                instructions, excerpt, text, code=not _is_prose(label), expectations=expectations
+            )
             + taskplan.check_structure(label, instructions, excerpt, text, whole_file=original)
+            + taskplan.check_comment_request(label, instructions, excerpt, text)
             + (taskplan.check_relevant(instructions, excerpt, text) if speculative else []),
             original=excerpt,
             repair=lambda text: taskplan.match_indentation(
                 excerpt,
                 taskplan.restore_layout(excerpt, text) if taskplan.looks_reflowed(excerpt, text) else text,
             ),
+            sample_first=bool(feedback),
         )
 
     updated_lines = lines[: lo - 1] + new_excerpt.splitlines() + lines[hi:]
@@ -409,6 +520,39 @@ def propose_edit(
         "updated": updated,
         "summary": f"edited {label}: {instructions}",
     }
+
+
+def _edit_each_function(label: str, original: str, instructions: str, context: str, task: str) -> str | None:
+    """Apply `instructions` to each function separately, bottom-up so line
+    numbers stay valid. None if the file has no functions to go through."""
+    blocks = codework.function_blocks(label, original)
+    # Nested functions are handled as part of the function around them.
+    blocks = [b for b in blocks if not any(o != b and o[1] <= b[1] and b[2] <= o[2] for o in blocks)]
+    if not blocks:
+        return None
+    lines = original.splitlines()
+    for name, start, end in sorted(blocks, key=lambda b: -b[1]):
+        block = "\n".join(lines[start:end])
+        per = f"{instructions} (this is one of those functions: apply it to {name})"
+        prompt = (
+            _context_block(context, task, instructions)
+            + f"Here is the function {name} from {label}:\n\n```\n{block}\n```\n\n"
+            f"Change request: {per}\n\nWrite the complete updated function."
+        )
+        new_block = _generate_checked(
+            prompt, fm_code,
+            lambda text, block=block, name=name: taskplan.check_edit(instructions, block, text, code=True)
+            + taskplan.check_structure(label, instructions, block, text)
+            + ([] if re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text) else [f"{name} is no longer defined"]),
+            original=block,
+            repair=lambda text, block=block: taskplan.match_indentation(block, text),
+        )
+        indent = re.match(r"[ \t]*", lines[start]).group()
+        new_lines = new_block.splitlines()
+        if indent and new_lines and not new_lines[0].startswith(indent):
+            new_lines = [indent + l if l.strip() else l for l in new_lines]
+        lines[start:end] = new_lines
+    return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
 
 
 def _is_palette_request(label: str, instructions: str, text: str) -> bool:
@@ -465,7 +609,9 @@ def _propose_palette(label: str, instructions: str, text: str) -> str:
     raise EditError(f"couldn't produce a correct palette after {EDIT_ATTEMPTS} tries: {'; '.join(problems)}")
 
 
-def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
+def propose_new_file(
+    path: str, instructions: str, cwd: str, context: str = "", task: str = "", expectations: bool = True
+) -> dict:
     """Write a brand new file -- empty if `instructions` is blank (no model
     call needed), otherwise written by the on-device model and checked
     against the request ("containing the word hello" -> it does).
@@ -488,13 +634,20 @@ def propose_new_file(path: str, instructions: str, cwd: str) -> dict:
                 "summary": f"created empty file {label}"}
 
     prompt = (
-        f"Create a new file at {label}.\n\n"
+        _context_block(context, task, instructions)
+        + f"Create a new file at {label}.\n\n"
         f"What it should contain: {instructions}\n\n"
         f"Write the complete contents of this file -- only the file's own "
         f"contents, no commentary."
     )
+    generate = (
+        (lambda p, g: fm_structured(_NEW_FILE_SCHEMA, p, g).get("content") or "")
+        if _is_prose(label) else fm_code
+    )
     content = _generate_checked(
-        prompt, _NEW_FILE_SCHEMA, lambda text: taskplan.check_new_file(instructions, text)
+        prompt, generate,
+        lambda text: taskplan.check_new_file(instructions, text, expectations=expectations)
+        + taskplan.check_structure(label, instructions, "", text),
     )
     if content and not content.endswith("\n"):
         content += "\n"
@@ -709,7 +862,12 @@ def gather_task_tree(cwd: str) -> tuple[list[str], list[str]]:
 # than firing automatically -- these four get the same treatment: /task can
 # plan them, but never executes them itself, only surfaces the matching
 # command (/push, /branch create|switch, /pull) for the user to run.
-TASK_CONFIRM_GATED = {"PUSH", "BRANCH_CREATE", "BRANCH_SWITCH", "PULL"}
+TASK_CONFIRM_GATED = {"PUSH", "BRANCH_CREATE", "BRANCH_SWITCH", "PULL", "RUN"}
+# After changing code, /task runs the project's own checks (syntax checks,
+# its test suite, anything the request said to run) and, on a failure,
+# shows the model the output and has it fix the file -- up to this many
+# rounds before giving up and saying so.
+VERIFY_ROUNDS = 3
 
 _PLAN_SCHEMA = {
     "type": "object", "title": "Plan", "additionalProperties": False,
@@ -731,10 +889,11 @@ _PLAN_SCHEMA = {
 }
 
 
-def _plan_prompt(request: str, task: str, files: list[str], folders: list[str]) -> str:
+def _plan_prompt(request: str, task: str, files: list[str], folders: list[str], code: str = "") -> str:
     context = f"Overall task: {task}\nPart to plan now: {request}\n\n" if request != task else f"Task: {task}\n\n"
     return (
         context
+        + (f"Relevant project code:\n\n{code}\n\n" if code else "")
         + f"Existing files: {', '.join(files) or '(none)'}\n"
         + f"Existing folders: {', '.join(folders) or '(none)'}\n\n"
         "List the steps that carry out exactly this request, in order -- "
@@ -771,7 +930,8 @@ def _parse_json_plan(reply: str) -> list[dict] | None:
 
 
 def plan_with_model(
-    request: str, task: str, files: list[str], folders: list[str], backend: "Backend", model: str
+    request: str, task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
+    cwd: str | None = None,
 ) -> tuple[list[dict], str]:
     """Ask the planning model for raw steps (not yet normalized). A cloud
     model gets asked for JSON in plain text (Shortcuts has no schema
@@ -779,7 +939,11 @@ def plan_with_model(
     to it -- uses guided generation, so its action is always one of the
     allowed ones. Returns (steps, model actually used).
     """
-    prompt = _plan_prompt(request, task, files, folders)
+    # The planner sees real code, not just file names -- without it,
+    # measured, it asked to "fix" a failing test by editing the test.
+    budget = CONTEXT_BUDGET_ON_DEVICE if model == "on-device" else CONTEXT_BUDGET_CLOUD
+    code = codework.build_context(cwd, task, budget) if cwd else ""
+    prompt = _plan_prompt(request, task, files, folders, code)
     if model != "on-device":
         reply, used = backend.classify_with_fallback(
             prompt + '\n\nReply with only JSON: {"steps": [{"action": ..., "path": ..., '
@@ -791,11 +955,54 @@ def plan_with_model(
             if steps is not None:
                 return steps, used
         model = used
+    if budget != CONTEXT_BUDGET_ON_DEVICE and cwd:
+        # Fell back from a cloud tier: on-device needs the smaller context.
+        small = codework.build_context(cwd, task, CONTEXT_BUDGET_ON_DEVICE)
+        prompt = _plan_prompt(request, task, files, folders, small)
     return fm_structured(_PLAN_SCHEMA, prompt).get("steps") or [], model
 
 
+_ABOUT_TESTS_RE = re.compile(
+    r"\b(?:fix|update|change|edit|correct|rewrite|write|add|create|remove|delete)\s+(?:the\s+|a\s+|some\s+|more\s+)?"
+    r"(?:unit\s+)?tests?\b(?!\s+(?:fails?|failing|passes?|pass))|\btests?\s+(?:itself|file)\b",
+    re.IGNORECASE,
+)
+
+
+def _retarget_test_edits(steps: list[dict], task: str, cwd: str, files: list[str]) -> list[dict]:
+    """"The test in test_x.py fails -- fix the code": edit the code under
+    test, not the test (measured: the planner edited the test). The test
+    file's contents go along as context."""
+    if _ABOUT_TESTS_RE.search(task):
+        return steps
+    out = []
+    for s in steps:
+        if s["action"] != "EDIT" or not codework.is_test_file(s["path"]):
+            out.append(s)
+            continue
+        test_src = codework.read_text(cwd, s["path"])
+        names = [a or b for a, b in re.findall(
+            r"^\s*from\s+([\w.]+)\s+import|^\s*import\s+([\w.]+)", test_src, re.MULTILINE)]
+        names += [a or b for a, b in re.findall(
+            r"require\(\s*['\"]\./([\w./-]+)['\"]\s*\)|from\s+['\"]\./([\w./-]+)['\"]", test_src)]
+        targets = []
+        for module in names:
+            name = module.replace(".", "/") if not module.endswith((".js", ".ts")) else module
+            for cand in (f"{name}.py", f"{name}.js", f"{name}.ts", name):
+                if cand in files and not codework.is_test_file(cand) and cand not in targets:
+                    targets.append(cand)
+        if not targets:
+            out.append(s)
+            continue
+        for t in targets:
+            out.append({**s, "path": t, "details": s["details"],
+                        "context_files": [s["path"]]})
+    return out
+
+
 def plan_task(
-    task: str, files: list[str], folders: list[str], backend: "Backend", model: str
+    task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
+    cwd: str | None = None,
 ) -> tuple[list[dict], str | None]:
     """The whole plan for `task`, up front: deterministic where the request
     has a recognizable shape (taskplan.parse_task), the planning model for
@@ -806,7 +1013,7 @@ def plan_task(
     parsed = taskplan.parse_task(task, files, folders)
     unparsed = [s for s in parsed if s["action"] == "UNPARSED"]
     if not unparsed:
-        return parsed, None
+        return (_retarget_test_edits(parsed, task, cwd, files) if cwd else parsed), None
 
     whole = len(unparsed) == len(parsed)
     steps: list[dict] = []
@@ -817,14 +1024,32 @@ def plan_task(
             continue
         request = task if whole else s["details"]
         now_files, now_folders = s.get("files", files), s.get("folders", folders)
-        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model)
+        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd)
         try:
             planned = taskplan.normalize_model_steps(raw, request, now_files, now_folders)
         except ValueError as e:
             planned = [taskplan.step("UNSUPPORTED", details=f"{request!r} ({e})")]
+        # The planner's summary of an edit replaces the user's own words
+        # -- measured, it turned "it should include b" into "Add b to the
+        # range_sum function". Keep the request itself as the instructions;
+        # with several files, add the planner's note for this one.
+        content_steps = [p for p in planned if p["action"] in ("EDIT", "CREATE_FILE")]
+        for p in content_steps:
+            note = p["details"].strip()
+            p["details"] = request
+            if len(content_steps) > 1:
+                # One request covering several files: the planner's note
+                # says what this file is for. It goes to the model as a
+                # hint -- never into the checks, which would otherwise
+                # demand the whole request's wording in every file (seen
+                # for real: a note holding a whole draft of index.html).
+                p["note"] = note[:1500]
+                p["shared"] = True
         steps.extend(planned or [taskplan.step("UNSUPPORTED", details=f"work out how to do {request!r}")])
         if whole:
             break
+    if cwd:
+        steps = _retarget_test_edits(steps, task, cwd, files)
     return steps, model_used
 
 
@@ -846,6 +1071,14 @@ def describe_step(s: dict) -> str:
         return f"{'create' if action == 'BRANCH_CREATE' else 'switch to'} branch {path}"
     if action == "UNSUPPORTED":
         return f"can't do: {details}"
+    if action == "RENAME_SYMBOL":
+        return f"rename {dest} → {details}" + (f" in {path}" if path else " everywhere")
+    if action == "MOVE_CODE":
+        return f"move {details} from {path} into {dest}"
+    if action == "TEST":
+        return "run the tests"
+    if action == "RUN":
+        return f"run {details}"
     return action.lower()
 
 
@@ -857,6 +1090,17 @@ def choose_edit_range(
     something (a function, a heading) that only one section contains, and
     by the planning model otherwise.
     """
+    # A request naming a function edits exactly that function, in any code
+    # file past a small size: measured, the model can't faithfully
+    # reproduce a 3 KB file of 60 functions to change one of them, and a
+    # fixed 40-line chunk can cut a function in half.
+    if len(content) > NAMED_FUNCTION_EDIT_MIN_CHARS:
+        names = set(re.findall(r"[A-Za-z_$][\w$]*", instructions))
+        blocks = [b for b in codework.function_blocks(filename, content) if b[0] in names]
+        if len(blocks) == 1:
+            _name, start, end = blocks[0]
+            if len("\n".join(content.splitlines()[start:end])) <= REWRITE_MAX_CHARS:
+                return start + 1, end
     if len(content) <= REWRITE_MAX_CHARS:
         return None
     sections = split_sections(content, filename)
@@ -926,7 +1170,7 @@ def pick_section(task: str, filename: str, sections: list[dict], backend: "Backe
 ASK_MAX_SUBQUESTIONS = 8
 
 
-def decompose_question(question: str, backend: "Backend", model: str) -> dict:
+def decompose_question(question: str, backend: "Backend", model: str, context: str = "") -> dict:
     """Ask the "planning" role to either answer directly, or split into
     sub-questions for the "building" role to research first.
 
@@ -936,7 +1180,8 @@ def decompose_question(question: str, backend: "Backend", model: str) -> dict:
     than raising -- a plain but usable reply beats a hard failure here.
     """
     prompt = (
-        f"Question: {question}\n\n"
+        (f"The project's files (the question is about these):\n\n{context}\n\n" if context else "")
+        + f"Question: {question}\n\n"
         "If this is simple enough to answer directly and completely, reply "
         "with exactly:\nANSWER: <your answer>\n\n"
         "If it would be answered better by researching a few simpler "
@@ -967,12 +1212,13 @@ def decompose_question(question: str, backend: "Backend", model: str) -> dict:
 
 
 def synthesize_answer(
-    question: str, subanswers: list[tuple[str, str]], backend: "Backend", model: str
+    question: str, subanswers: list[tuple[str, str]], backend: "Backend", model: str, context: str = ""
 ) -> str:
     """Ask the "planning" role to combine sub-answers into one final answer."""
     research = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in subanswers)
     prompt = (
-        f"Original question: {question}\n\nResearch:\n{research}\n\n"
+        (f"The project's files:\n\n{context}\n\n" if context else "")
+        + f"Original question: {question}\n\nResearch:\n{research}\n\n"
         "Using this research, write one clear, complete final answer to the "
         "original question."
     )
@@ -1066,12 +1312,20 @@ def cancel_active_process() -> bool:
     return True
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    """subprocess.run-alike whose Popen is registered so Esc-Esc can kill it."""
+def _run(cmd: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+    """subprocess.run-alike whose Popen is registered so Esc-Esc can kill it.
+    With `timeout`, a run that takes longer is killed and reported as a
+    failure (returncode -9) rather than hanging -- seen for real: an
+    on-device generation that ran on for over two minutes."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     _begin_op(proc)
     try:
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate()
+            return subprocess.CompletedProcess(cmd, -9, stdout, f"timed out after {int(timeout)}s")
     finally:
         cancelled = _end_op(proc)
     if cancelled:
@@ -1802,6 +2056,8 @@ class ChatApp(App):
         # The last plain-chat message that read like a change request, so
         # "yes, do that" right after can run it as /task.
         self._pending_action_request: str | None = None
+        # /verify off turns off running the project's checks after /task.
+        self._verify_enabled = True
         self._history_index: int | None = None
         self._history_draft = ""
         self._suppress_palette_once = False
@@ -2129,6 +2385,8 @@ class ChatApp(App):
         "compare": "ask every model the same question: /compare <question>",
         "save": "save the conversation: /save <name>",
         "export": "export the transcript: /export [file.md|file.txt|file.json|copy]",
+        "run": "run a shell command in this directory and show its output: /run <command>",
+        "verify": "turn /task's automatic checks (tests, syntax) on or off: /verify [on|off]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
         "push": "commit and push the current changes to git",
@@ -2203,6 +2461,22 @@ class ChatApp(App):
             self._handle_save(arg)
         elif name == "export":
             self._handle_export(arg)
+        elif name == "run":
+            if not arg:
+                self._add_message(Message("system", "usage: /run <command>"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_shell(arg)
+        elif name == "verify":
+            if arg.strip().lower() in ("on", "off"):
+                self._verify_enabled = arg.strip().lower() == "on"
+            state = "on" if self._verify_enabled else "off"
+            self._add_message(Message(
+                "system",
+                f"/task's automatic checks are {state}"
+                + (" -- after changing code it runs the project's tests and syntax checks, and fixes failures"
+                   if self._verify_enabled else " -- /task won't run tests or checks after changing code"),
+            ))
         elif name == "resume":
             self._handle_resume(arg)
         elif name == "undo":
@@ -2286,12 +2560,16 @@ class ChatApp(App):
         self._loop_cancel_requested = False
         summaries: list[str] = []
         skipped: list[str] = []
+        self._task_request = task
+        self._task_changed: list[str] = []   # files changed in this run
+        self._task_created: list[str] = []   # files created in this run
+        self._task_unverified = False        # code changed since the last check
         start_time = time.monotonic()
         try:
             files, folders = gather_task_tree(cwd)
             self.call_from_thread(self._log_progress, "planning…")
             steps, model_used = plan_task(
-                task, files, folders, self.backend, self.subagent_roles["planning"]
+                task, files, folders, self.backend, self.subagent_roles["planning"], cwd=cwd
             )
             if model_used:
                 self._note_planning_fallback(model_used)
@@ -2315,12 +2593,18 @@ class ChatApp(App):
                         + (f" -- steps 1-{number - 1} were done." if number > 1 else "."),
                     )
                     return
+                if action in TASK_CONFIRM_GATED or action == "COMMIT":
+                    # Nothing gets committed or handed off before the code
+                    # changed so far has passed the project's own checks.
+                    if not self._verify_changes(cwd):
+                        return
                 if action in TASK_CONFIRM_GATED:
                     suggestion = {
                         "PUSH": "/push",
                         "PULL": "/pull",
                         "BRANCH_CREATE": f"/branch create {s['path']}",
                         "BRANCH_SWITCH": f"/branch switch {s['path']}",
+                        "RUN": f"/run {s['details']}",
                     }[action]
                     self.call_from_thread(
                         self._log_progress,
@@ -2350,6 +2634,8 @@ class ChatApp(App):
                     self._log_progress, "stopped: none of the planned changes could be made."
                 )
                 return
+            if not self._verify_changes(cwd):
+                return
             note = f" (skipped {', '.join(skipped)})" if skipped else ""
             self.call_from_thread(self._log_progress, f"done after {done} step(s){note}.")
         except GenerationCancelled:
@@ -2368,10 +2654,40 @@ class ChatApp(App):
         """Carry out one planned, non-gated step. Returns a one-line summary
         of what happened; raises EditError if it can't be done."""
         action, path, destination, details = s["action"], s["path"], s["destination"], s["details"]
+        task = getattr(self, "_task_request", details)
 
         if action == "STAGE":
             git_add_all(cwd)
             return "staged all changes"
+
+        if action == "TEST":
+            checks = [c for c in codework.detect_checks(cwd, [], task) if c[0] == "tests"]
+            if not checks:
+                raise EditError("couldn't find a test suite to run in this project")
+            for label, argv in checks:
+                ok, out = codework.run_check(argv, cwd)
+                if not ok:
+                    raise EditError(f"tests failed ({' '.join(argv)}):\n{out[-1500:]}")
+            return f"tests passed ({' '.join(checks[0][1])})"
+
+        if action == "RENAME_SYMBOL":
+            old, new = destination, details
+            changes = codework.rename_symbol(old, new, cwd, only=[path] if path else None)
+            if not changes:
+                raise EditError(f"{old} doesn't appear in {path or 'any file'}")
+            for rel, (before, after) in changes.items():
+                self._write_task_change(cwd, rel, before, after, f"renamed {old} to {new}")
+            return f"renamed {old} to {new} in {', '.join(changes)}"
+
+        if action == "MOVE_CODE":
+            names = [n.strip() for n in details.split(",") if n.strip()]
+            try:
+                changes = codework.move_functions(names, path, destination, cwd)
+            except ValueError as e:
+                raise EditError(str(e))
+            for rel, (before, after) in changes.items():
+                self._write_task_change(cwd, rel, before, after, f"moved {details} into {destination}")
+            return f"moved {details} from {path} into {destination}"
 
         if action == "COMMIT":
             if not git_status_porcelain(cwd).strip():
@@ -2394,8 +2710,18 @@ class ChatApp(App):
             verb = "renamed" if action == "RENAME" else "moved"
             return f"{verb} {result['src_label']} to {result['dest_label']}"
 
+        # What else the model sees: files this run already changed (a test
+        # being written for a module just created, say) and whatever the
+        # request's words point at.
+        context = codework.build_context(
+            cwd, f"{details} {task}", CONTEXT_BUDGET_ON_DEVICE, exclude=(path,),
+            prefer=tuple(s.get("context_files", [])) + tuple(getattr(self, "_task_changed", [])),
+        )
+        if s.get("note"):
+            context = f"Planner's note for {path}: {s['note']}\n\n{context}"
+        shared = bool(s.get("shared"))
         if action == "CREATE_FILE":
-            proposal = propose_new_file(path, details, cwd)
+            proposal = propose_new_file(path, details, cwd, context=context, task=task, expectations=not shared)
         elif action == "EDIT":
             full = resolve_safe_path(path, cwd)
             with open(full, "r", errors="replace") as f:
@@ -2404,21 +2730,167 @@ class ChatApp(App):
                 content, path, details, self.backend, self.subagent_roles["planning"]
             )
             proposal = propose_edit(
-                path, details, cwd, line_range=line_range, speculative=bool(s.get("optional"))
+                path, details, cwd, line_range=line_range, speculative=bool(s.get("optional")),
+                context=context, task=task, expectations=not shared,
             )
         else:
             raise EditError(f"unknown step: {action}")
 
-        os.makedirs(os.path.dirname(proposal["path"]), exist_ok=True)
-        with open(proposal["path"], "w") as f:
-            f.write(proposal["updated"])
-        self._push_undo(
-            proposal["path"], proposal["label"], proposal["original"],
+        self._write_task_change(
+            cwd, proposal["label"], proposal["original"], proposal["updated"], proposal["summary"],
             existed_before=action == "EDIT",
         )
-        diff = diff_preview(proposal["original"], proposal["updated"])
-        self.call_from_thread(self._task_step_applied, proposal, diff)
         return proposal["summary"]
+
+    def _write_task_change(
+        self, cwd: str, rel: str, before: str, after: str, summary: str, existed_before: bool | None = None
+    ) -> None:
+        """Write one file change made by /task: undo entry, diff shown, and
+        noted for the verify step."""
+        full = resolve_safe_path(rel, cwd)
+        if existed_before is None:
+            existed_before = os.path.exists(full)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(after)
+        self._push_undo(full, rel, before, existed_before=existed_before)
+        self.call_from_thread(
+            self._task_step_applied, {"label": rel, "summary": summary}, diff_preview(before, after)
+        )
+        changed = getattr(self, "_task_changed", None)
+        if changed is not None and rel not in changed:
+            changed.append(rel)
+        created = getattr(self, "_task_created", None)
+        if created is not None and not existed_before and rel not in created:
+            created.append(rel)
+        if not _is_prose(rel):
+            self._task_unverified = True
+
+    def _write_smoke_script(self, cwd: str, targets: list[str], task: str) -> tuple[str, str] | None:
+        """A short script that imports the changed modules and calls what
+        the request changed, for run_smoke. None if the model can't write
+        one."""
+        lang = codework.SMOKE_LANGS[os.path.splitext(targets[0])[1]]
+        targets = [t for t in targets if codework.SMOKE_LANGS[os.path.splitext(t)[1]] == lang]
+        sources = "\n\n".join(f"--- {t} ---\n{codework.read_text(cwd, t)[:2500]}" for t in targets)
+        how = (
+            "import them (by module name, e.g. `import stats` for stats.py)"
+            if lang == "python" else "require them (e.g. `require('./stats.js')`)"
+        )
+        prompt = (
+            f"These files were just changed for this request: {task}\n\n{sources}\n\n"
+            f"Write a short {lang} script that {how} and calls the functions or classes this "
+            f"request changed or added, with a few typical inputs, printing the results. Don't use "
+            f"assert, don't read input, and don't create, change, or delete any files."
+        )
+        try:
+            return lang, fm_code(prompt)
+        except EditError:
+            return None
+
+    def _verify_changes(self, cwd: str) -> bool:
+        """Run the project's checks over code /task changed; on a failure,
+        show the model the output and have it fix the file it points at,
+        up to VERIFY_ROUNDS times. False (after saying why) if it still
+        fails -- the caller then stops before committing anything."""
+        if not getattr(self, "_task_unverified", False) or not self._verify_enabled:
+            return True
+        task = self._task_request
+        about_tests = bool(_ABOUT_TESTS_RE.search(task))
+        smoke_script: tuple[str, str] | None = None
+        for round_number in range(VERIFY_ROUNDS + 1):
+            smoke_origin: str | None = None
+            checks = codework.detect_checks(cwd, self._task_changed, task)
+            if not checks:
+                break
+            failure = None
+            for label, argv in checks:
+                self.call_from_thread(self._log_progress, f"checking: {label}…")
+                ok, out = codework.run_check(argv, cwd)
+                if not ok:
+                    failure = (label, argv, out)
+                    break
+            # No test suite to catch a logic error: exercise the changed
+            # code with a short model-written script (on a copy of the
+            # project) -- seen for real: syntactically valid code that
+            # crashed with an AttributeError the moment it was called.
+            targets = codework.smoke_targets(self._task_changed, cwd)
+            if failure is None and targets and not codework.has_test_suite(checks):
+                if smoke_script is None:
+                    smoke_script = self._write_smoke_script(cwd, targets, task)
+                if smoke_script is not None:
+                    lang, script = smoke_script
+                    self.call_from_thread(self._log_progress, "checking: a quick run of the changed code…")
+                    ok, out, origin = codework.run_smoke(cwd, script, lang)
+                    if not ok and origin in targets:
+                        failure = ("smoke run", [f"a quick run of {', '.join(targets)}"], out)
+                        smoke_origin = origin
+                    else:
+                        # A crash anywhere but a changed file is the
+                        # throwaway script's problem, not the change's.
+                        checks = checks + [("smoke run", [])]
+            if failure is None:
+                self.call_from_thread(
+                    self._log_progress, "checks passed: " + ", ".join(label for label, _ in checks)
+                )
+                break
+            label, argv, out = failure
+            tail = out[-1500:]
+            if round_number == VERIFY_ROUNDS:
+                self.call_from_thread(
+                    self._log_progress,
+                    f"error: {label} still failing after {VERIFY_ROUNDS} fix attempts -- stopping "
+                    f"before anything else (nothing committed). Output:\n{tail}",
+                )
+                return False
+            candidates = [f for f in self._task_changed if os.path.isfile(os.path.join(cwd, f))]
+            candidates += [f for f in codework.files_in_output(out, codework.project_files(cwd)) if f not in candidates]
+            if not about_tests:
+                candidates = [f for f in candidates if not codework.is_test_file(f)] or candidates
+            pointed = codework.files_in_output(out, candidates)
+            ordered = pointed + [c for c in candidates if c not in pointed]
+            if smoke_origin:
+                # A smoke-run crash: fix exactly the file it came from.
+                ordered = [smoke_origin]
+            # A test written in this same run can itself be wrong (seen for
+            # real: expecting 15°C to be 61°F). If the code under test comes
+            # back unchanged -- the model standing by it -- try the new test.
+            ordered += [
+                f for f in codework.files_in_output(out, self._task_created)
+                if codework.is_test_file(f) and f not in ordered
+            ]
+            if not ordered:
+                self.call_from_thread(self._log_progress, f"error: {label} failed:\n{tail}")
+                return False
+            fixed = False
+            for target in ordered[:3]:
+                self.call_from_thread(
+                    self._log_progress, f"{label} failed -- fixing {target} (attempt {round_number + 1}):\n{tail[-600:]}"
+                )
+                context = codework.build_context(
+                    cwd, f"{task}\n{out}", CONTEXT_BUDGET_ON_DEVICE, exclude=(target,),
+                    prefer=tuple(f for f in self._task_changed if f != target),
+                )
+                try:
+                    proposal = propose_edit(
+                        target, task, cwd, context=context, task=task, expectations=False,
+                        feedback=(
+                        f"After the change, running `{' '.join(os.path.basename(a) for a in argv)}` "
+                        f"fails with:\n{tail}\nFix {target} so it passes."
+                    ) if label != "smoke run" else (
+                        f"After the change, calling the code crashes:\n{tail}\nFix {target} so it works."
+                    ),
+                    )
+                except EditError as e:
+                    self.call_from_thread(self._log_progress, f"couldn't fix {target}: {e}")
+                    continue
+                self._write_task_change(cwd, target, proposal["original"], proposal["updated"], f"fixed {target}")
+                fixed = True
+                break
+            if not fixed:
+                continue
+        self._task_unverified = False
+        return True
 
     def _task_step_applied(self, proposal: dict, diff: str) -> None:
         self._add_message(
@@ -2482,6 +2954,25 @@ class ChatApp(App):
             self._add_message(Message("system", f"couldn't save session '{name}': {e}"))
             return
         self._add_message(Message("system", f"saved session '{name}'"))
+
+    @work(thread=True)
+    def _run_shell(self, command: str) -> None:
+        """/run: the user's own command, run in the current directory --
+        the explicit, confirmed way to run something /task won't run on
+        its own."""
+        try:
+            result = subprocess.run(
+                command, shell=True, cwd=os.getcwd(), capture_output=True, text=True,
+                timeout=600, stdin=subprocess.DEVNULL,
+            )
+            out = (result.stdout + result.stderr).strip()
+            text = f"$ {command}  (exit {result.returncode})" + (f"\n{out[-6000:]}" if out else "")
+        except subprocess.TimeoutExpired:
+            text = f"$ {command}  (timed out after 10 minutes)"
+        except OSError as e:
+            text = f"$ {command}  (couldn't run: {e})"
+        self.call_from_thread(self._log_progress, text)
+        self.call_from_thread(self._enable_input)
 
     def _handle_export(self, arg: str) -> None:
         """Write everything on screen to a file (Markdown by default; .txt
@@ -2756,10 +3247,32 @@ class ChatApp(App):
         building_model = self.subagent_roles["building"]
         start_time = time.monotonic()
         try:
+            # The files the question is about -- without them, measured,
+            # /ask confidently named the wrong file and described a filter
+            # function as computing a factorial.
+            cwd = os.getcwd()
+            budget = CONTEXT_BUDGET_ON_DEVICE + 2000 if planning_model == "on-device" else CONTEXT_BUDGET_CLOUD
+            context = codework.build_context(cwd, question, budget)
+            if context and planning_model == "on-device":
+                # One call with the code in view beats splitting the
+                # question on a 4096-token model: each sub-question would
+                # need the same files again.
+                self.call_from_thread(self._log_progress, "on-device is reading the project…")
+                definitions = codework.find_definitions(cwd, question)
+                found = ("Definitions matching the question:\n" + "\n".join(definitions) + "\n\n") if definitions else ""
+                answer = self.backend.classify(
+                    f"The project's files:\n\n{context}\n\n{found}Question: {question}\n\n"
+                    "Answer the question in plain words first, then back it up with the specifics "
+                    "from these files: the exact names and values, and which file (and function) "
+                    "they're in.",
+                    "on-device",
+                )
+                self.call_from_thread(self._ask_answered, answer.strip())
+                return
             self.call_from_thread(
                 self._log_progress, f"{model_label(planning_model)} is thinking this through…"
             )
-            plan = decompose_question(question, self.backend, planning_model)
+            plan = decompose_question(question, self.backend, planning_model, context)
             self._note_planning_fallback(plan["model_used"])
             planning_model = self.subagent_roles["planning"]
 
@@ -2780,13 +3293,17 @@ class ChatApp(App):
                     self.call_from_thread(self._log_progress, "stopped")
                     return
                 self.call_from_thread(self._log_progress, f"  {i}. {subq}")
-                answer = self.backend.classify(subq, building_model)
+                sub_budget = CONTEXT_BUDGET_ON_DEVICE if building_model == "on-device" else CONTEXT_BUDGET_CLOUD
+                sub_context = codework.build_context(cwd, f"{question} {subq}", sub_budget) if context else ""
+                answer = self.backend.classify(
+                    (f"The project's files:\n\n{sub_context}\n\n" if sub_context else "") + subq, building_model
+                )
                 subanswers.append((subq, answer))
 
             self.call_from_thread(
                 self._log_progress, f"{model_label(planning_model)} is synthesizing an answer…"
             )
-            final = synthesize_answer(question, subanswers, self.backend, planning_model)
+            final = synthesize_answer(question, subanswers, self.backend, planning_model, context)
             self.call_from_thread(self._ask_answered, final)
         except GenerationCancelled:
             self.call_from_thread(self._log_progress, "stopped")

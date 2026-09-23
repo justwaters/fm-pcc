@@ -180,6 +180,22 @@ _I = re.IGNORECASE
 _RENAME_RE = re.compile(
     rf"^(?:rename|change\s+the\s+name\s+of)\s+{_obj('src')}\s+(?:to|as|into)\s+{_obj('dst')}$", _I
 )
+_RENAME_SYMBOL_RE = re.compile(
+    r"^(?:rename|change\s+the\s+name\s+of)\s+(?:the\s+)?"
+    r"(?:(?P<kind>function|method|class|variable|var|constant|const|field|property|parameter|param|symbol|identifier)\s+)?"
+    r"(?P<a>[A-Za-z_$][\w$]*)(?:\(\))?(?:\s+(?:function|method|class|variable|constant))?\s+(?:to|as)\s+"
+    r"(?P<b>[A-Za-z_$][\w$]*)(?:\(\))?"
+    r"(?P<where>\s+(?:everywhere|in\s+all\s+(?:the\s+)?files|across\s+(?:the\s+)?(?:whole\s+)?(?:project|codebase|repo|code)|"
+    r"throughout(?:\s+the\s+(?:project|code|codebase))?))?"
+    r"(?:\s+in\s+(?P<f>[\w./-]+\.\w+))?$",
+    _I,
+)
+_MOVE_CODE_RE = re.compile(
+    r"^(?:move|extract|split\s+out|pull\s+out)\s+(?P<names>.+?)\s+(?:functions?|methods?|classes?|code)?\s*"
+    r"(?:from|out\s+of)\s+(?P<src>[\w./-]+\.\w+)\s+(?:in)?to\s+(?:a\s+)?(?:new\s+)?(?:file\s+|module\s+)?"
+    r"(?:called\s+|named\s+)?(?P<dest>[\w./-]+\.\w+)(?:\s+(?:and\s+)?import\s+(?:them|it)(?:\s+(?:in|into|back\s+into)\s+\S+)?)?$",
+    _I,
+)
 _MOVE_RE = re.compile(
     r"^(?:move|put|place|relocate|drag)\s+(?P<list>.+?)\s+"
     r"(?:into|in|to|inside|under|over\s+to)\s+(?P<dest>.+)$",
@@ -253,9 +269,15 @@ _FOLDER_WITH_FILE_RE = re.compile(
     rf"(?:file\s+)?(?:called\s+|named\s+)?(?P<f>{_NAME})(?:\s+(?:file))?(?:\s+(?:inside|in)(?:\s+(?:it|there))?)?$",
     _I,
 )
+_FILE_KIND = (
+    r"(?:(?:python|py|javascript|js|typescript|ts|node|swift|go|rust|ruby|bash|shell|html|css|json|yaml|"
+    r"markdown|text|config|test|unit\s+test|react|web)\s+)?"
+    r"(?:file|script|module|program|class|component|page|stylesheet|config(?:uration)?(?:\s+file)?|"
+    r"tests?(?:\s+file)?|app|tool|utility|cli)"
+)
 _CREATE_FILE_RE = re.compile(
-    rf"^(?:create|make|add|write)\s+(?:an?\s+)?(?:new\s+)?(?:empty\s+)?file\s+"
-    rf"(?:called\s+|named\s+)?(?P<n>{_NAME})(?P<rest>.*)$",
+    rf"^(?:create|make|add|write|generate|build|set\s+up)\s+(?:an?\s+)?(?:new\s+)?(?:empty\s+|simple\s+|small\s+)?"
+    rf"{_FILE_KIND}\s+(?:called\s+|named\s+)?(?P<n>⟦\d+⟧|[\w\-/~]+\.\w+)(?P<rest>.*)$",
     _I,
 )
 _CREATE_NAMED_FILE_RE = re.compile(
@@ -265,6 +287,15 @@ _CREATE_NAMED_FILE_RE = re.compile(
 _FILE_LOCATION_RE = re.compile(
     rf"^\s*(?:in|inside|under)\s+(?:the\s+)?(?:(?:folder|directory)\s+)?(?P<d>{_NAME})"
     rf"(?:\s+(?:folder|directory))?(?P<rest>.*)$",
+    _I,
+)
+# "range_sum in util.py is off by one", "isEven in utils.js returns the
+# wrong answer", "the test in test_x.py fails": a bug report about a named
+# file is a request to fix it. (Naming/location declaratives -- "x.py
+# should be called y.py" -- are handled before this and never match.)
+_BUG_CUE_RE = re.compile(
+    r"\b(?:bug|buggy|broken|wrong|incorrect|off[\s-]by[\s-]one|crash(?:es|ing)?|fails?|failing|errors?|exception|"
+    r"doesn'?t\s+work|isn'?t\s+working|not\s+working|should(?:n'?t)?|raises?|typo|mistake)\b",
     _I,
 )
 _POLITE_LEAD_RE = re.compile(
@@ -405,6 +436,23 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
     """Steps for one clause, or None if it isn't a shape this recognizes."""
     clause = _POLITE_TAIL_RE.sub("", _POLITE_LEAD_RE.sub("", clause.strip().rstrip(".!?"))).strip()
     everything = state.files + state.folders
+
+    if (m := _RENAME_SYMBOL_RE.match(clause)):
+        old_name, new_name = m.group("a"), m.group("b")
+        scope = m.group("f")
+        in_file = resolve_existing(scope, state.files) if scope else None
+        is_file = resolve_existing(old_name, everything) is not None or "." in old_name
+        if not is_file and (m.group("kind") or m.group("where") or in_file or re.search(r"[_A-Z]", old_name)):
+            return [step("RENAME_SYMBOL", in_file or "", old_name, details=new_name)]
+
+    if (m := _MOVE_CODE_RE.match(clause)):
+        src = resolve_existing(_unquote_name(m.group("src"), quotes), state.files)
+        names = [n for n in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", m.group("names").strip()) if n]
+        names = [re.sub(r"^(?:the\s+)?(?:functions?\s+|methods?\s+|classes?\s+)?|\s*\(\)$", "", n) for n in names]
+        if src and names and all(re.fullmatch(r"[A-Za-z_]\w*", n) for n in names):
+            dest = _unquote_name(m.group("dest"), quotes)
+            state.add_file(dest)
+            return [step("MOVE_CODE", src, dest, details=", ".join(names))]
 
     if (m := _RENAME_RE.match(clause)):
         raw_src = _unquote_name(m.group("src"), quotes)
@@ -547,6 +595,19 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
     if (m := _CREATE_FILE_RE.match(clause)) or (m := _CREATE_NAMED_FILE_RE.match(clause)):
         path = _unquote_name(m.group("n"), quotes)
         rest = m.group("rest")
+        existing = resolve_existing(path, state.files) if "." in path else None
+        if existing and not re.match(r"^(?:create|add|generate|set\s+up)\b", clause, _I):
+            # "make app.py also print the timeout": app.py exists, so this
+            # changes it -- it isn't a new file.
+            state.last_paths = [existing]
+            return [step("EDIT", existing, details=restore_quotes(clause, quotes, keep_marks=True))]
+        # "create a.py with ..., and test_a.py with ...": two files.
+        more = re.search(r",?\s+and\s+(?:an?\s+)?(?:new\s+)?(?:file\s+)?(?=[\w\-/]+\.\w+\b)", rest)
+        extra: list[dict] = []
+        if more:
+            tail = "create " + rest[more.end():]
+            rest = rest[: more.start()]
+            extra = parse_clause(tail, quotes, state, previous) or []
         location = _FILE_LOCATION_RE.match(rest)
         steps = []
         if location:
@@ -561,16 +622,28 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
         details = re.sub(r"^(?:that\s+(?:is|should\s+be)\s+)", "", details, flags=_I)
         if re.fullmatch(r"(?:that\s+is\s+)?empty|with\s+nothing\s+in\s+it|", details, _I):
             details = ""
-        steps.append(step("CREATE_FILE", path, details=details))
+        steps.insert(0, step("CREATE_FILE", path, details=details))
         state.add_file(path)
         state.last_paths = [path]
-        return steps
+        return steps + extra
 
     if (m := _DELETE_RE.match(clause)):
         raw = _unquote_name(m.group("x"), quotes)
         target = resolve_existing(raw, everything)
         if target is not None:
             return [step("UNSUPPORTED", target, details=f"deleting files or folders ({target})")]
+
+    # "write tests for Stack in stack.py in a new file test_stack.py": the
+    # new file is what gets written; stack.py is just what it's about.
+    if (nf := re.search(
+        rf"\b(?:in|into|as|to)\s+(?:a\s+)?new\s+(?:file|module|script)\s+(?:called\s+|named\s+)?(?P<n>{_NAME})",
+        clause, _I,
+    )):
+        path = _unquote_name(nf.group("n"), quotes)
+        if resolve_existing(path, state.files) is None:
+            state.add_file(path)
+            state.last_paths = [path]
+            return [step("CREATE_FILE", path, details=restore_quotes(clause, quotes, keep_marks=True))]
 
     # An instruction to change contents ("add ...", "in x.txt, replace
     # ...") naming exactly one existing file is an edit of that file,
@@ -581,7 +654,7 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
     # the model planner, whose EDITs are likewise dropped unless the
     # request asks for one.
     named = mentioned_files(clause, state.files)
-    if not _EDIT_LEAD_RE.match(clause):
+    if not _EDIT_LEAD_RE.match(clause) and not (len(named) == 1 and _BUG_CUE_RE.search(clause)):
         return None
     if len(named) == 1:
         state.last_paths = named
@@ -614,6 +687,11 @@ def parse_task(task: str, files: list[str], folders: list[str]) -> list[dict]:
     steps: list[dict] = []
     for clause in split_clauses(text):
         parsed = parse_clause(clause, quotes, state, steps)
+        if parsed:
+            # "isEven in utils.js is wrong. fix it": two clauses, one edit.
+            while parsed and parsed[0]["action"] == "EDIT" and steps and steps[-1]["action"] == "EDIT" \
+                    and steps[-1]["path"] == parsed[0]["path"]:
+                steps[-1]["details"] += ". " + parsed.pop(0)["details"]
         if parsed is None:
             # Snapshot of the tree as earlier steps will have left it, so a
             # model planning just this clause sees e.g. a renamed file under
@@ -883,9 +961,11 @@ def _literal_in(needle: str, haystack: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(needle)}(?![\w])", haystack, _I) is not None
 
 
-def edit_expectations(instructions: str, original: str) -> tuple[list[str], list[str]]:
+def edit_expectations(instructions: str, original: str, code: bool = False) -> tuple[list[str], list[str]]:
     """(must_contain, must_not_contain) implied by an edit request, only
-    where the request is unambiguous about it."""
+    where the request is unambiguous about it. For `code`, only quoted
+    text counts as required wording: "return None when b is zero instead
+    of crashing" is satisfied by `if b == 0`, not by the word "zero"."""
     text, quotes = protect_quotes(instructions)
     present: list[str] = []
     absent: list[str] = []
@@ -942,8 +1022,16 @@ def edit_expectations(instructions: str, original: str) -> tuple[list[str], list
         if _literal_in(target, original):
             absent.append(target)
 
-    # "delete the line X": X is named to be removed, not required.
-    present = [p for p in dict.fromkeys(present) if p and not any(_literal_in(a, p) for a in absent)]
+    # "delete the line X": X is named to be removed, not required. And a
+    # filename is never required text: "use slugify from utils.py instead"
+    # is satisfied by `from utils import slugify`.
+    present = [
+        p for p in dict.fromkeys(present)
+        if p and not any(_literal_in(a, p) for a in absent) and not re.fullmatch(r"[\w./-]+\.\w{1,5}", p)
+    ]
+    if code:
+        quoted = set(quotes)
+        present = [p for p in present if p in quoted]
     return present, list(dict.fromkeys(absent))
 
 
@@ -951,9 +1039,16 @@ def _content_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def check_edit(instructions: str, original: str, updated: str) -> list[str]:
+def check_edit(
+    instructions: str, original: str, updated: str, code: bool = False, expectations: bool = True
+) -> list[str]:
     """Problems with `updated` as the result of applying `instructions` to
-    `original` -- empty if it looks right."""
+    `original` -- empty if it looks right. `code` relaxes the "an addition
+    keeps every existing line" rule, which is right for prose but wrong for
+    code ("add a parameter" has to change the signature line); code is
+    judged by the project's own checks instead. `expectations=False` skips
+    the text-derived must/mustn't-contain checks (for an edit that's one
+    part of a request describing several files)."""
     problems: list[str] = []
     if _content_lines(updated) == _content_lines(original):
         return ["the file came back unchanged -- the requested change wasn't made"]
@@ -967,7 +1062,7 @@ def check_edit(instructions: str, original: str, updated: str) -> list[str]:
     if not updated.strip() and original.strip() and not _CLEAR_RE.search(instructions):
         return ["the file came back empty"]
 
-    present, absent = edit_expectations(instructions, original)
+    present, absent = edit_expectations(instructions, original, code=code) if expectations else ([], [])
     for p in present:
         if p.lower() not in updated.lower():
             problems.append(f"the result should contain {p!r} but doesn't")
@@ -978,24 +1073,27 @@ def check_edit(instructions: str, original: str, updated: str) -> list[str]:
     original_lines = _content_lines(original)
     updated_set = set(_content_lines(updated))
     kept = [line for line in original_lines if line in updated_set]
-    if _ADDITIVE_RE.search(instructions):
+    if _ADDITIVE_RE.search(instructions) and not code:
         dropped = [line for line in original_lines if line not in updated_set]
         if dropped:
             problems.append(
                 f"this was an addition, but existing lines were lost or changed: {dropped[:3]!r}"
             )
-    elif len(original_lines) >= 4 and len(kept) < len(original_lines) / 2 and not _CLEAR_RE.search(instructions):
+    elif len(original_lines) >= (15 if code else 4) and len(kept) < len(original_lines) / 2 \
+            and not _CLEAR_RE.search(instructions):
+        # (For code, only a sizable file: a refactor legitimately shrinks
+        # a small function -- a 5-line loop becomes a 2-line comprehension.)
         problems.append("most of the existing lines were lost -- only the requested change should differ")
     return problems
 
 
-def check_new_file(instructions: str, content: str) -> list[str]:
+def check_new_file(instructions: str, content: str, expectations: bool = True) -> list[str]:
     """Problems with a freshly written file's `content`."""
     text, quotes = protect_quotes(instructions)
     problems = []
     if instructions.strip() and not content.strip():
         problems.append("the file came back empty")
-    for m in _SAYS_RE.finditer(text):
+    for m in (_SAYS_RE.finditer(text) if expectations else ()):
         want = _phrase(m.group("w"), quotes)
         if want and want.lower() not in content.lower():
             problems.append(f"the file should contain {want!r} but doesn't")
@@ -1214,7 +1312,8 @@ def _assign_values(text: str, quotes: list[str], lines: list[str]) -> list[str] 
 
 
 _REMOVE_BLOCK_RE = re.compile(
-    r"\b(?:remove|delete|drop|get\s+rid\s+of)\s+(?:the\s+)?"
+    r"\b(?:remove|delete|drop|get\s+rid\s+of)\s+(?:the\s+)?(?:(?:unused|old|dead|deprecated|obsolete|legacy|"
+    r"duplicate|redundant|empty)\s+)*"
     r"(?:(?:function|method|class|def|func|fn)\s+(?P<n1>[\w$]+)|(?P<n2>[\w$]+)(?:\(\))?\s+(?:function|method|class))\b",
     _I,
 )
@@ -1623,3 +1722,105 @@ def looks_like_action(text: str) -> bool:
     """A chat message that reads like a change request, but that the
     parser couldn't fully read -- worth offering to run it as /task."""
     return not text.rstrip().endswith("?") and bool(_ACTION_CUE_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Requests with special handling in the editor
+# ---------------------------------------------------------------------------
+
+_JSON_SET_RE = re.compile(
+    r"\b(?:add|set|change|update|put)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?"
+    r"(?:(?:setting|key|field|property|option|value|entry)\s+)?[\"'⟦]?(?P<k>[A-Za-z_][\w.-]*)[\"'⟧]?\s+"
+    r"(?:(?:setting|key|field|property|option|value|entry)\s+)?"
+    r"(?:of|to|=|:|as|with\s+(?:a\s+)?value\s+(?:of\s+)?)\s*(?P<v>⟦\d+⟧|[^\s,]+)",
+    _I,
+)
+
+
+def json_assignment(instructions: str) -> tuple[str, object] | None:
+    """("timeout", 30) for "add a timeout setting of 30 to config.json"."""
+    text, quotes = protect_quotes(instructions)
+    m = _JSON_SET_RE.search(text)
+    if not m:
+        return None
+    key = restore_quotes(m.group("k"), quotes)
+    raw = restore_quotes(m.group("v"), quotes).rstrip(".;")
+    if raw.lower() in ("true", "on", "yes"):
+        value: object = True
+    elif raw.lower() in ("false", "off", "no"):
+        value = False
+    elif raw.lower() in ("null", "none"):
+        value = None
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = raw
+    return key, value
+
+
+_EVERY_BLOCK_RE = re.compile(
+    r"\b(?:every|each|all(?:\s+(?:of\s+)?the)?)\s+(?:of\s+the\s+)?(?:functions?|methods?|defs?)\b", _I
+)
+
+
+def applies_to_every_function(instructions: str) -> bool:
+    """"add a docstring to every function": one edit per function, which
+    the model does far better than several at once."""
+    return bool(_EVERY_BLOCK_RE.search(instructions))
+
+
+# ---------------------------------------------------------------------------
+# Cleaning up generated code
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(r"(?:^|\n)(`{3,}|~{3,})[^\n`]*\n(.*?)\n?\1[ \t]*(?=\n|$)", re.DOTALL)
+
+
+def extract_code_block(reply: str) -> str:
+    """The code from a plain-text reply: the longest fenced block, or an
+    unterminated one's contents, or else the whole reply."""
+    blocks = [m.group(2) for m in _FENCE_RE.finditer(reply)]
+    if blocks:
+        return max(blocks, key=len)
+    m = re.match(r"\s*(`{3,}|~{3,})[^\n]*\n(.*)$", reply, re.DOTALL)
+    if m:
+        return m.group(2).rstrip("`~ \n")
+    return reply.strip("\n")
+
+
+def unescape_literal_newlines(original: str, text: str) -> str:
+    """Seen for real through guided generation: a whole multi-line file
+    returned as one line full of literal "\\n" sequences. If the reply has
+    no real line breaks but does have escaped ones, decode them."""
+    if "\n" in text.strip() or "\\n" not in text:
+        return text
+    if original and "\n" not in original.strip() and "\\n" in original:
+        return text  # the file genuinely is one line with "\n" in it
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+
+
+_COMMENT_MARKERS = {
+    ".py": ("#",), ".sh": ("#",), ".rb": ("#",), ".yml": ("#",), ".yaml": ("#",), ".toml": ("#",),
+    ".js": ("//", "/*"), ".mjs": ("//", "/*"), ".cjs": ("//", "/*"), ".jsx": ("//", "/*"), ".ts": ("//", "/*"),
+    ".tsx": ("//", "/*"), ".swift": ("//", "/*"), ".go": ("//", "/*"), ".rs": ("//", "/*"), ".java": ("//", "/*"),
+    ".kt": ("//", "/*"), ".c": ("//", "/*"), ".cpp": ("//", "/*"), ".cs": ("//", "/*"), ".php": ("//", "#", "/*"),
+    ".css": ("/*",), ".scss": ("//", "/*"), ".html": ("<!--",), ".htm": ("<!--",), ".sql": ("--",),
+}
+
+
+def check_comment_request(filename: str, instructions: str, original: str, updated: str) -> list[str]:
+    """"Add a comment above X" in code means a real comment -- seen for
+    real: a docstring written instead of the requested # comment."""
+    if not re.search(r"\b(?:add|write|put|insert)\s+(?:a\s+|an\s+|some\s+)?(?:short\s+|brief\s+)?comments?\b",
+                     instructions, _I):
+        return []
+    markers = _COMMENT_MARKERS.get(os.path.splitext(filename)[1].lower())
+    if not markers:
+        return []
+    if sum(updated.count(mk) for mk in markers) <= sum(original.count(mk) for mk in markers):
+        return [f"no new {' or '.join(markers)} comment was added"]
+    return []

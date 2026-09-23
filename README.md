@@ -96,8 +96,16 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   combinations, in varied phrasings — each checked against the resulting
   files and git history; most batches of it were written and run *before*
   tuning anything for them, as an honest measure of how new phrasings
-  fare. `test_on_device_capabilities.py` covers create/rename/move and
-  the push/branch gating. About a minute in total.
+  fare. `test_agentic_eval.py` is 56 agentic-coding tasks — features,
+  bug fixes (from a description, an error message, or failing tests),
+  refactors across files, writing tests, scaffolding projects, code
+  questions via `/ask` — each judged by *running* the result (the code
+  has to work, not just look right). Its first 24 cases went from 7/24
+  to 24/24; two later batches, written after that tuning, scored 17/20
+  and 8/12 on their first, untuned runs before their failures were fixed.
+  One case is kept as a documented model limitation (see Limitations).
+  `test_on_device_capabilities.py` covers create/rename/move and the
+  push/branch gating. A few minutes in total.
   These guard against cases where the model's real behavior didn't match
   what the code assumed (a small on-device model asked to "create a
   folder" once created a *file* named `test` instead, because `/task` had
@@ -197,12 +205,14 @@ Slash commands, same spirit as `fm chat`:
 | `/model reset`              | Clear any "requires iCloud+" restrictions and retry those tiers |
 | `/edit <path> <instructions>` | Propose an edit to a file (on-device only, see below) |
 | `/task <description>`       | Plan and carry out a multi-step change, writing as it goes (see below) |
-| `/ask <question>`           | Research a question via cloud/core subagents (see below) |
+| `/ask <question>`           | Answer a question about the project's code (see below) |
 | `/subagents [planning\|building] <model>` | Show or set which model plays each subagent role  |
 | `/compare <question>`       | Ask every model the same question, one at a time       |
 | `/save <name>`               | Save the conversation under a name                     |
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
 | `/export [file\|copy]`       | Export the transcript as Markdown (or `.txt`/`.json`), or copy it |
+| `/run <command>`             | Run a shell command here and show its output           |
+| `/verify [on\|off]`          | Turn `/task`'s automatic checks (tests, syntax) on or off |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
 | `/pull`                      | Pull the latest changes from git                        |
@@ -302,6 +312,43 @@ command yourself (`/push`, `/pull`, `/branch create <name>`, `/branch
 switch <name>`), then re-run `/task` for anything after it. Deleting files
 isn't something `/task` does; it says so instead of trying.
 
+**Coding.** `/task` is built to do real coding work on-device, measured
+against the agentic-coding suite in `tests/slow/`:
+
+- **It sees the code.** Planning, every edit, and `/ask` get the most
+  relevant files in full plus an outline of the rest (function and class
+  signatures), fitted to the on-device model's 4096-token context.
+- **Code is written as plain text,** not squeezed through a JSON string:
+  on the same prompts the model got 8/8 right in plain text and 5/8
+  through guided generation. Code edits ask for a correct implementation
+  of your request, in your own words (not a planner's paraphrase).
+- **Refactors are exact.** "Rename compute_total to sum_values
+  everywhere" renames the symbol in every file that uses it; "move
+  double and triple from main.py into helpers.py" moves the functions,
+  carries their imports along, and imports them back; "add a timeout of
+  30 to config.json" edits the JSON as data; "add a docstring to every
+  function" works through them one at a time; a request naming one
+  function in a bigger file edits just that function.
+- **It checks its work.** After changing code, `/task` runs the
+  project's own checks: syntax checks of what changed (Python, `node
+  --check`, a Swift type check, valid JSON), the test suite if there is
+  one (pytest or unittest, `npm test`, `swift build`, `go test`, `cargo
+  test`), and anything your request said to run ("running main.py fails
+  with…" re-runs main.py). With no test suite, it has the model write a
+  short script that calls the changed code and runs it on a copy of the
+  project; only a crash inside your code counts. On a failure it shows
+  the model the output and has it fix the file the failure points at, up
+  to 3 rounds, trying a test written in the same run if the code under
+  test comes back unchanged (a new test can be wrong too). Nothing is
+  committed until the checks pass; if they never do, `/task` stops and
+  shows the output. `/verify off` turns all of this off.
+- **"Fix the failing test"** edits the code under test, not the test,
+  unless you ask about the test itself.
+
+`/run <command>` runs a shell command in the current directory and shows
+its output — the explicit way to run something `/task` won't run on its
+own (a plan step like "run the server" stops and suggests `/run`).
+
 `fm serve`'s OpenAI-style tool-calling was tried as an alternative to this
 fixed vocabulary and is broken on this OS build (it leaks raw, unparsed
 generation text instead of returning structured tool calls) — and a
@@ -315,12 +362,14 @@ choose not to call it.
 large file to edit) and `/ask` (below). Either role can be
 set to any model, including a specific `ollama:<name>`. One thing this
 *doesn't* change: `/task`'s actual file-writing step always runs on-device
-regardless of the "building" setting, since it's the only backend with the
-guided-generation schema support editing requires — this is a real
-technical constraint, not a default that "building" can override.
+regardless of the "building" setting.
 
-`/ask <question>` is a similar orchestrator/worker pattern applied to
-research instead of editing, entirely read-only. The **planning** role
+`/ask <question>` answers questions about the project in the current
+directory, entirely read-only. It gives the model the relevant files, plus
+any definitions matching the question (ask about "the tax rate" and it
+finds `TAX_RATE = 0.2`), and with on-device planning answers in one call
+with that code in view. With a cloud planning role it's an
+orchestrator/worker pattern: the **planning** role
 either answers directly (if it's confident it can) or splits the question
 into a few sub-questions; each sub-question is dispatched to the
 **building** role; then **planning** synthesizes a final answer from that
@@ -453,6 +502,24 @@ exactly, where the model's unassisted reading of the same image dropped a
 character and a space.
 
 ## Limitations
+
+**On-device coding**, measured with `tests/slow/test_agentic_eval.py`:
+
+- **4096-token context.** The model sees relevant files and outlines, not
+  a whole project; a file over about 4 KB is edited one function or
+  section at a time.
+- **Logic without tests.** Syntax checks and smoke runs catch code that
+  doesn't compile or crashes, but not code that runs and is simply wrong.
+  The suite's documented case: asked to cache a function's result, the
+  model wrote a cache that's never filled. With a test suite, `/task`
+  runs it and fixes failures; without one, review the diff.
+- **Edge-case reasoning.** Given the failing test output, the model fixes
+  some of its own mistakes but not all (a quoted-field CSV parser never
+  came out right).
+- **Speed.** Each model call takes a few seconds; a task with a failing
+  check and several repair rounds can take a minute or two.
+
+Other limitations:
 
 - Cloud/Cloud Pro's "multi-turn context" is just prior turns re-sent as
   text, not a real session — it'll drift on long conversations.

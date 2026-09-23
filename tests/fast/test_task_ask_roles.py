@@ -10,7 +10,7 @@ async def main():
             return fn(*a, **kw)
 
         captured_models = []
-        def fake_plan_with_model(request, task, files, folders, backend, model):
+        def fake_plan_with_model(request, task, files, folders, backend, model, cwd=None):
             captured_models.append(model)
             return [], model  # nothing planned
 
@@ -24,7 +24,7 @@ async def main():
         print("task uses planning role OK")
 
         captured = []
-        def fake_decompose(question, backend, model):
+        def fake_decompose(question, backend, model, context=""):
             captured.append(model)
             return {"answer": "done", "model_used": model}
 
