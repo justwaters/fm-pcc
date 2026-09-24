@@ -42,7 +42,7 @@ from textual.reactive import reactive
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__, codework, taskplan
+from . import __version__, codework, mapreduce, taskplan
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -456,6 +456,14 @@ def propose_edit(
             f"large to edit on-device (over {REWRITE_MAX_CHARS} characters)"
         )
 
+    if line_range and lo > 1 and not _is_prose(label):
+        # What the rest of the file already provides (imports, a `log`
+        # object, constants): seen for real, a function edited on its own
+        # re-imported logging and called logging.info instead of the
+        # file's own log.info.
+        prelude = _file_prelude(label, original, lo)
+        if prelude:
+            context = (f"The top of {label} (already there; don't repeat it):\n{prelude}\n\n" + context).strip()
     if line_range:
         what = f"lines {lo}-{hi} of {label} (the rest of the file is unchanged)"
         noun = "version of just these lines"
@@ -516,6 +524,16 @@ def propose_edit(
             sample_first=bool(feedback),
         )
 
+    hoisted: list[str] = []
+    if line_range and label.endswith(".py"):
+        new_excerpt, hoisted = _hoist_imports(excerpt, new_excerpt)
+        prelude_end = next((i for i, l in enumerate(lines) if re.match(r"(?:async\s+)?(?:def|class)\s", l)), 0)
+        existing = set(l.strip() for l in lines[:prelude_end])
+        hoisted = [h for h in hoisted if h.strip() not in existing]
+        if hoisted and lo - 1 >= prelude_end:
+            last_import = max((i for i, l in enumerate(lines[:prelude_end]) if re.match(r"(?:import|from)\s", l)), default=-1)
+            lines = lines[: last_import + 1] + hoisted + lines[last_import + 1:]
+            lo, hi = lo + len(hoisted), hi + len(hoisted)
     updated_lines = lines[: lo - 1] + new_excerpt.splitlines() + lines[hi:]
     updated = "\n".join(updated_lines)
     if original.endswith("\n") or not original:
@@ -527,7 +545,50 @@ def propose_edit(
         "original": original,
         "updated": updated,
         "summary": f"edited {label}: {instructions}",
+        # for callers splicing several parts of one file themselves
+        "new_excerpt": new_excerpt,
+        "hoisted": hoisted,
     }
+
+
+def _file_prelude(label: str, content: str, before_line: int, limit: int = 1200) -> str:
+    """A file's imports and module-level definitions above its first
+    function (for context when editing a part further down)."""
+    lines = content.splitlines()[: before_line - 1]
+    first_def = next((i for i, l in enumerate(lines) if re.match(
+        r"\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|func|fn)\s", l)), len(lines))
+    return "\n".join(lines[:first_def]).strip()[:limit]
+
+
+def _hoist_imports(before: str, after: str) -> tuple[str, list[str]]:
+    """For a rewrite of one Python function: pull out top-level lines the
+    model put around it -- imports (returned, to be added once at the top
+    of the file) and other module-level statements (dropped: seen for
+    real, `logging.basicConfig(...)` added above each edited function)."""
+    if re.match(r"\s", before) or not re.match(r"(?:@|async\s+def|def|class)\b", before.lstrip()):
+        return after, []
+    out, hoisted, inside = [], [], False
+    for line in after.splitlines():
+        if not inside and re.match(r"(?:@|async\s+def\s|def\s|class\s)", line):
+            inside = True
+        if inside:
+            out.append(line)
+        elif re.match(r"(?:import|from)\s+\S+", line):
+            hoisted.append(line)
+        # anything else before the function starts is dropped
+    if not out:
+        return after, []
+    while out and not out[-1].strip():
+        out.pop()
+    # stray top-level code the model appended after the function
+    trimmed = []
+    for i, line in enumerate(out):
+        if i and line and not line[0].isspace() and not re.match(r"(?:@|def\s|class\s|async\s+def\s|#)", line):
+            break
+        trimmed.append(line)
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    return "\n".join(trimmed), hoisted
 
 
 def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
@@ -910,6 +971,77 @@ _PLAN_SCHEMA = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Map-reduce plumbing (see mapreduce.py): on-device calls used by the map
+# and reduce sessions, and the project material they read.
+# ---------------------------------------------------------------------------
+
+# The most of a project map-reduce will read for one request (~14 on-device
+# sessions): past this, the files are ranked in code and the most relevant
+# ones read.
+MAPREDUCE_MAX_CHARS = 120_000
+
+
+MAP_SESSION_TIMEOUT_SECONDS = 45
+
+
+def ask_on_device(prompt: str) -> str:
+    result = _run(["fm", "respond", "--model", "system", "--no-stream", "--greedy", prompt],
+                  timeout=MAP_SESSION_TIMEOUT_SECONDS)
+    if result.returncode != 0:
+        raise EditError(result.stderr.strip() or "fm respond failed")
+    return result.stdout.strip()
+
+
+def judge_files_on_device(prompt: str, paths: list[str]) -> list[dict]:
+    """Structured per-file relevance verdicts; paths are an enum, so the
+    model can only name files it was actually shown."""
+    if not paths:
+        return []
+    schema = {
+        "type": "object", "title": "Relevance", "additionalProperties": False,
+        "properties": {"files": {"type": "array", "items": {"$ref": "#/$defs/File"}}},
+        "required": ["files"], "x-order": ["files"],
+        "$defs": {"File": {
+            "type": "object", "title": "File", "additionalProperties": False,
+            "properties": {
+                "path": {"type": "string", "enum": paths},
+                "relevant": {"type": "boolean"},
+                "names": {"type": "array", "items": {"type": "string"},
+                          "description": "Functions or classes in this file that matter for the request"},
+            },
+            "required": ["path", "relevant", "names"], "x-order": ["path", "relevant", "names"],
+        }},
+    }
+    return fm_structured(schema, prompt).get("files") or []
+
+
+def judge_yes_on_device(prompt: str) -> bool:
+    schema = {
+        "type": "object", "title": "Verdict", "additionalProperties": False,
+        "properties": {"needs_change": {"type": "boolean"}},
+        "required": ["needs_change"], "x-order": ["needs_change"],
+    }
+    return bool(fm_structured(schema, prompt).get("needs_change"))
+
+
+def project_documents(cwd: str, request: str, limit: int = MAPREDUCE_MAX_CHARS) -> tuple[list[tuple[str, str]], int]:
+    """(docs, total files): the project's text files as (path, text), most
+    relevant to `request` first, up to `limit` characters in all."""
+    files = codework.project_files(cwd, limit=400)
+    texts = {f: codework.read_text(cwd, f) for f in files}
+    terms = codework.request_terms(request)
+    named = set(taskplan.mentioned_files(request, files))
+    ranked = sorted(files, key=lambda f: (-codework.relevance(f, texts[f], terms, named), f))
+    docs, used = [], 0
+    for f in ranked:
+        if used + len(texts[f]) > limit and docs:
+            continue
+        docs.append((f, texts[f]))
+        used += len(texts[f])
+    return docs, len(files)
+
+
 def _plan_prompt(request: str, task: str, files: list[str], folders: list[str], code: str = "") -> str:
     context = f"Overall task: {task}\nPart to plan now: {request}\n\n" if request != task else f"Task: {task}\n\n"
     return (
@@ -950,9 +1082,27 @@ def _parse_json_plan(reply: str) -> list[dict] | None:
     return steps if isinstance(steps, list) else None
 
 
+def _relevant_to(task: str, cwd: str, model: str, progress=None) -> tuple[str, ...]:
+    """For an on-device planner in a project too big for its window: read
+    every (relevant-ranked) file in map-reduce sessions and return the
+    ones that matter, so the planner's context holds those rather than
+    whatever matched keywords."""
+    if model != "on-device":
+        return ()
+    docs, _total = project_documents(cwd, task)
+    if sum(len(t) for _, t in docs) <= CONTEXT_BUDGET_ON_DEVICE:
+        return ()
+    try:
+        found = mapreduce.relevant_files(task, docs, judge_files_on_device,
+                                         mapreduce.MapReduce(progress=progress or (lambda _m: None)))
+    except (EditError, InterruptedError):
+        return ()
+    return tuple(found)
+
+
 def plan_with_model(
     request: str, task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
-    cwd: str | None = None,
+    cwd: str | None = None, progress=None,
 ) -> tuple[list[dict], str]:
     """Ask the planning model for raw steps (not yet normalized). A cloud
     model gets asked for JSON in plain text (Shortcuts has no schema
@@ -963,7 +1113,7 @@ def plan_with_model(
     # The planner sees real code, not just file names -- without it,
     # measured, it asked to "fix" a failing test by editing the test.
     budget = CONTEXT_BUDGET_ON_DEVICE if model == "on-device" else CONTEXT_BUDGET_CLOUD
-    code = codework.build_context(cwd, task, budget) if cwd else ""
+    code = codework.build_context(cwd, task, budget, prefer=_relevant_to(task, cwd, model, progress)) if cwd else ""
     prompt = _plan_prompt(request, task, files, folders, code)
     if model != "on-device":
         reply, used = backend.classify_with_fallback(
@@ -1023,7 +1173,7 @@ def _retarget_test_edits(steps: list[dict], task: str, cwd: str, files: list[str
 
 def plan_task(
     task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
-    cwd: str | None = None,
+    cwd: str | None = None, progress=None,
 ) -> tuple[list[dict], str | None]:
     """The whole plan for `task`, up front: deterministic where the request
     has a recognizable shape (taskplan.parse_task), the planning model for
@@ -1045,7 +1195,7 @@ def plan_task(
             continue
         request = task if whole else s["details"]
         now_files, now_folders = s.get("files", files), s.get("folders", folders)
-        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd)
+        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd, progress)
         named = taskplan.mentioned_files(request, now_files)
         related = tuple(r for n in named for r in codework.local_imports(cwd, n, now_files)) if cwd else ()
         try:
@@ -1107,6 +1257,38 @@ def describe_step(s: dict) -> str:
     return action.lower()
 
 
+def _file_blocks(label: str, content: str) -> list[tuple[str, int, int, str]]:
+    """A file as non-overlapping (label, start, end, text) parts, 0-based
+    [start, end): each top-level function on its own, the code between
+    them grouped, anything too big for a rewrite split further."""
+    lines = content.splitlines()
+    funcs = [b for b in codework.function_blocks(label, content)]
+    funcs = sorted((b for b in funcs if not any(o != b and o[1] <= b[1] and b[2] <= o[2] for o in funcs)),
+                   key=lambda b: b[1])
+    raw: list[tuple[str, int, int]] = []
+    pos = 0
+    for name, start, end in funcs:
+        if start > pos:
+            raw.append((f"lines {pos + 1}-{start}", pos, start))
+        raw.append((name, start, end))
+        pos = end
+    if pos < len(lines):
+        raw.append((f"lines {pos + 1}-{len(lines)}", pos, len(lines)))
+    out = []
+    for name, start, end in raw:
+        text = "\n".join(lines[start:end])
+        if not text.strip():
+            continue
+        if len(text) <= REWRITE_MAX_CHARS:
+            out.append((name, start, end, text))
+            continue
+        for p in mapreduce.split_text(text, name, REWRITE_MAX_CHARS, overlap_lines=0):
+            p_start = start + p.start_line - 1
+            p_end = p_start + len(p.text.splitlines())
+            out.append((p.source, p_start, p_end, p.text))
+    return out
+
+
 def choose_edit_range(
     content: str, filename: str, instructions: str, backend: "Backend", model: str
 ) -> tuple[int, int] | None:
@@ -1162,6 +1344,23 @@ def default_commit_message(summaries: list[str], cwd: str) -> str:
     if summaries:
         first = summaries[0][0].upper() + summaries[0][1:]
         return first if len(summaries) == 1 else f"{first} (+{len(summaries) - 1} more changes)"
+    # Changes this /task didn't make itself: describe the diff, however
+    # big (map-reduce), falling back to the file list.
+    try:
+        diff = git_run(["diff", "HEAD"], cwd, timeout=20).stdout
+        untracked = git_run(["ls-files", "--others", "--exclude-standard"], cwd, timeout=10).stdout.split()
+        if diff.strip() or untracked:
+            material = diff + "".join(f"\nnew file: {u}" for u in untracked)
+            gist = mapreduce.condense(material, "These are changes about to be committed to git.",
+                                      ask_on_device, mapreduce.MapReduce(), source="the diff")
+            subject = ask_on_device(
+                f"Changes:\n{gist}\n\nWrite a one-line git commit message for these changes: imperative "
+                f"mood, at most 60 characters, no quotes, no trailing period. Reply with only the message."
+            ).strip().splitlines()[0].strip().strip('"').strip("'").rstrip(".")
+            if 3 <= len(subject) <= 72:
+                return subject
+    except (EditError, OSError, subprocess.SubprocessError, IndexError):
+        pass
     changed = [line[3:].strip().strip('"') for line in git_status_porcelain(cwd).splitlines() if line.strip()]
     names = ", ".join(os.path.basename(c.split(" -> ")[-1]) for c in changed[:3])
     more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
@@ -1291,50 +1490,46 @@ class CloudTierUnavailable(RuntimeError):
 
 
 _op_lock = threading.Lock()
-_active_op: subprocess.Popen | http.client.HTTPConnection | None = None
-_cancel_requested = False
+# Every model call in flight -- map-reduce runs several on-device sessions
+# at once (measured: three in parallel take about half the time of three
+# in a row), and Esc-Esc has to stop all of them, not just the last one.
+_active_ops: set = set()
+_cancelled_ops: set = set()
 
 
 def _begin_op(op: subprocess.Popen | http.client.HTTPConnection) -> None:
-    global _active_op, _cancel_requested
     with _op_lock:
-        _active_op = op
-        _cancel_requested = False
+        _active_ops.add(op)
 
 
 def _end_op(op: subprocess.Popen | http.client.HTTPConnection) -> bool:
     """Unregister `op`. Returns True if it had been cancelled."""
-    global _active_op
     with _op_lock:
-        was_cancelled = _cancel_requested and _active_op is op
-        if _active_op is op:
-            _active_op = None
+        _active_ops.discard(op)
+        was_cancelled = op in _cancelled_ops
+        _cancelled_ops.discard(op)
     return was_cancelled
 
 
 def cancel_active_process() -> bool:
-    """Interrupt whatever fm/shortcuts subprocess or Ollama request is running.
+    """Interrupt every fm/shortcuts subprocess or Ollama request running.
 
-    Only one of these runs at a time in this app (a single background
-    worker per turn), so a single module-level slot is enough. A subprocess
-    gets terminated; an HTTP connection gets closed out from under its
-    blocked read, which raises in the thread that's waiting on it.
+    A subprocess gets terminated; an HTTP connection gets closed out from
+    under its blocked read, which raises in the thread that's waiting on it.
     """
-    global _cancel_requested
     with _op_lock:
-        op = _active_op
-        if op is None:
-            return False
-        _cancel_requested = True
-    if isinstance(op, subprocess.Popen):
-        if op.poll() is None:
-            op.terminate()
-    else:
-        try:
-            op.close()
-        except OSError:
-            pass
-    return True
+        ops = list(_active_ops)
+        _cancelled_ops.update(ops)
+    for op in ops:
+        if isinstance(op, subprocess.Popen):
+            if op.poll() is None:
+                op.terminate()
+        else:
+            try:
+                op.close()
+            except OSError:
+                pass
+    return bool(ops)
 
 
 def _run(cmd: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
@@ -1709,6 +1904,7 @@ def save_icloud_plus_unavailable(unavailable: set[str]) -> None:
 
 
 FALLBACK_CHAIN = {"cloud-pro": "cloud", "cloud": "on-device"}
+_CONTEXT_FULL_RE = re.compile(r"exceeded the model's context size|context window|too many tokens", re.I)
 
 
 class Backend:
@@ -1725,6 +1921,10 @@ class Backend:
         self._shortcut_overrides = shortcut_overrides or {}
         self._shortcut_ready: dict[str, bool] = {}
         self._transcript_path: str | None = None
+        # (user, assistant) turns of the on-device conversation, so that when
+        # it outgrows the 4096-token window the older turns can be condensed
+        # and the chat carried on in a fresh session.
+        self._on_device_turns: list[tuple[str, str]] = []
         self._cloud_history: dict[str, list[tuple[str, str]]] = {
             model: [] for model in CLOUD_SHORTCUTS
         }
@@ -1745,6 +1945,7 @@ class Backend:
 
     def reset(self) -> None:
         self._transcript_path = None
+        self._on_device_turns = []
         self._ollama_context_tokens.clear()
         for history in self._cloud_history.values():
             history.clear()
@@ -1827,9 +2028,33 @@ class Backend:
         args += ["--save-transcript", self._transcript_path, prompt]
 
         result = _run(args)
+        if result.returncode != 0 and _CONTEXT_FULL_RE.search(result.stderr or "") and self._on_device_turns:
+            # The conversation outgrew the window: condense the earlier
+            # turns (map-reduce, however long they are) and carry on in a
+            # fresh session that starts from that summary.
+            summary = self._condense_conversation()
+            self._transcript_path = os.path.join(tempfile.gettempdir(), f"fm-pcc-{uuid.uuid4().hex}.json")
+            self._on_device_turns = [("(summary of the conversation so far)", summary)]
+            if self.on_status:
+                self.on_status("the conversation outgrew the on-device model's window -- continuing from a summary of it")
+            framed = f"Summary of our conversation so far:\n{summary}\n\nContinuing the conversation: {prompt}"
+            result = _run(["fm", "respond", "--no-stream", "--save-transcript", self._transcript_path, framed])
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "fm respond failed")
-        return result.stdout.strip()
+        reply = result.stdout.strip()
+        self._on_device_turns.append((prompt, reply))
+        return reply
+
+    def _condense_conversation(self) -> str:
+        history = "\n\n".join(f"User: {u}\nAssistant: {a}" for u, a in self._on_device_turns)
+        return mapreduce.condense(
+            history,
+            "This is the earlier part of a conversation between a user and an assistant. "
+            "It will be used to continue the conversation.",
+            lambda p: self.classify(p, "on-device"),
+            mapreduce.MapReduce(),
+            source="the conversation",
+        )
 
     def _ensure_ready(self, model: str) -> None:
         if not self._shortcut_ready.get(model):
@@ -2642,7 +2867,8 @@ class ChatApp(App):
             files, folders = gather_task_tree(cwd)
             self.call_from_thread(self._log_progress, "planning…")
             steps, model_used = plan_task(
-                task, files, folders, self.backend, self.subagent_roles["planning"], cwd=cwd
+                task, files, folders, self.backend, self.subagent_roles["planning"], cwd=cwd,
+                progress=lambda m: self.call_from_thread(self._log_progress, m),
             )
             if model_used:
                 self._note_planning_fallback(model_used)
@@ -2808,6 +3034,10 @@ class ChatApp(App):
             full = resolve_safe_path(path, cwd)
             with open(full, "r", errors="replace") as f:
                 content = f.read()
+            multi = self._edit_every_site(path, content, details, cwd, context, task, s)
+            if multi is not None:
+                self._write_task_change(cwd, path, content, multi, f"edited {path}: {details}", existed_before=True)
+                return f"edited {path}: {details}"
             line_range = choose_edit_range(
                 content, path, details, self.backend, self.subagent_roles["planning"]
             )
@@ -2823,6 +3053,54 @@ class ChatApp(App):
             existed_before=action == "EDIT",
         )
         return proposal["summary"]
+
+    def _edit_every_site(
+        self, path: str, content: str, details: str, cwd: str, context: str, task: str, s: dict
+    ) -> str | None:
+        """An edit to a file too big for one window that isn't about a
+        single named function: find every part that needs the change (one
+        session per function or chunk), rewrite each part in its own
+        session, and splice them all back. None to fall back to editing
+        one section."""
+        if len(content) <= REWRITE_MAX_CHARS or self.subagent_roles["building"] != "on-device":
+            return None
+        names = set(re.findall(r"[A-Za-z_$][\w$]*", details))
+        if sum(1 for b in codework.function_blocks(path, content) if b[0] in names) == 1:
+            return None  # one named function: choose_edit_range handles it
+        blocks = _file_blocks(path, content)
+        engine = self._engine()
+        sites = mapreduce.sites_by_name(details, blocks)
+        if sites is None:
+            sites = mapreduce.find_edit_sites(details, blocks, judge_yes_on_device, engine)
+        if not sites:
+            return None
+        self.call_from_thread(self._log_progress, f"changing {len(sites)} part(s) of {path}…")
+        lines = content.splitlines()
+
+        def edit(site):
+            lo, hi = site[0] + 1, site[1]
+            proposal = propose_edit(path, details, cwd, line_range=(lo, hi), context=context, task=task,
+                                    expectations=False, speculative=bool(s.get("optional")))
+            return site, proposal["new_excerpt"].splitlines(), proposal.get("hoisted") or []
+
+        results = [r for r in engine.map(sites, edit) if r]
+        if not results:
+            return None
+        hoisted: list[str] = []
+        for (start, end), new_part, imports in sorted(results, key=lambda r: -r[0][0]):
+            lines[start:end] = new_part
+            hoisted += [h for h in imports if h not in hoisted]
+        if hoisted:
+            first_def = next((i for i, l in enumerate(lines) if re.match(r"(?:async\s+)?(?:def|class)\s", l)), 0)
+            existing = {l.strip() for l in lines[:first_def]}
+            new_imports = [h for h in hoisted if h.strip() not in existing]
+            last_import = max((i for i, l in enumerate(lines[:first_def]) if re.match(r"(?:import|from)\s", l)), default=-1)
+            lines[last_import + 1:last_import + 1] = new_imports
+        updated = "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+        problems = taskplan.check_structure(path, details, content, updated)
+        if problems:
+            raise EditError("; ".join(problems))
+        return updated
 
     def _write_task_change(
         self, cwd: str, rel: str, before: str, after: str, summary: str, existed_before: bool | None = None
@@ -2880,6 +3158,14 @@ class ChatApp(App):
                 f"note: {len(failing)} test(s) already fail before any change -- only new failures will count",
             )
         return failing
+
+    def _engine(self) -> "mapreduce.MapReduce":
+        """A map-reduce engine that reports progress in the chat and stops
+        on Esc-Esc."""
+        return mapreduce.MapReduce(
+            progress=lambda m: self.call_from_thread(self._log_progress, m),
+            cancelled=lambda: self._loop_cancel_requested,
+        )
 
     def _check_behavior(self, cwd: str) -> tuple[str, list[str], str, str] | None:
         """Behavior checks that need no model, run on a copy of the project:
@@ -3448,6 +3734,22 @@ class ChatApp(App):
             cwd = os.getcwd()
             budget = CONTEXT_BUDGET_ON_DEVICE + 2000 if planning_model == "on-device" else CONTEXT_BUDGET_CLOUD
             context = codework.build_context(cwd, question, budget)
+            docs, total_files = project_documents(cwd, question) if planning_model == "on-device" else ([], 0)
+            if planning_model == "on-device" and sum(len(t) for _, t in docs) > budget:
+                # The project doesn't fit one window: read all of it (the
+                # most relevant ~120 KB of a big one) in parallel sessions
+                # that pull out verified quotes, combined in as many tiers
+                # as it takes.
+                definitions = codework.find_definitions(cwd, question)
+                if definitions:
+                    docs.insert(0, ("definitions matching the question", "\n".join(definitions)))
+                engine = self._engine()
+                answer, sources = mapreduce.answer_over(question, docs, ask_on_device, engine)
+                read = len([d for d in docs if d[0] != "definitions matching the question"])
+                note = (f"\n\n(read {read} of {total_files} files in {engine.sessions} on-device "
+                        f"sessions{', ' + str(engine.tiers) + ' tiers' if engine.tiers > 1 else ''})")
+                self.call_from_thread(self._ask_answered, answer.strip() + note)
+                return
             if context and planning_model == "on-device":
                 # One call with the code in view beats splitting the
                 # question on a 4096-token model: each sub-question would
@@ -3760,7 +4062,48 @@ class ChatApp(App):
             self._add_message(Message("system", f"context: {cwd} and its contents included"))
 
         self._thinking = self._add_message(Message("thinking", ""))
+        # (Sized from the real files: `expanded` holds attachments cut off
+        # at MAX_FILE_CHARS, which would hide that they don't fit.)
+        real_size = len(prompt) + sum(
+            os.path.getsize(os.path.join(os.getcwd(), a)) for a in attachments
+            if os.path.isfile(os.path.join(os.getcwd(), a))
+        )
+        if self.model == "on-device" and (not mapreduce.fits(expanded) or real_size > mapreduce.PIECE_CHARS):
+            # Too big for one on-device window (a large @file, a long
+            # paste): answer from all of it with map-reduce instead of
+            # truncating it.
+            self._respond_long(prompt, attachments)
+            return
         self._respond(expanded)
+
+    @work(thread=True)
+    def _respond_long(self, prompt: str, attachments: list[str]) -> None:
+        cwd = os.getcwd()
+        self._loop_cancel_requested = False
+        docs = []
+        for label in attachments:
+            path = os.path.join(cwd, label) if not os.path.isabs(label) else label
+            try:
+                with open(path, "r", errors="replace") as f:
+                    docs.append((label, f.read()))
+            except OSError:
+                pass
+        question = re.sub(r"@\S+", lambda m: m.group(0)[1:], prompt)
+        if not docs:
+            # A long paste: the first lines are the request, the rest the material.
+            head, _, rest = prompt.partition("\n")
+            question, docs = (head, [("your message", rest)]) if len(head) < 400 and rest.strip() \
+                else (prompt[:300], [("your message", prompt)])
+        try:
+            engine = self._engine()
+            answer, _sources = mapreduce.answer_over(question, docs, ask_on_device, engine)
+            answer += f"\n\n(read in {engine.sessions} on-device sessions)"
+            self.backend._on_device_turns.append((prompt[:2000], answer))
+            self.call_from_thread(self._finish_turn, answer, None, None)
+        except (GenerationCancelled, InterruptedError):
+            self.call_from_thread(self._finish_cancelled)
+        except Exception as e:
+            self.call_from_thread(self._finish_turn, None, str(e), None)
 
     def _route_chat_to_task(self, prompt: str) -> bool:
         """Chat can't change files or run git -- only /task can -- and the

@@ -578,15 +578,34 @@ def find_definitions(cwd: str, question: str, limit: int = 8) -> list[str]:
         rf"^[ \t]*(?:export[ \t]+)?(?:(?:const|let|var|def|class|function|func|fn|struct|enum|type)[ \t]+)?"
         rf"(?:{alternation})\b\s*(?:=|:|\(|\{{)", re.MULTILINE
     )
+    # Second pass: settings/constants whose name is mostly the question's
+    # own words, in any order ("the base backoff delay in seconds" finds
+    # BACKOFF_BASE_SECONDS = 2; "how many times does it retry" finds
+    # MAX_RETRIES = 5).
+    stems = {w.lower()[:5] for w in words if len(w) > 2}
+    assign = re.compile(r"^[ \t]*(?:export[ \t]+)?(?:(?:const|let|var|final|static)[ \t]+)?([A-Za-z_][\w]*)[ \t]*(?::[^=\n]+)?=[^=]", re.MULTILINE)
     hits = []
     for rel in project_files(cwd):
         text = read_text(cwd, rel)
+        lines = text.splitlines()
+        seen_lines = set()
         for m in pattern.finditer(text):
             line_no = text.count("\n", 0, m.start()) + 1
-            line = text.splitlines()[line_no - 1].strip()
-            hits.append(f"{rel}:{line_no}: {line[:160]}")
+            seen_lines.add(line_no)
+            hits.append(f"{rel}:{line_no}: {lines[line_no - 1].strip()[:160]}")
             if len(hits) >= limit:
                 return hits
+        for m in assign.finditer(text):
+            parts = [p.lower() for p in re.split(r"_|(?<=[a-z])(?=[A-Z])", m.group(1)) if len(p) > 1]
+            matched = [p for p in parts if any(len(os.path.commonprefix([p, st])) >= min(4, len(p), len(st)) for st in stems)]
+            if matched and len(matched) * 2 >= len(parts):
+                line_no = text.count("\n", 0, m.start()) + 1
+                if line_no in seen_lines:
+                    continue
+                seen_lines.add(line_no)
+                hits.append(f"{rel}:{line_no}: {lines[line_no - 1].strip()[:160]}")
+                if len(hits) >= limit:
+                    return hits
     return hits
 
 

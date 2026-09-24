@@ -12,7 +12,7 @@ async def main():
             return fn(*a, **kw)
 
         captured_models = []
-        def fake_plan_with_model(request, task, files, folders, backend, model, cwd=None):
+        def fake_plan_with_model(request, task, files, folders, backend, model, cwd=None, progress=None):
             captured_models.append(model)
             return [], model  # nothing planned
 

@@ -115,8 +115,12 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   17/20, 8/12, and 9/15 on their first, untuned runs before their
   failures were fixed. Two cases are kept as documented model
   limitations (see Limitations).
-  `test_on_device_capabilities.py` covers create/rename/move and the
-  push/branch gating. A few minutes in total.
+  `test_mapreduce_real.py` runs map-reduce (below) on material that
+  can't fit the model's window: a ~100 KB project, a ~40 KB attached
+  file, a long chat, a big file needing edits in several places, and a
+  large diff to describe. `test_on_device_capabilities.py` covers
+  create/rename/move and the push/branch gating. About 15 minutes in
+  total.
   These guard against cases where the model's real behavior didn't match
   what the code assumed (a small on-device model asked to "create a
   folder" once created a *file* named `test` instead, because `/task` had
@@ -329,7 +333,8 @@ against the agentic-coding suite in `tests/slow/`:
 
 - **It sees the code.** Planning, every edit, and `/ask` get the most
   relevant files in full plus an outline of the rest (function and class
-  signatures), fitted to the on-device model's 4096-token context.
+  signatures), fitted to the on-device model's 4096-token context — and
+  when a project is bigger than that, map-reduce (below) reads the rest.
 - **Code is written as plain text,** not squeezed through a JSON string:
   on the same prompts the model got 8/8 right in plain text and 5/8
   through guided generation. Code edits ask for a correct implementation
@@ -387,6 +392,43 @@ large file to edit) and `/ask` (below). Either role can be
 set to any model, including a specific `ollama:<name>`. One thing this
 *doesn't* change: `/task`'s actual file-writing step always runs on-device
 regardless of the "building" setting.
+
+### Map-reduce: past the 4096-token window
+
+The on-device model sees about 4,096 tokens at a time (roughly 13 KB of
+text, including its own reply). Every `fm respond` call is a fresh
+session with its own full window, so when material is bigger than that,
+fm-pcc splits it, handles each piece in its own session — three at a time,
+which measured about twice as fast as one after another — and combines
+the results. If the combined results still don't fit one window, they're
+grouped and combined again: as many tiers as it takes, until one session
+can see everything that's left.
+
+Pieces are *extracted from*, not summarized, where that's possible: each
+session copies the lines that answer the question word for word, and
+fm-pcc keeps only quotes that really appear in the source — a summary of
+a summary drifts, a checked quote can't. Each quote is cited by the file
+and line it came from. A session that fails (a model reply that runs on
+too long, say) is skipped and reported instead of sinking the rest.
+
+Where it's used, on the on-device model:
+
+- **`/ask` on a project too big to show at once:** every file is read
+  (the ~120 KB most relevant to the question, in a very large project),
+  and the answer cites `[file:line]` for each fact.
+- **Chat with a large `@file` or a long paste:** answered from all of it,
+  instead of cutting it off at 8,000 characters.
+- **`/task` planning in a large project:** a session per group of files
+  decides which files and functions actually matter, so the plan is made
+  with those in view rather than whatever matched keywords.
+- **`/task` edits that touch many places in a big file:** each part that
+  needs the change is found (by name — "every admin handler" — or by a
+  session per function), rewritten in its own session with the top of the
+  file as context, and spliced back in one write.
+- **Long chats:** if an on-device conversation outgrows its session, the
+  earlier turns are condensed and the chat carries on from the summary.
+- **Commit messages** for a large set of changes `/task` didn't make
+  itself are written from the diff, however big.
 
 `/ask <question>` answers questions about the project in the current
 directory, entirely read-only. It gives the model the relevant files, plus
@@ -529,9 +571,10 @@ character and a space.
 
 **On-device coding**, measured with `tests/slow/test_agentic_eval.py`:
 
-- **4096-token context.** The model sees relevant files and outlines, not
-  a whole project; a file over about 4 KB is edited one function or
-  section at a time.
+- **4096-token context.** Map-reduce lets fm-pcc read past it — but each
+  session still reasons about only one window's worth at a time, so a
+  change that needs several distant files understood *together* (not
+  just found) is harder than one that doesn't.
 - **Logic without tests or examples.** Syntax checks, smoke runs, and
   documented examples catch code that doesn't compile, crashes, or
   contradicts its own docstring — but not code that runs and is simply
@@ -552,7 +595,8 @@ character and a space.
   the model flagged every wrong change but also 3 of 4 correct ones, so
   fm-pcc doesn't use it as a check.
 - **Speed.** Each model call takes a few seconds; a task with a failing
-  check and several repair rounds can take a minute or two.
+  check and several repair rounds can take a minute or two, and reading
+  a ~100 KB project through map-reduce takes one to two minutes.
 
 Other limitations:
 
