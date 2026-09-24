@@ -276,7 +276,7 @@ def _extract_prompt(question: str, piece: Piece) -> str:
         f"Question: {question}\n\n"
         f"Text (from {piece.source}):\n{piece.text}\n\n"
         "Copy, word for word, the lines from this text that help answer the question -- at most "
-        "8 lines, one per line, each starting with \"> \". Copy exactly; don't reword or explain. "
+        "8 short lines, one per line, each starting with \"> \". Copy exactly; don't reword or explain. "
         "If nothing in it is relevant, reply NONE."
     )
 

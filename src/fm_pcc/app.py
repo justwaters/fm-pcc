@@ -42,7 +42,7 @@ from textual.reactive import reactive
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__, codework, mapreduce, taskplan
+from . import __version__, codework, docs, mapreduce, taskplan
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -985,6 +985,31 @@ MAPREDUCE_MAX_CHARS = 120_000
 MAP_SESSION_TIMEOUT_SECONDS = 45
 
 
+def docs_context(library: "docs.Library", request: str, files: list[str] = (), limit_chars: int = 1500,
+                 extra_sets: list[str] = ()) -> str:
+    """The installed documentation passages most relevant to `request`, as
+    a context block of at most `limit_chars` -- only from doc sets that
+    match the files involved or the languages the request names. Empty
+    when nothing relevant is installed."""
+    installed = library.installed()
+    if not installed:
+        return ""
+    wanted = [s for s in dict.fromkeys([*docs.sets_for_files(files), *docs.sets_named_in(request), *extra_sets])
+              if s in installed]
+    if not wanted:
+        return ""
+    out, used = [], 0
+    for p in library.search(request, wanted, limit=6):
+        block = f"[{p['heading']} <{p['url']}>]\n{p['body']}"
+        if used + len(block) > limit_chars:
+            if not out:
+                out.append(block[:limit_chars])
+            break
+        out.append(block)
+        used += len(block)
+    return ("Relevant documentation:\n" + "\n\n".join(out)) if out else ""
+
+
 def ask_on_device(prompt: str) -> str:
     result = _run(["fm", "respond", "--model", "system", "--no-stream", "--greedy", prompt],
                   timeout=MAP_SESSION_TIMEOUT_SECONDS)
@@ -1558,6 +1583,7 @@ OLLAMA_HOST_DEFAULT = "http://localhost:11434"
 # at a temp dir so tests never read or write the real ~/.fm-pcc.
 FM_PCC_HOME = os.environ.get("FM_PCC_HOME") or os.path.expanduser("~/.fm-pcc")
 SESSIONS_DIR = os.path.join(FM_PCC_HOME, "sessions")
+DOCS_HOME = os.path.join(FM_PCC_HOME, "docs")
 STATE_PATH = os.path.join(FM_PCC_HOME, "state.json")
 NOTIFY_MIN_SECONDS = 5.0
 ON_DEVICE_CONTEXT_TOKENS = 4096  # documented limit for the on-device system model
@@ -2276,7 +2302,7 @@ class ChatApp(App):
     #palette {
         display: none;
         height: auto;
-        max-height: 8;
+        max-height: 10;
         margin: 0 2 0 2;
         border: round #7b838a;
         background: #1b2126;
@@ -2338,6 +2364,10 @@ class ChatApp(App):
         self._pending_action_request: str | None = None
         # /verify off turns off running the project's checks after /task.
         self._verify_enabled = True
+        # Downloaded documentation (/docs), searched locally.
+        self._docs = docs.Library(DOCS_HOME)
+        # What choosing an option in the open picker does (None: /model's).
+        self._picker_handler: Callable[[str], None] | None = None
         self._history_index: int | None = None
         self._history_draft = ""
         self._suppress_palette_once = False
@@ -2605,6 +2635,7 @@ class ChatApp(App):
 
     def _close_model_picker(self) -> None:
         self._model_picker_active = False
+        self._picker_handler = None
         self.query_one("#palette", OptionList).display = False
         input_widget = self.query_one(Input)
         input_widget.disabled = False
@@ -2680,6 +2711,7 @@ class ChatApp(App):
         "export": "export the transcript: /export [file.md|file.txt|file.json|copy]",
         "run": "run a shell command in this directory and show its output: /run <command>",
         "license": "read and agree to Apple's on-device model terms (one-time setup)",
+        "docs": "download language docs, or ask them: /docs, /docs <question>",
         "verify": "turn /task's automatic checks (tests, syntax) on or off: /verify [on|off]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
@@ -2757,6 +2789,8 @@ class ChatApp(App):
             self._handle_export(arg)
         elif name == "license":
             self._handle_license()
+        elif name == "docs":
+            self._handle_docs(arg)
         elif name == "run":
             if not arg:
                 self._add_message(Message("system", "usage: /run <command>"))
@@ -3027,6 +3061,9 @@ class ChatApp(App):
         )
         if s.get("note"):
             context = f"Planner's note for {path}: {s['note']}\n\n{context}"
+        reference = docs_context(self._docs, f"{details} {task}", [path], 1200)
+        if reference:
+            context = f"{context}\n\n{reference}".strip()
         shared = bool(s.get("shared"))
         if action == "CREATE_FILE":
             proposal = propose_new_file(path, details, cwd, context=context, task=task, expectations=not shared)
@@ -3335,6 +3372,11 @@ class ChatApp(App):
                     cwd, f"{task}\n{out}", CONTEXT_BUDGET_ON_DEVICE, exclude=(target,),
                     prefer=tuple(f for f in self._task_changed if f != target),
                 )
+                # Look the error itself up in the installed docs for that language.
+                error_lines = " ".join(l for l in out.splitlines()[-6:] if re.search(r"error|Error|exception|cannot|undefined", l))
+                reference = docs_context(self._docs, error_lines or task, [target], 1000)
+                if reference:
+                    context = f"{context}\n\n{reference}".strip()
                 try:
                     proposal = propose_edit(
                         target, task, cwd, context=context, task=task, expectations=False,
@@ -3418,6 +3460,158 @@ class ChatApp(App):
             self._add_message(Message("system", f"couldn't save session '{name}': {e}"))
             return
         self._add_message(Message("system", f"saved session '{name}'"))
+
+    # ---- /docs -------------------------------------------------------------
+
+    def _handle_docs(self, arg: str) -> None:
+        arg = arg.strip()
+        m = re.fullmatch(r"(download|install|get|update|remove|delete)\s+(\w+)", arg, re.IGNORECASE)
+        if not arg:
+            self._open_docs_picker()
+        elif m and m.group(2).lower() in docs.SETS:
+            verb, set_id = m.group(1).lower(), m.group(2).lower()
+            if verb in ("remove", "delete"):
+                self._remove_docs(set_id)
+            else:
+                self._download_docs(set_id)
+        else:
+            if not self._docs.installed():
+                self._add_message(Message("system", "no docs are downloaded yet -- type /docs to choose some"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_docs_question(arg)
+
+    def _relevant_doc_sets(self, text: str, cwd: str) -> list[str]:
+        """Installed doc sets that matter here: the languages `text` names,
+        or else the ones matching the project's files."""
+        installed = self._docs.installed()
+        named = [s for s in docs.sets_named_in(text) if s in installed]
+        if named:
+            return named
+        return [s for s in docs.sets_for_files(codework.project_files(cwd, limit=200)) if s in installed]
+
+    def _docs_status(self, set_id: str) -> str:
+        info = self._docs.installed().get(set_id)
+        if not info:
+            return "not downloaded"
+        return f"downloaded {info['installed']} · {info['pages']:,} pages"
+
+    def _open_docs_picker(self) -> None:
+        palette = self.query_one("#palette", OptionList)
+        palette.clear_options()
+        installed = self._docs.installed()
+        for doc_set in docs.SETS.values():
+            marker = "● " if doc_set.id in installed else "○ "
+            palette.add_option(Option(
+                f"{marker}{doc_set.name} — {doc_set.description} ({self._docs_status(doc_set.id)})", id=doc_set.id
+            ))
+        palette.highlighted = 0
+        palette.display = True
+        palette.focus()
+        self._model_picker_active = True
+        self._picker_handler = self._docs_picked
+        self.query_one(Input).disabled = True
+
+    def _docs_picked(self, set_id: str) -> None:
+        if set_id not in self._docs.installed():
+            self._download_docs(set_id)
+            return
+        name = docs.SETS[set_id].name
+        palette = self.query_one("#palette", OptionList)
+        palette.clear_options()
+        palette.add_option(Option(f"Update {name} to the latest docs", id=f"update:{set_id}"))
+        palette.add_option(Option(f"Remove {name}", id=f"remove:{set_id}"))
+        palette.add_option(Option("Cancel", id="cancel"))
+        palette.highlighted = 0
+        palette.display = True
+        palette.focus()
+        self._model_picker_active = True
+        self._picker_handler = self._docs_action
+        self.query_one(Input).disabled = True
+
+    def _docs_action(self, choice: str) -> None:
+        verb, _, set_id = choice.partition(":")
+        if verb == "update":
+            self._download_docs(set_id)
+        elif verb == "remove":
+            self._remove_docs(set_id)
+
+    def _remove_docs(self, set_id: str) -> None:
+        if set_id not in self._docs.installed():
+            self._add_message(Message("system", f"{docs.SETS[set_id].name} docs aren't downloaded"))
+            return
+        self._docs.remove(set_id)
+        self._add_message(Message("system", f"removed the {docs.SETS[set_id].name} docs"))
+
+    def _download_docs(self, set_id: str) -> None:
+        if not shutil.which("git"):
+            self._add_message(Message("system", "downloading docs needs git (xcode-select --install)"))
+            return
+        self._add_message(Message("system", f"downloading the {docs.SETS[set_id].name} docs in the background…"))
+        self._run_docs_download(set_id)
+
+    @work(thread=True, group="docs-download")
+    def _run_docs_download(self, set_id: str) -> None:
+        name = docs.SETS[set_id].name
+        try:
+            info = self._docs.install(
+                set_id, progress=lambda m: self.call_from_thread(self._log_progress, f"{name} docs: {m}"),
+            )
+        except Exception as e:
+            self.call_from_thread(self._log_progress, f"couldn't download the {name} docs: {e}")
+            return
+        size = info["chars"] / 1_000_000
+        self.call_from_thread(
+            self._log_progress,
+            f"{name} docs ready: {info['pages']:,} pages, {info['passages']:,} passages ({size:.1f} MB of text). "
+            f"Ask them with /docs <question>; /ask and /task use them automatically.",
+        )
+
+    @work(thread=True)
+    def _run_docs_question(self, question: str) -> None:
+        """/docs <question>: search the downloaded docs (just the languages
+        the question names, if it names any), answer from the best passages
+        with map-reduce, and list the pages used."""
+        self._loop_cancel_requested = False
+        try:
+            installed = self._docs.installed()
+            named = [s for s in docs.sets_named_in(question) if s in installed]
+            hits = self._docs.search(question, named or None, limit=12)
+            if not hits:
+                where = ", ".join(installed[s]["name"] for s in (named or installed))
+                self.call_from_thread(self._ask_answered, f"Nothing in the downloaded docs ({where}) matched that.")
+                return
+            # The search already ranked the passages: the best ones that fit
+            # one window are answered from in a single session (measured:
+            # sending all 12 through map-reduce made dense pages like
+            # Python's stdtypes run past the session time limit).
+            budget = mapreduce.PIECE_CHARS - len(question) - 600
+            chosen, used = [], 0
+            for h in hits:
+                label, body = docs.format_passage(h)
+                body = body[:1400]
+                if used + len(label) + len(body) + 10 > budget and chosen:
+                    break
+                chosen.append((label, body))
+                used += len(label) + len(body) + 10
+            self.call_from_thread(self._log_progress, f"reading the {len(chosen)} most relevant passages…")
+            answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+            if re.match(r"I read all of it, but found nothing", answer) and len(chosen) < len(hits):
+                # Not in the best few: read all of them, map-reduce style.
+                answer, _sources = mapreduce.answer_over(
+                    question, [docs.format_passage(h) for h in hits], ask_on_device, self._engine()
+                )
+            else:
+                hits = hits[: len(chosen)]
+            urls = list(dict.fromkeys(h["url"] for h in hits))[:5]
+            links = "\n".join(f"- {u}" for u in urls if u.startswith("http"))
+            self.call_from_thread(self._ask_answered, answer.strip() + (f"\n\nSources:\n{links}" if links else ""))
+        except (GenerationCancelled, InterruptedError):
+            self.call_from_thread(self._log_progress, "stopped")
+        except Exception as e:
+            self.call_from_thread(self._log_progress, f"error: docs search failed: {e}")
+        finally:
+            self.call_from_thread(self._enable_input)
 
     def _handle_license(self) -> None:
         """Hand the terminal to `fm license` so the user can read Apple's
@@ -3734,18 +3928,20 @@ class ChatApp(App):
             cwd = os.getcwd()
             budget = CONTEXT_BUDGET_ON_DEVICE + 2000 if planning_model == "on-device" else CONTEXT_BUDGET_CLOUD
             context = codework.build_context(cwd, question, budget)
-            docs, total_files = project_documents(cwd, question) if planning_model == "on-device" else ([], 0)
-            if planning_model == "on-device" and sum(len(t) for _, t in docs) > budget:
+            material, total_files = project_documents(cwd, question) if planning_model == "on-device" else ([], 0)
+            if planning_model == "on-device" and sum(len(t) for _, t in material) > budget:
                 # The project doesn't fit one window: read all of it (the
                 # most relevant ~120 KB of a big one) in parallel sessions
                 # that pull out verified quotes, combined in as many tiers
                 # as it takes.
                 definitions = codework.find_definitions(cwd, question)
                 if definitions:
-                    docs.insert(0, ("definitions matching the question", "\n".join(definitions)))
+                    material.insert(0, ("definitions matching the question", "\n".join(definitions)))
+                for p in self._docs.search(question, self._relevant_doc_sets(question, cwd), limit=4):
+                    material.append(docs.format_passage(p))
                 engine = self._engine()
-                answer, sources = mapreduce.answer_over(question, docs, ask_on_device, engine)
-                read = len([d for d in docs if d[0] != "definitions matching the question"])
+                answer, sources = mapreduce.answer_over(question, material, ask_on_device, engine)
+                read = len([d for d in material if d[0] != "definitions matching the question" and " <http" not in d[0]])
                 note = (f"\n\n(read {read} of {total_files} files in {engine.sessions} on-device "
                         f"sessions{', ' + str(engine.tiers) + ' tiers' if engine.tiers > 1 else ''})")
                 self.call_from_thread(self._ask_answered, answer.strip() + note)
@@ -3757,6 +3953,10 @@ class ChatApp(App):
                 self.call_from_thread(self._log_progress, "on-device is reading the project…")
                 definitions = codework.find_definitions(cwd, question)
                 found = ("Definitions matching the question:\n" + "\n".join(definitions) + "\n\n") if definitions else ""
+                reference = docs_context(self._docs, question, codework.project_files(cwd, limit=200), 1500,
+                                         self._relevant_doc_sets(question, cwd))
+                if reference:
+                    found += reference + "\n\n"
                 answer = self.backend.classify(
                     f"The project's files:\n\n{context}\n\n{found}Question: {question}\n\n"
                     "Answer the question in plain words first, then back it up with the specifics "
@@ -3968,8 +4168,12 @@ class ChatApp(App):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if not self._model_picker_active:
             return
-        self._select_model(event.option.id)
+        self._picker_choose(event.option.id)
+
+    def _picker_choose(self, option_id: str) -> None:
+        handler = self._picker_handler or self._select_model
         self._close_model_picker()
+        handler(option_id)
 
     def on_key(self, event: events.Key) -> None:
         palette = self.query_one("#palette", OptionList)
@@ -3980,8 +4184,7 @@ class ChatApp(App):
             # on_option_list_option_selected. Only handle what it doesn't.
             if event.key == "tab" and palette.highlighted is not None:
                 option = palette.get_option_at_index(palette.highlighted)
-                self._select_model(option.id)
-                self._close_model_picker()
+                self._picker_choose(option.id)
                 event.prevent_default()
                 event.stop()
             elif event.key == "escape":
@@ -4080,23 +4283,23 @@ class ChatApp(App):
     def _respond_long(self, prompt: str, attachments: list[str]) -> None:
         cwd = os.getcwd()
         self._loop_cancel_requested = False
-        docs = []
+        material = []
         for label in attachments:
             path = os.path.join(cwd, label) if not os.path.isabs(label) else label
             try:
                 with open(path, "r", errors="replace") as f:
-                    docs.append((label, f.read()))
+                    material.append((label, f.read()))
             except OSError:
                 pass
         question = re.sub(r"@\S+", lambda m: m.group(0)[1:], prompt)
-        if not docs:
+        if not material:
             # A long paste: the first lines are the request, the rest the material.
             head, _, rest = prompt.partition("\n")
-            question, docs = (head, [("your message", rest)]) if len(head) < 400 and rest.strip() \
+            question, material = (head, [("your message", rest)]) if len(head) < 400 and rest.strip() \
                 else (prompt[:300], [("your message", prompt)])
         try:
             engine = self._engine()
-            answer, _sources = mapreduce.answer_over(question, docs, ask_on_device, engine)
+            answer, _sources = mapreduce.answer_over(question, material, ask_on_device, engine)
             answer += f"\n\n(read in {engine.sessions} on-device sessions)"
             self.backend._on_device_turns.append((prompt[:2000], answer))
             self.call_from_thread(self._finish_turn, answer, None, None)

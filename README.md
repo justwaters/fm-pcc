@@ -115,7 +115,8 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   17/20, 8/12, and 9/15 on their first, untuned runs before their
   failures were fixed. Two cases are kept as documented model
   limitations (see Limitations).
-  `test_mapreduce_real.py` runs map-reduce (below) on material that
+  `test_docs_real.py` downloads every doc set fresh and asks each one a
+  question with a known answer. `test_mapreduce_real.py` runs map-reduce (below) on material that
   can't fit the model's window: a ~100 KB project, a ~40 KB attached
   file, a long chat, a big file needing edits in several places, and a
   large diff to describe. `test_on_device_capabilities.py` covers
@@ -228,6 +229,7 @@ Slash commands, same spirit as `fm chat`:
 | `/export [file\|copy]`       | Export the transcript as Markdown (or `.txt`/`.json`), or copy it |
 | `/run <command>`             | Run a shell command here and show its output           |
 | `/license`                   | Read and agree to Apple's on-device model terms (one-time setup) |
+| `/docs [question]`           | Download language docs (picker), or answer a question from them |
 | `/verify [on\|off]`          | Turn `/task`'s automatic checks (tests, syntax) on or off |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
@@ -392,6 +394,38 @@ large file to edit) and `/ask` (below). Either role can be
 set to any model, including a specific `ollama:<name>`. One thing this
 *doesn't* change: `/task`'s actual file-writing step always runs on-device
 regardless of the "building" setting.
+
+### Documentation library: `/docs`
+
+`/docs` opens a picker of official documentation to download, for the
+latest version of each:
+
+| Set | Source |
+|---|---|
+| Swift | *The Swift Programming Language* (swift.org), plus Xcode's AI-ready guides and Swift compiler diagnostics when Xcode is installed |
+| Python | The official docs for the newest release (docs.python.org's text archive) |
+| HTML, JavaScript, CSS | MDN's reference and guides for each |
+| Go | The spec, the memory model, Effective Go, the FAQ, and the standard library (from `go doc`, when Go is installed) |
+| Rust | *The Rust Book* and *The Rust Reference* |
+| React | react.dev's Learn and Reference sections |
+
+Choosing a set downloads it in the background — just the docs folders of
+each source (a sparse, shallow git clone; Python's docs archive), a few
+seconds each — then cleans it into text, splits it at headings, and
+indexes it locally (SQLite full-text search) under `~/.fm-pcc/docs`. All
+eight together are about 4,100 pages. Choosing an installed set offers
+**Update** (to the newest docs) or **Remove**; `/docs update <set>` and
+`/docs remove <set>` do the same.
+
+`/docs <question>` searches the downloaded docs — just the languages the
+question names, if it names any ("in CSS…", "React's useEffect") — and
+answers on-device from the best-matching passages, listing the official
+pages it used. Searching needs no network once a set is downloaded.
+
+Installed docs are used automatically, too: `/ask` adds the passages
+relevant to a question; `/task` adds the docs for the language of each
+file it edits, and when a check fails it looks the error up before asking
+the model to fix it.
 
 ### Map-reduce: past the 4096-token window
 
@@ -594,6 +628,11 @@ character and a space.
 - **Self-review doesn't work.** Asked whether its own change was correct,
   the model flagged every wrong change but also 3 of 4 correct ones, so
   fm-pcc doesn't use it as a check.
+- **Docs answers are only as good as the model's reading.** `/docs`
+  finds the right pages reliably (and lists them), but the on-device
+  model can still blur what it read — asked how Rust's `String` differs
+  from `&str`, it cited the right pages yet mixed the two up. Check the
+  linked pages for anything important.
 - **Speed.** Each model call takes a few seconds; a task with a failing
   check and several repair rounds can take a minute or two, and reading
   a ~100 KB project through map-reduce takes one to two minutes.
