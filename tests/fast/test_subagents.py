@@ -11,7 +11,8 @@ def last_text(app):
 async def main():
     app = m.ChatApp()
     async with app.run_test() as pilot:
-        assert app.subagent_roles == {"planning": "cloud-pro", "building": "on-device"}, app.subagent_roles
+        # On-device for both roles out of the box: no cloud, no Shortcuts.
+        assert app.subagent_roles == {"planning": "on-device", "building": "on-device"}, app.subagent_roles
         print("default roles OK")
 
         app._handle_command("/subagents")

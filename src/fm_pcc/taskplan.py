@@ -95,7 +95,8 @@ def split_clauses(text: str) -> list[str]:
     """Split on "and"/"then"/","/";" only where the next word starts a new
     request ("rename a and commit"), not a list ("move a.txt and b.txt").
     """
-    text = text.strip().rstrip(".!")
+    # Only a closing period goes: "prints Hello, World!" needs its "!".
+    text = text.strip().rstrip(".")
     return [c.strip() for c in _SPLIT_RE.split(text) if c.strip()]
 
 
@@ -295,9 +296,22 @@ _FILE_LOCATION_RE = re.compile(
 # should be called y.py" -- are handled before this and never match.)
 _BUG_CUE_RE = re.compile(
     r"\b(?:bug|buggy|broken|wrong|incorrect|off[\s-]by[\s-]one|crash(?:es|ing)?|fails?|failing|errors?|exception|"
-    r"doesn'?t\s+work|isn'?t\s+working|not\s+working|should(?:n'?t)?|raises?|typo|mistake)\b",
+    r"doesn'?t\s+work|isn'?t\s+working|not\s+working|should(?:n'?t)?|raises?|typo|mistake|"
+    r"(?:too|really|very|far\s+too)\s+slow|slow|hangs?|freezes?|times?\s+out|timeout|leaks?)\b",
     _I,
 )
+_FIX_FAILING_RE = re.compile(
+    r"\b(?:fix|make)\s+(?:all\s+)?(?:the\s+)?(?:failing|broken|red)\s+(?:unit\s+)?tests?\b"
+    r"|\bmake\s+(?:all\s+)?(?:the\s+)?tests?\s+pass\b"
+    r"|\b(?:tests?|test\s+suite|go\s+test|npm\s+test|pytest|cargo\s+test|swift\s+test)\b.*?\b(?:fails?|failing|broken|red)\b",
+    _I,
+)
+
+
+def _is_test_path(path: str) -> bool:
+    return bool(re.search(r"(?:^|/)(?:test_[^/]+\.py|[^/]+_test\.(?:py|go)|[^/]+\.(?:test|spec)\.[jt]sx?|tests?/[^/]+)$", path))
+
+
 _POLITE_LEAD_RE = re.compile(
     r"^(?:(?:please|kindly|now|also|just|then|ok(?:ay)?|hey|so)\s*,?\s+|"
     r"(?:can|could|would|will)\s+you\s+(?:please\s+)?|go\s+ahead\s+and\s+|"
@@ -434,7 +448,14 @@ def _resolve_list(text: str, quotes: list[str], state: TaskParseState, within: s
 
 def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous: list[dict]) -> list[dict] | None:
     """Steps for one clause, or None if it isn't a shape this recognizes."""
-    clause = _POLITE_TAIL_RE.sub("", _POLITE_LEAD_RE.sub("", clause.strip().rstrip(".!?"))).strip()
+    clause = _POLITE_TAIL_RE.sub("", _POLITE_LEAD_RE.sub("", clause.strip().rstrip("."))).strip()
+    # Structural patterns match without closing punctuation; content
+    # ("... that prints Hello, World!") keeps it.
+    if re.search(r"[!?]$", clause) and not re.search(
+        r"\b(?:print|prints|say|says|saying|show|shows|display|displays|output|outputs|message|text|string|reads?)\b",
+        clause, _I,
+    ):
+        clause = clause.rstrip("!?").strip()
     everything = state.files + state.folders
 
     if (m := _RENAME_SYMBOL_RE.match(clause)):
@@ -540,6 +561,23 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
         if not message and (mm := _COMMIT_MESSAGE_RE.search(rest)):
             message = restore_quotes(mm.group("m"), quotes).strip().strip(".")
         return [step("COMMIT", details=message or "")]
+
+    # (Only files named with their extension count here: "the inventory
+    # report" shouldn't turn into report.py.)
+    explicit = [f for f in mentioned_files(clause, state.files)
+                if re.search(rf"(?<![\w/]){re.escape(os.path.basename(f))}\b", clause)]
+    if _FIX_FAILING_RE.search(clause) and not any(not _is_test_path(f) for f in explicit):
+        # "fix the failing tests", "go test fails. fix it", "the tests in
+        # test_x.py fail": run the project's checks and fix the files the
+        # failures point at -- the failures say where the bug is better
+        # than the wording does.
+        return [step("FIX_CHECKS", details=restore_quotes(clause, quotes, keep_marks=True))]
+
+    if previous and previous[-1]["action"] == "FIX_CHECKS" and not mentioned_files(clause, state.files) \
+            and re.match(r"(?:please\s+)?(?:fix|solve|sort\s+out|repair|make|get)\b", clause, _I):
+        # "... fails. fix it" / "fix the code so it passes": the same job.
+        previous[-1]["details"] += ". " + restore_quotes(clause, quotes, keep_marks=True)
+        return []
 
     if _STAGE_RE.match(clause):
         return [step("STAGE")]
@@ -677,11 +715,60 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
     return None
 
 
+_PASTED_OUTPUT_LINE_RE = re.compile(
+    r"^(?:\s{2,}\S|Traceback \(most recent call last\)|\s*File \"|\s*at\s+\S+.*:\d+|"
+    r"[\w.]*(?:Error|Exception|Warning)\b.*:|\s*[\^~]+\s*$|-{5,}|={5,}|FAIL(?:ED)?\b|panic:|---\s*FAIL)"
+)
+
+
+def split_pasted_output(task: str) -> tuple[str, str]:
+    """(request, pasted output): a traceback or test output pasted into the
+    request is evidence for the fix, not sentences to parse."""
+    request_lines, output_lines = [], []
+    for line in task.splitlines():
+        (output_lines if _PASTED_OUTPUT_LINE_RE.match(line) else request_lines).append(line)
+    return " ".join(l.strip() for l in request_lines if l.strip()), "\n".join(output_lines)
+
+
 def parse_task(task: str, files: list[str], folders: list[str]) -> list[dict]:
     """Deterministic plan for `task`. Returns a list of steps; any clause
     this couldn't recognize becomes {"action": "UNPARSED", "details":
     <clause>} in its position, for the caller to hand to a model planner.
     """
+    request, pasted = split_pasted_output(task)
+    steps = _parse_request(request, files, folders)
+    fixes = [s for s in steps if s["action"] == "FIX_CHECKS"]
+    code_edits = [s for s in steps if s["action"] == "EDIT" and not _is_test_path(s["path"])]
+    if fixes and code_edits:
+        # "The tests in test_x.py fail. fix x.py": the named file is the
+        # fix; the failing tests are its context (and get run afterwards).
+        context = ". ".join(f["details"] for f in fixes)
+        for e in code_edits:
+            e["details"] = f"{context}. {e['details']}"
+        steps = [s for s in steps if s["action"] != "FIX_CHECKS"
+                 and not (s["action"] == "EDIT" and _is_test_path(s["path"]))]
+    edits = [s for s in steps if s["action"] == "EDIT"]
+    if len({s["path"] for s in edits}) == 1:
+        # Clauses the parser couldn't place that only describe the problem
+        # ("the data uses 'quantity'", "the total in the report is wrong")
+        # are context for the one file being fixed, not separate work.
+        target = edits[0]["path"]
+        kept = []
+        for s in steps:
+            if s["action"] == "UNPARSED" and set(mentioned_files(s["details"], files)) <= {target} \
+                    and not re.match(r"^(?:create|make|add|write|rename|move|commit|push)\b", s["details"], _I):
+                edits[0]["details"] = s["details"].rstrip(".") + ". " + edits[0]["details"]
+                continue
+            kept.append(s)
+        steps = kept
+    if pasted:
+        for s in steps:
+            if s["action"] in ("EDIT", "UNPARSED"):
+                s["details"] += "\n" + pasted
+    return steps
+
+
+def _parse_request(task: str, files: list[str], folders: list[str]) -> list[dict]:
     text, quotes = protect_quotes(task)
     state = TaskParseState(files, folders)
     steps: list[dict] = []
@@ -745,7 +832,9 @@ def _clean_path(value: str) -> str:
     return "" if value in (".", "..") else value
 
 
-def normalize_model_steps(steps: list[dict], request: str, files: list[str], folders: list[str]) -> list[dict]:
+def normalize_model_steps(
+    steps: list[dict], request: str, files: list[str], folders: list[str], related: tuple[str, ...] = ()
+) -> list[dict]:
     """Ground a model-proposed plan in reality and in the request's own
     words. Drops steps of a kind the request never asked for, steps that
     would re-create something that exists, redundant EDITs of something
@@ -829,7 +918,9 @@ def normalize_model_steps(steps: list[dict], request: str, files: list[str], fol
             # none ("make the ui a green and yellow theme") leaves the
             # choice to the planner -- those edits are marked optional: a
             # file that turns out to need no change is skipped, not fatal.
-            if request_files and target not in request_files:
+            # (`related`: files the named ones import -- "the total in the
+            # report is wrong" is fixed in the module the report uses.)
+            if request_files and target not in request_files and target not in related:
                 continue
             new = step("EDIT", target, details=details or request, optional=not request_files)
         elif action == "CREATE_FILE":
@@ -1087,13 +1178,17 @@ def check_edit(
     return problems
 
 
-def check_new_file(instructions: str, content: str, expectations: bool = True) -> list[str]:
-    """Problems with a freshly written file's `content`."""
+def check_new_file(instructions: str, content: str, expectations: bool = True, code: bool = False) -> list[str]:
+    """Problems with a freshly written file's `content`. For `code`, only
+    quoted wording is required: "a script that reads data.csv and prints
+    the average" describes behavior, it isn't text the file must contain."""
     text, quotes = protect_quotes(instructions)
     problems = []
     if instructions.strip() and not content.strip():
         problems.append("the file came back empty")
     for m in (_SAYS_RE.finditer(text) if expectations else ()):
+        if code and not _PLACEHOLDER_RE.search(m.group("w")):
+            continue
         want = _phrase(m.group("w"), quotes)
         if want and want.lower() not in content.lower():
             problems.append(f"the file should contain {want!r} but doesn't")

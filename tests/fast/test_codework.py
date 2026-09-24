@@ -110,6 +110,40 @@ assert os.listdir(d) == ["db.py", "web.js"] or sorted(os.listdir(d)) == ["db.py"
 eq(c.smoke_targets(["db.py", "web.js", "test_db.py"], d), ["db.py"])
 print("smoke runs OK")
 
+# ---- definitions: kept, not copied, copies removed with their imports ----
+assert c.check_definitions("temps.py", "add an f_to_c function", "def c_to_f(c):\n    return c\n", "def f_to_c(f):\n    return f\n")
+eq(c.check_definitions("temps.py", "rename c_to_f to f_to_c", "def c_to_f(c):\n    return c\n", "def f_to_c(f):\n    return f\n"), [])
+assert c.check_definitions("calc.go", "fix Max", "func Max() {\n}\n", "func Max() {\n}\nfunc TestMax(t *testing.T) {\n}\n", {"TestMax"})
+go = 'package calc\n\nimport "testing"\n\nfunc Max(a, b int) int {\n\treturn a\n}\n\nfunc TestMax(t *testing.T) {\n\tt.Fatal()\n}\n'
+eq(c.drop_definitions("calc.go", go, {"TestMax"}), "package calc\n\nfunc Max(a, b int) int {\n\treturn a\n}\n")
+print("definitions OK")
+
+# ---- documented examples, runnable scripts, crash location ----
+d = project({"duration.py": "def parse_duration(s):\n    \"\"\"'1h30m' -> 90, '45m' -> 45.\"\"\"\n    return 0\n"})
+script = c.docstring_examples_script("duration.py", c.read_text(d, "duration.py"), {"parse_duration"})
+ok, out, _o = c.run_smoke(d, script, "python")
+assert "parse_duration('1h30m') returned 0, but its docstring says 90" in out, out
+eq(c.changed_functions("x.py", "def a():\n    return 1\n\ndef b():\n    return 2\n", "def a():\n    return 1\n\ndef b():\n    return 3\n"), {"b"})
+assert c.runnable_script("avg.py", "import csv\nprint(1)\n") and not c.runnable_script("wc.py", "import sys\nprint(sys.argv[1])\n")
+eq(c.crash_function('File "_s.py", line 4, in <module>\n  File "records.py", line 9, in transform_25\nAttributeError'), "transform_25")
+print("behavior checks OK")
+
+# ---- test runs: failing-test ids, no-tests-ran, tests/ folders, foreign paths ----
+eq(c.failing_tests("FAIL: test_total (test_store.T.test_total)\n--- FAIL: TestMax (0.00s)\nnot ok 1 - spaces\n"),
+   {"test_total (test_store.T.test_total)", "TestMax", "spaces"})
+assert c.no_tests_ran("Ran 0 tests in 0.000s\n\nNO TESTS RAN")
+d = project({"inventory/__init__.py": "", "inventory/store.py": "def total():\n    return 1\n",
+             "tests/test_store.py": "import unittest\nfrom inventory.store import total\n\n\nclass T(unittest.TestCase):\n"
+                                    "    def test_total(self):\n        self.assertEqual(total(), 1)\n"})
+tests = [argv for label, argv in c.detect_checks(d, []) if label == "tests"]
+ok, out = c.run_check(tests[0], d)
+assert ok and "Ran 1 test" in out, (tests, out)
+eq(c.local_imports(d, "tests/test_store.py", c.project_files(d)), ["inventory/store.py"])
+out = ('  File "/opt/local/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/unittest/main.py", line 1\n'
+       '  File "tests/test_store.py", line 7')
+eq(c.files_in_output(out, ["main.py", "tests/test_store.py"], d), ["tests/test_store.py"])
+print("test runs OK")
+
 # ---- code blocks from plain-text replies ----
 eq(t.extract_code_block("Here:\n```python\ndef f():\n    return 1\n```\nDone."), "def f():\n    return 1")
 eq(t.unescape_literal_newlines("a\nb\n", "def f():\\n    return 1"), "def f():\n    return 1")

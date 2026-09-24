@@ -473,18 +473,24 @@ def propose_edit(
             f"requested change."
         )
     else:
-        # Task first, and asking for a correct implementation rather than a
-        # minimal one: measured, "keep every existing line exactly as it
-        # is" pushed the model toward timid, wrong code changes (a
-        # parse_int that returned None for everything).
+        # Task first, asking for a correct implementation rather than a
+        # minimal one, and a function taken from a bigger file shown as if
+        # it were the whole file (it's spliced back in afterwards) --
+        # measured on six single-function fixes: 6/6 this way, 5/6 when
+        # framed as "lines X-Y of the file" or "the function X", and
+        # "keep every existing line exactly as it is" wording produced
+        # timid, wrong changes.
         lang = _FENCE_LANGS.get(os.path.splitext(label)[1].lower(), "")
         prompt = (
             _context_block(context, task, instructions)
             + f"Task: {instructions}\n\n"
             + (f"{feedback}\n\n" if feedback else "")
-            + f"Current {what}:\n```{lang}\n{excerpt}\n```\n\n"
-            + f"Write the complete updated {noun} that does this. Make sure the code actually "
-            f"implements the request correctly; keep unrelated code unchanged."
+            + f"Current {label}:\n```{lang}\n{excerpt}\n```\n\n"
+            + "Write the complete updated file that does this. Make sure the code actually "
+            "implements the request correctly; keep unrelated code unchanged."
+            # (No "standard library only" line here: measured, it cost a
+            # correct answer on one of six single-function fixes. New
+            # files get it, and new scripts are test-run anyway.)
         )
     literal = taskplan.literal_edit(instructions, excerpt)
     if _is_palette_request(label, instructions, excerpt):
@@ -499,12 +505,14 @@ def propose_edit(
             )
             + taskplan.check_structure(label, instructions, excerpt, text, whole_file=original)
             + taskplan.check_comment_request(label, instructions, excerpt, text)
+            + ([] if _is_prose(label) else codework.check_definitions(
+                label, instructions, excerpt, text, elsewhere=codework.names_defined_elsewhere(cwd, label)))
             + (taskplan.check_relevant(instructions, excerpt, text) if speculative else []),
             original=excerpt,
-            repair=lambda text: taskplan.match_indentation(
+            repair=lambda text: _drop_copied(label, excerpt, taskplan.match_indentation(
                 excerpt,
                 taskplan.restore_layout(excerpt, text) if taskplan.looks_reflowed(excerpt, text) else text,
-            ),
+            ), cwd),
             sample_first=bool(feedback),
         )
 
@@ -520,6 +528,17 @@ def propose_edit(
         "updated": updated,
         "summary": f"edited {label}: {instructions}",
     }
+
+
+def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
+    """Remove definitions the model copied in from another file (shown to
+    it as context) -- asked not to, it still did; removing them keeps its
+    actual change."""
+    if _is_prose(label):
+        return text
+    copied = (codework.top_level_names(label, text) - codework.top_level_names(label, before)) \
+        & codework.names_defined_elsewhere(cwd, label)
+    return codework.drop_definitions(label, text, copied) if copied else text
 
 
 def _edit_each_function(label: str, original: str, instructions: str, context: str, task: str) -> str | None:
@@ -639,6 +658,8 @@ def propose_new_file(
         f"What it should contain: {instructions}\n\n"
         f"Write the complete contents of this file -- only the file's own "
         f"contents, no commentary."
+        + ("" if _is_prose(label) else
+           " Use only the standard library and the project's own code unless the project already uses a package.")
     )
     generate = (
         (lambda p, g: fm_structured(_NEW_FILE_SCHEMA, p, g).get("content") or "")
@@ -646,7 +667,7 @@ def propose_new_file(
     )
     content = _generate_checked(
         prompt, generate,
-        lambda text: taskplan.check_new_file(instructions, text, expectations=expectations)
+        lambda text: taskplan.check_new_file(instructions, text, expectations=expectations, code=not _is_prose(label))
         + taskplan.check_structure(label, instructions, "", text),
     )
     if content and not content.endswith("\n"):
@@ -1025,8 +1046,10 @@ def plan_task(
         request = task if whole else s["details"]
         now_files, now_folders = s.get("files", files), s.get("folders", folders)
         raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd)
+        named = taskplan.mentioned_files(request, now_files)
+        related = tuple(r for n in named for r in codework.local_imports(cwd, n, now_files)) if cwd else ()
         try:
-            planned = taskplan.normalize_model_steps(raw, request, now_files, now_folders)
+            planned = taskplan.normalize_model_steps(raw, request, now_files, now_folders, related)
         except ValueError as e:
             planned = [taskplan.step("UNSUPPORTED", details=f"{request!r} ({e})")]
         # The planner's summary of an edit replaces the user's own words
@@ -1077,6 +1100,8 @@ def describe_step(s: dict) -> str:
         return f"move {details} from {path} into {dest}"
     if action == "TEST":
         return "run the tests"
+    if action == "FIX_CHECKS":
+        return "run the tests/checks and fix what fails"
     if action == "RUN":
         return f"run {details}"
     return action.lower()
@@ -1384,6 +1409,36 @@ def _latest_version_from_api(url: str, timeout: float) -> str:
     if not version:
         raise ValueError(f"unexpected response: {data!r}"[:200])
     return version
+
+
+def on_device_problem() -> str | None:
+    """None if the on-device model is ready to use; otherwise what's wrong
+    and how to fix it. Agreeing to Apple's terms is the user's decision --
+    fm-pcc never does it for them, it only points at /license."""
+    try:
+        status = subprocess.run(["fm", "license", "--status"], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return ("the on-device model isn't available: Apple's `fm` command wasn't found. "
+                "fm-pcc needs macOS 27 with Apple Intelligence.")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"couldn't check the on-device model: {e}"
+    text = (status.stdout + status.stderr).strip()
+    if status.returncode != 0 or not re.search(r"\bagreed\b", text, re.IGNORECASE) or re.search(
+        r"\bnot\s+(?:yet\s+)?agreed\b|\bhas\s+not\b", text, re.IGNORECASE
+    ):
+        return ("one-time setup: the on-device model needs you to read and agree to Apple's "
+                "Foundation Models terms first. Type /license to do that now.")
+    try:
+        available = subprocess.run(
+            ["fm", "available", "--model", "system"], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"couldn't check the on-device model: {e}"
+    if available.returncode != 0:
+        reason = (available.stdout + available.stderr).strip() or "unavailable"
+        return (f"the on-device model isn't available yet: {reason}. Make sure Apple Intelligence "
+                f"is turned on in System Settings (and has finished downloading its model).")
+    return None
 
 
 def fetch_latest_version(
@@ -2065,7 +2120,10 @@ class ChatApp(App):
         self._last_quit_time = 0.0
         self._loop_running = False
         self._loop_cancel_requested = False
-        self.subagent_roles: dict[str, str] = {"planning": "cloud-pro", "building": "on-device"}
+        # On-device by default for both roles: fm-pcc works fully offline
+        # from the first launch, with no Shortcuts to install and no cloud
+        # quota. /subagents opts planning into a cloud tier.
+        self.subagent_roles: dict[str, str] = {"planning": "on-device", "building": "on-device"}
         self._message_log: list[Message] = []
         # Everything shown on screen (user, assistant, and system lines like
         # /task plans and diffs) for /export -- _message_log is just the
@@ -2101,7 +2159,17 @@ class ChatApp(App):
         hint = launch_context_hint(os.getcwd())
         if hint:
             self._add_message(Message("system", hint))
+        self._check_on_device_ready()
         self._check_for_update()
+
+    @work(thread=True)
+    def _check_on_device_ready(self) -> None:
+        """Everything fm-pcc does runs on the on-device model by default, so
+        say right away -- not at the first failed request -- if it can't
+        be used yet, and exactly what to do about it."""
+        problem = on_device_problem()
+        if problem:
+            self.call_from_thread(self._log_progress, problem)
 
     @work(thread=True)
     def _check_for_update(self) -> None:
@@ -2386,6 +2454,7 @@ class ChatApp(App):
         "save": "save the conversation: /save <name>",
         "export": "export the transcript: /export [file.md|file.txt|file.json|copy]",
         "run": "run a shell command in this directory and show its output: /run <command>",
+        "license": "read and agree to Apple's on-device model terms (one-time setup)",
         "verify": "turn /task's automatic checks (tests, syntax) on or off: /verify [on|off]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
@@ -2461,6 +2530,8 @@ class ChatApp(App):
             self._handle_save(arg)
         elif name == "export":
             self._handle_export(arg)
+        elif name == "license":
+            self._handle_license()
         elif name == "run":
             if not arg:
                 self._add_message(Message("system", "usage: /run <command>"))
@@ -2563,6 +2634,8 @@ class ChatApp(App):
         self._task_request = task
         self._task_changed: list[str] = []   # files changed in this run
         self._task_created: list[str] = []   # files created in this run
+        self._task_originals: dict[str, str] = {}  # contents before this run first changed them
+        self._task_baseline: set[str] | None = None  # tests failing before this run
         self._task_unverified = False        # code changed since the last check
         start_time = time.monotonic()
         try:
@@ -2580,6 +2653,7 @@ class ChatApp(App):
                 self._log_progress,
                 "plan:\n" + "\n".join(f"{i}. {describe_step(s)}" for i, s in enumerate(steps, 1)),
             )
+            self._task_baseline = self._baseline_failures(cwd, task, steps)
 
             for number, s in enumerate(steps, 1):
                 if self._loop_cancel_requested:
@@ -2659,6 +2733,14 @@ class ChatApp(App):
         if action == "STAGE":
             git_add_all(cwd)
             return "staged all changes"
+
+        if action == "FIX_CHECKS":
+            self._task_unverified = True
+            if not codework.detect_checks(cwd, [], task):
+                raise EditError("couldn't find tests or other checks to run in this project")
+            if not self._verify_changes(cwd):
+                raise EditError("the checks still fail")
+            return "the checks pass"
 
         if action == "TEST":
             checks = [c for c in codework.detect_checks(cwd, [], task) if c[0] == "tests"]
@@ -2757,6 +2839,9 @@ class ChatApp(App):
         self.call_from_thread(
             self._task_step_applied, {"label": rel, "summary": summary}, diff_preview(before, after)
         )
+        originals = getattr(self, "_task_originals", None)
+        if originals is not None and rel not in originals:
+            originals[rel] = before if existed_before else ""
         changed = getattr(self, "_task_changed", None)
         if changed is not None and rel not in changed:
             changed.append(rel)
@@ -2766,22 +2851,88 @@ class ChatApp(App):
         if not _is_prose(rel):
             self._task_unverified = True
 
+    def _baseline_failures(self, cwd: str, task: str, steps: list[dict]) -> set[str] | None:
+        """Tests already failing before this run changes anything, so a
+        change isn't blamed (and "repaired") for them -- seen for real: a
+        pre-existing failure sent the repair loop after unrelated code.
+        None when there's nothing to record (no code changes planned, no
+        test suite, or a request to fix the failing tests themselves)."""
+        if not self._verify_enabled or any(s["action"] == "FIX_CHECKS" for s in steps):
+            return None
+        # A fix request's failing tests are most likely the bug being fixed:
+        # they have to pass afterwards, not be excused.
+        if re.search(r"\b(?:fix|bug|broken|wrong|incorrect|fails?|failing|crash(?:es)?|errors?|off[\s-]by[\s-]one)\b",
+                     task, re.IGNORECASE):
+            return None
+        if not any(s["action"] in ("EDIT", "CREATE_FILE", "RENAME_SYMBOL", "MOVE_CODE") for s in steps):
+            return None
+        tests = [argv for label, argv in codework.detect_checks(cwd, [], task) if label == "tests"]
+        if not tests:
+            return None
+        failing: set[str] = set()
+        for argv in tests:
+            ok, out = codework.run_check(argv, cwd)
+            if not ok and not codework.no_tests_ran(out):
+                failing |= codework.failing_tests(out) or {"<unparsed failure>"}
+        if failing:
+            self.call_from_thread(
+                self._log_progress,
+                f"note: {len(failing)} test(s) already fail before any change -- only new failures will count",
+            )
+        return failing
+
+    def _check_behavior(self, cwd: str) -> tuple[str, list[str], str, str] | None:
+        """Behavior checks that need no model, run on a copy of the project:
+        documented examples of functions this run changed ("'45m' -> 45" in
+        a docstring, or doctests), and new standalone scripts run as-is
+        (seen for real: a new script importing pandas, which wasn't
+        installed). Returns ("behavior", argv, output, file) for the first
+        failure, else None."""
+        for rel in self._task_changed:
+            if not rel.endswith(".py") or not os.path.isfile(os.path.join(cwd, rel)):
+                continue
+            after = codework.read_text(cwd, rel)
+            names = codework.changed_functions(rel, self._task_originals.get(rel, ""), after)
+            script = codework.docstring_examples_script(rel, after, names) if names else None
+            if script:
+                self.call_from_thread(self._log_progress, f"checking: {rel}'s documented examples…")
+                ok, out, _origin = codework.run_smoke(cwd, script, "python")
+                if not ok or (out and "docstring says" in out):
+                    return ("behavior", [f"the documented examples in {rel}"], out, rel)
+            if rel in self._task_created and codework.runnable_script(rel, after):
+                self.call_from_thread(self._log_progress, f"checking: running {rel}…")
+                runner = f"import runpy\nrunpy.run_path({rel!r}, run_name='__main__')\n"
+                ok, out, origin = codework.run_smoke(cwd, runner, "python")
+                if not ok and origin == rel:
+                    return ("behavior", [f"python {rel}"], out, rel)
+        return None
+
     def _write_smoke_script(self, cwd: str, targets: list[str], task: str) -> tuple[str, str] | None:
         """A short script that imports the changed modules and calls what
         the request changed, for run_smoke. None if the model can't write
         one."""
         lang = codework.SMOKE_LANGS[os.path.splitext(targets[0])[1]]
         targets = [t for t in targets if codework.SMOKE_LANGS[os.path.splitext(t)[1]] == lang]
-        sources = "\n\n".join(f"--- {t} ---\n{codework.read_text(cwd, t)[:2500]}" for t in targets)
+        changed = sorted({
+            n for t in targets
+            for n in codework.changed_functions(t, self._task_originals.get(t, ""), codework.read_text(cwd, t))
+        })
+        self._smoke_functions = set(changed)
+        changed_list = ("these functions (changed by this request): " + ", ".join(changed)) if changed \
+            else "the functions or classes this request changed or added"
+        sources = "\n\n".join(
+            f"--- {t} ---\n{codework.excerpt_for(cwd, t, task + ' ' + ' '.join(changed))}" for t in targets
+        )
         how = (
             "import them (by module name, e.g. `import stats` for stats.py)"
             if lang == "python" else "require them (e.g. `require('./stats.js')`)"
         )
         prompt = (
             f"These files were just changed for this request: {task}\n\n{sources}\n\n"
-            f"Write a short {lang} script that {how} and calls the functions or classes this "
-            f"request changed or added, with a few typical inputs, printing the results. Don't use "
-            f"assert, don't read input, and don't create, change, or delete any files."
+            f"Write a short {lang} script that {how} and calls only {changed_list}, with arguments "
+            f"of the right types, printing the results. Use any specific inputs the request itself "
+            f"mentions, plus a few typical ones. Don't use assert, don't read input, and don't "
+            f"create, change, or delete any files."
         )
         try:
             return lang, fm_code(prompt)
@@ -2807,9 +2958,21 @@ class ChatApp(App):
             for label, argv in checks:
                 self.call_from_thread(self._log_progress, f"checking: {label}…")
                 ok, out = codework.run_check(argv, cwd)
+                if not ok and label == "tests" and codework.no_tests_ran(out):
+                    ok = True  # a test command that found nothing hasn't failed
+                baseline = getattr(self, "_task_baseline", None)
+                if not ok and label == "tests" and baseline:
+                    now = codework.failing_tests(out)
+                    if now and now <= baseline:
+                        ok = True  # only the failures that were already there
                 if not ok:
                     failure = (label, argv, out)
                     break
+            if failure is None:
+                failure = self._check_behavior(cwd)
+                if failure is not None and failure[0] == "behavior":
+                    smoke_origin = failure[3]
+                    failure = failure[:3]
             # No test suite to catch a logic error: exercise the changed
             # code with a short model-written script (on a copy of the
             # project) -- seen for real: syntactically valid code that
@@ -2822,6 +2985,14 @@ class ChatApp(App):
                     lang, script = smoke_script
                     self.call_from_thread(self._log_progress, "checking: a quick run of the changed code…")
                     ok, out, origin = codework.run_smoke(cwd, script, lang)
+                    if origin == "timeout" and len(targets) == 1:
+                        origin = targets[0]
+                    elif origin in targets and getattr(self, "_smoke_functions", None):
+                        # A crash inside a function this run didn't touch
+                        # means the script called it wrongly (seen for
+                        # real: an int passed where a dict belongs).
+                        if codework.crash_function(out) not in self._smoke_functions:
+                            origin = None
                     if not ok and origin in targets:
                         failure = ("smoke run", [f"a quick run of {', '.join(targets)}"], out)
                         smoke_origin = origin
@@ -2843,11 +3014,18 @@ class ChatApp(App):
                     f"before anything else (nothing committed). Output:\n{tail}",
                 )
                 return False
+            all_files = codework.project_files(cwd)
             candidates = [f for f in self._task_changed if os.path.isfile(os.path.join(cwd, f))]
-            candidates += [f for f in codework.files_in_output(out, codework.project_files(cwd)) if f not in candidates]
+            candidates += [f for f in codework.files_in_output(out, all_files, cwd) if f not in candidates]
             if not about_tests:
-                candidates = [f for f in candidates if not codework.is_test_file(f)] or candidates
-            pointed = codework.files_in_output(out, candidates)
+                code = [f for f in candidates if not codework.is_test_file(f)]
+                if not code:
+                    # A plain assertion failure only shows the test file:
+                    # the bug is in the code that test imports.
+                    for t in [f for f in candidates if codework.is_test_file(f)]:
+                        code += [m for m in codework.local_imports(cwd, t, all_files) if m not in code]
+                candidates = code or candidates
+            pointed = codework.files_in_output(out, candidates, cwd)
             ordered = pointed + [c for c in candidates if c not in pointed]
             if smoke_origin:
                 # A smoke-run crash: fix exactly the file it came from.
@@ -2856,7 +3034,7 @@ class ChatApp(App):
             # real: expecting 15°C to be 61°F). If the code under test comes
             # back unchanged -- the model standing by it -- try the new test.
             ordered += [
-                f for f in codework.files_in_output(out, self._task_created)
+                f for f in codework.files_in_output(out, self._task_created, cwd)
                 if codework.is_test_file(f) and f not in ordered
             ]
             if not ordered:
@@ -2954,6 +3132,23 @@ class ChatApp(App):
             self._add_message(Message("system", f"couldn't save session '{name}': {e}"))
             return
         self._add_message(Message("system", f"saved session '{name}'"))
+
+    def _handle_license(self) -> None:
+        """Hand the terminal to `fm license` so the user can read Apple's
+        terms and answer its prompt themselves, then re-check."""
+        try:
+            with self.suspend():
+                subprocess.run(["fm", "license"])
+        except FileNotFoundError:
+            self._add_message(Message("system", "Apple's `fm` command wasn't found -- fm-pcc needs macOS 27."))
+            return
+        except Exception as e:
+            self._add_message(Message(
+                "system", f"couldn't open the license prompt here ({e}) -- run `fm license` in a terminal instead."
+            ))
+            return
+        problem = on_device_problem()
+        self._add_message(Message("system", problem or "the on-device model is ready."))
 
     @work(thread=True)
     def _run_shell(self, command: str) -> None:
@@ -3712,7 +3907,7 @@ def main() -> None:
 
     respond_p = sub.add_parser("respond", help="Non-interactive one-shot response")
     respond_p.add_argument("prompt", nargs="?", help="Prompt (reads stdin if omitted)")
-    respond_p.add_argument("-m", "--model", default="cloud-pro", type=_model_arg)
+    respond_p.add_argument("-m", "--model", default="on-device", type=_model_arg)
     _add_shortcut_args(respond_p)
 
     parser.add_argument(

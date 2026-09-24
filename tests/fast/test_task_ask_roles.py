@@ -6,6 +6,8 @@ import fm_pcc.app as m
 async def main():
     app = m.ChatApp()
     async with app.run_test() as pilot:
+        # Roles are honored whatever they're set to (the default is on-device).
+        app.subagent_roles["planning"] = "cloud-pro"
         def sync_call_from_thread(fn, *a, **kw):
             return fn(*a, **kw)
 

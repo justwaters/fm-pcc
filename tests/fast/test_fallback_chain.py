@@ -134,6 +134,7 @@ async def main():
     # ===== /task's planning role falls back and keeps working =====
     app = m.ChatApp()
     async with app.run_test() as pilot:
+        app.subagent_roles["planning"] = "cloud-pro"  # opted into the cloud
         def sync_call_from_thread(fn, *a, **kw):
             return fn(*a, **kw)
 

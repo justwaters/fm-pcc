@@ -339,10 +339,24 @@ def detect_checks(cwd: str, changed: list[str], request: str = "") -> list[tuple
         checks.append(("Swift type check", ["swiftc", "-typecheck", *together]))
 
     files = project_files(cwd)
-    if any(f.endswith(".py") and is_test_file(f) for f in files):
+    py_tests = [f for f in files if f.endswith(".py") and is_test_file(f)]
+    if py_tests:
         has_pytest = subprocess.run([py, "-c", "import pytest"], capture_output=True).returncode == 0
-        checks.append(("tests", [py, "-m", "pytest", "-q"] if has_pytest
-                       else [py, "-m", "unittest", "discover", "-q", "-s", ".", "-p", "*test*.py"]))
+        if has_pytest:
+            checks.append(("tests", [py, "-m", "pytest", "-q"]))
+        else:
+            # unittest only descends into packages, so a tests/ folder
+            # without an __init__.py needs its own discovery root.
+            roots = sorted({
+                "." if "/" not in f or os.path.exists(os.path.join(cwd, os.path.dirname(f), "__init__.py"))
+                else f.split("/", 1)[0]
+                for f in py_tests
+            })
+            for root in roots:
+                # (No -t: with a top level set, unittest refuses a start
+                # folder that isn't a package. `python -m` already puts
+                # the project root on the import path.)
+                checks.append(("tests", [py, "-m", "unittest", "discover", "-q", "-s", root, "-p", "*test*.py"]))
     pkg = os.path.join(cwd, "package.json")
     if os.path.exists(pkg):
         try:
@@ -386,14 +400,61 @@ def run_check(argv: list[str], cwd: str, timeout: float = 120) -> tuple[bool, st
     return r.returncode == 0, _ANSI_RE.sub("", out)
 
 
-def files_in_output(output: str, candidates: list[str]) -> list[str]:
+_NO_TESTS_RE = re.compile(r"NO TESTS RAN|no tests ran|collected 0 items|no test files", re.I)
+
+
+def no_tests_ran(output: str) -> bool:
+    """A test command that found nothing to run hasn't failed."""
+    return bool(_NO_TESTS_RE.search(output))
+
+
+def local_imports(cwd: str, rel: str, files: list[str]) -> list[str]:
+    """Project files that `rel` imports (Python `import x` / `from x import`,
+    JS `require('./x')` / `import ... from './x'`, Go/other: none)."""
+    text = read_text(cwd, rel)
+    names = [a or b for a, b in re.findall(r"^\s*from\s+([\w.]+)\s+import|^\s*import\s+([\w.]+)", text, re.MULTILINE)]
+    names += [a or b for a, b in re.findall(
+        r"require\(\s*['\"](\.{1,2}/[\w./-]+)['\"]\s*\)|from\s+['\"](\.{1,2}/[\w./-]+)['\"]", text)]
+    base = os.path.dirname(rel)
+    out = []
+    for name in names:
+        if name.startswith("."):
+            stem = os.path.normpath(os.path.join(base, name))
+            cands = [stem, f"{stem}.js", f"{stem}.ts", f"{stem}.mjs", f"{stem}/index.js"]
+        else:
+            stem = name.replace(".", "/")
+            cands = [f"{stem}.py", f"{stem}/__init__.py"]
+        for cand in cands:
+            if cand in files and cand not in out and cand != rel:
+                out.append(cand)
+                break
+    return out
+
+
+_FOREIGN_PATH_RE = re.compile(r"/(?:lib/python[\d.]*|site-packages|dist-packages|node_modules|Frameworks|"
+                              r"\.pyenv|\.venv|venv|Cellar|go/pkg|\.cargo)/|^<frozen|^node:")
+
+
+def files_in_output(output: str, candidates: list[str], cwd: str | None = None) -> list[str]:
     """Which of `candidates` a failure's output points at (tracebacks,
-    compiler errors), most-mentioned first."""
-    counts = {}
+    compiler errors), most-mentioned first. Paths inside the language's
+    own install (Python's unittest/main.py, node_modules, ...) never count
+    -- seen for real: unittest's main.py was taken for the project's."""
+    roots = {os.path.realpath(cwd), cwd} if cwd else set()
+    roots |= {r.replace("/private/", "/", 1) for r in roots}
+    counts: dict[str, int] = {}
     for c in candidates:
-        n = len(re.findall(rf"(?<![\w.-]){re.escape(os.path.basename(c))}\b", output))
-        if n:
-            counts[c] = n
+        base = re.escape(os.path.basename(c))
+        for m in re.finditer(rf"(?:^|(?<=[\s\"'(,]))((?:[^\s\"'(,]*/)?{base})(?=[\s\"':),]|$)", output, re.MULTILINE):
+            token = m.group(1)
+            if _FOREIGN_PATH_RE.search(token):
+                continue
+            if token.startswith("/"):
+                if not any(token.startswith(r + os.sep) for r in roots) and not token.endswith("/" + c):
+                    continue
+            elif "/" in token and not (token == c or token.endswith("/" + c) or c.endswith(token.lstrip("./"))):
+                continue
+            counts[c] = counts.get(c, 0) + 1
     return sorted(counts, key=lambda c: -counts[c])
 
 
@@ -459,6 +520,8 @@ def run_smoke(cwd: str, script: str, lang: str, timeout: float = 20) -> tuple[bo
             out = out.replace(prefix + os.sep, "").replace(prefix, ".")
     if ok:
         return True, out, None
+    if out.startswith("timed out"):
+        return False, f"it ran for over {int(timeout)} seconds without finishing (too slow, or stuck in a loop)", "timeout"
     origin = smoke_crash_origin(out, name)
     return origin is None, out, origin
 
@@ -525,3 +588,232 @@ def find_definitions(cwd: str, question: str, limit: int = 8) -> list[str]:
             if len(hits) >= limit:
                 return hits
     return hits
+
+
+def excerpt_for(cwd: str, rel: str, request: str, limit: int = 2500) -> str:
+    """A file as a model should see it for `request` within `limit`
+    characters: all of it if it fits, otherwise the functions the request
+    names in full plus an outline of the rest (a 10 KB file's first 2.5 KB
+    missed the function that had just changed)."""
+    text = read_text(cwd, rel)
+    if len(text) <= limit:
+        return text
+    names = set(re.findall(r"[A-Za-z_$][\w$]*", request))
+    lines = text.splitlines()
+    parts = ["\n".join(lines[s:e]) for n, s, e in function_blocks(rel, text) if n in names]
+    body = "\n\n".join(parts)[:limit]
+    sig = "\n".join(outline(rel, text))
+    return (f"{body}\n\n(other definitions:)\n{sig}" if body else sig or text[:limit])[: limit + 1500]
+
+
+# ---------------------------------------------------------------------------
+# Definition bookkeeping (checks on a code rewrite)
+# ---------------------------------------------------------------------------
+
+def top_level_names(rel: str, text: str) -> set[str]:
+    """Names of top-level functions and classes (Python), or functions
+    found by function_blocks (brace languages, Go)."""
+    if rel.endswith(".py"):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return set()
+        return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    names = {n for n, _s, _e in function_blocks(rel, text)}
+    names |= set(re.findall(r"^\s*(?:export\s+)?class\s+([\w$]+)", text, re.MULTILINE))
+    return names
+
+
+_REMOVING_RE = re.compile(
+    r"\b(?:remove|delete|drop|rename|replace|refactor|convert|move|merge|split|extract|inline|rewrite|"
+    r"consolidate|combine|get\s+rid\s+of|instead\s+of)\b", re.I
+)
+
+
+def check_definitions(rel: str, instructions: str, original: str, updated: str,
+                      elsewhere: set[str] = frozenset()) -> list[str]:
+    """Code-rewrite problems a test suite might not catch:
+    - a definition that existed before is gone, when the request didn't
+      ask to remove/rename/refactor anything (seen for real: asked to add
+      f_to_c, the model replaced c_to_f);
+    - a definition copied in from another file (seen for real: TestMax
+      copied from calc_test.go into calc.go, which Go refuses to build)."""
+    before, after = top_level_names(rel, original), top_level_names(rel, updated)
+    problems = []
+    if not _REMOVING_RE.search(instructions):
+        lost = sorted(before - after)
+        if lost:
+            problems.append(f"existing definitions were removed: {', '.join(lost[:5])} -- keep them and only add or change what was asked")
+    copied = sorted((after - before) & set(elsewhere))
+    if copied:
+        problems.append(f"{', '.join(copied[:5])} already exists in another file -- don't copy it here")
+    return problems
+
+
+def names_defined_elsewhere(cwd: str, rel: str) -> set[str]:
+    """Top-level names defined in other files where a duplicate would
+    clash: the same directory for Go (one package), and test functions
+    anywhere (never meant to be copied into code)."""
+    ext = os.path.splitext(rel)[1]
+    out: set[str] = set()
+    for other in project_files(cwd):
+        if other == rel or os.path.splitext(other)[1] != ext:
+            continue
+        names = top_level_names(other, read_text(cwd, other))
+        if ext == ".go" and os.path.dirname(other) == os.path.dirname(rel):
+            out |= names
+        elif is_test_file(other):
+            out |= {n for n in names if n.lower().startswith("test")}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Documented examples as checks
+# ---------------------------------------------------------------------------
+
+_ARROW_EXAMPLE_RE = re.compile(r"""((?:'[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|\[[^\]]*\]|\([^)]*\)))\s*(?:->|=>|→)\s*"""
+                               r"""('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|True|False|None|\[[^\]]*\]|\{[^}]*\})""")
+
+
+def docstring_examples_script(rel: str, text: str, names: set[str]) -> str | None:
+    """A script that checks the documented examples of Python functions in
+    `names`: real doctests (>>>), and "input -> output" pairs in a
+    docstring ("'1h30m' -> 90, '45m' -> 45"). Prints a mismatch and exits
+    1 if the code disagrees with its own documentation. None if there are
+    no examples to check."""
+    if not rel.endswith(".py"):
+        return None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    module = os.path.splitext(rel)[0].replace("/", ".")
+    checks = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in names:
+            continue
+        doc = ast.get_docstring(node) or ""
+        if ">>>" in doc:
+            checks.append(f"_doctest({node.name!r})")
+            continue
+        if len(node.args.args) != 1:
+            continue
+        for arg, want in _ARROW_EXAMPLE_RE.findall(doc):
+            checks.append(f"_check({node.name!r}, {arg}, {want})")
+    if not checks:
+        return None
+    return (
+        "import doctest, sys\n"
+        f"import {module} as _m\n"
+        "_bad = []\n"
+        "def _check(name, arg, want):\n"
+        "    got = getattr(_m, name)(arg)\n"
+        "    if got != want:\n"
+        "        _bad.append(f'{name}({arg!r}) returned {got!r}, but its docstring says {want!r}')\n"
+        "def _doctest(name):\n"
+        "    f = getattr(_m, name)\n"
+        "    r = doctest.run_docstring_examples(f, {**vars(_m)}, name=name, verbose=False)\n"
+        + "".join(f"{c}\n" for c in checks)
+        + "if _bad:\n"
+        "    print('\\n'.join(_bad))\n"
+        "    sys.exit(1)\n"
+    )
+
+
+def runnable_script(rel: str, text: str) -> bool:
+    """A standalone Python script that can simply be run: it has top-level
+    code or a __main__ block, and needs no arguments or input."""
+    if not rel.endswith(".py") or is_test_file(rel):
+        return False
+    if re.search(r"\bsys\.argv\b|\bargparse\b|\binput\(|\bclick\b|\btyper\b|while\s+True", text):
+        return False
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    return any(
+        not isinstance(n, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign))
+        and not (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant))
+        for n in tree.body
+    )
+
+
+def changed_functions(rel: str, before: str, after: str) -> set[str]:
+    """Names of functions whose text differs between two versions of a
+    file (including ones that are new)."""
+    def blocks(text):
+        lines = text.splitlines()
+        return {n: "\n".join(lines[s:e]) for n, s, e in function_blocks(rel, text)}
+    old, new = blocks(before), blocks(after)
+    return {n for n, body in new.items() if old.get(n) != body}
+
+
+def drop_definitions(rel: str, text: str, names: set[str]) -> str:
+    """Remove the top-level definitions `names` from `text` -- used to undo
+    a model copying a definition in from another file (it kept copying a
+    Go test function into the package, even when told not to)."""
+    lines = text.splitlines()
+    ranges = [(s, e) for n, s, e in function_blocks(rel, text) if n in names]
+    if not ranges:
+        return text
+    drop = set()
+    for s, e in ranges:
+        drop.update(range(s, e))
+    kept = [l for i, l in enumerate(lines) if i not in drop]
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).rstrip("\n")
+    return _drop_unused_imports(rel, out) + ("\n" if text.endswith("\n") else "")
+
+
+def _drop_unused_imports(rel: str, text: str) -> str:
+    """After removing code, remove imports nothing uses any more -- Go
+    refuses to build with one ("testing" imported and not used)."""
+    if rel.endswith(".go"):
+        def used(pkg: str) -> bool:
+            name = pkg.rsplit("/", 1)[-1]
+            body = re.sub(r"(?s)^import\s*\(.*?\)|^import\s+\"[^\"]+\"", "", text, flags=re.MULTILINE)
+            return re.search(rf"\b{re.escape(name)}\.", body) is not None
+        text = re.sub(r'^import\s+"([^"]+)"\n?', lambda m: m.group(0) if used(m.group(1)) else "", text, flags=re.MULTILINE)
+        def block(m):
+            pkgs = re.findall(r'^\s*(?:\w+\s+)?"([^"]+)"', m.group(1), re.MULTILINE)
+            keep = [p for p in pkgs if used(p)]
+            if not keep:
+                return ""
+            return "import (\n" + "".join(f'\t"{p}"\n' for p in keep) + ")"
+        text = re.sub(r"(?s)^import\s*\((.*?)\)", block, text, flags=re.MULTILINE)
+        return re.sub(r"\n{3,}", "\n\n", text)
+    if rel.endswith(".py"):
+        lines = text.splitlines()
+        body = "\n".join(l for l in lines if not re.match(r"(?:import|from)\s", l))
+        out = []
+        for l in lines:
+            m = re.match(r"import\s+([\w.]+)(?:\s+as\s+(\w+))?\s*$", l)
+            if m and not re.search(rf"\b{re.escape(m.group(2) or m.group(1).split('.')[0])}\b", body):
+                continue
+            out.append(l)
+        return "\n".join(out)
+    return text
+
+
+def crash_function(output: str) -> str | None:
+    """The function a Python/Node crash happened in (innermost frame)."""
+    py = re.findall(r'File "[^"]+", line \d+, in ([\w<>]+)', output)
+    if py:
+        return py[-1]
+    js = re.findall(r"^\s*at\s+(?:\S+\.)?([\w$]+)\s+\(", output, re.MULTILINE)
+    return js[0] if js else None
+
+
+_FAILED_TEST_RE = re.compile(
+    r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)"            # unittest
+    r"|^FAILED ([\w/.:\[\]-]+)"                        # pytest -q summary
+    r"|^--- FAIL: (\w+)"                              # go test
+    r"|^not ok \d+ - (.+)$"                           # TAP / node --test
+    r"|^\s*✖ (.+?)(?: \(\d+(?:\.\d+)?ms\))?$",        # node --test spec reporter
+    re.MULTILINE,
+)
+
+
+def failing_tests(output: str) -> set[str]:
+    """Identifiers of the tests a test run reports as failing."""
+    return {next(g for g in m.groups() if g) + (f" ({m.group(2)})" if m.group(1) else "")
+            for m in _FAILED_TEST_RE.finditer(output)}

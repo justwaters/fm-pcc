@@ -50,12 +50,21 @@ uv tool install git+https://github.com/justwaters/fm-pcc
 This puts a `fm-pcc` command on your `PATH` (run `uv tool update-shell`
 once if a fresh shell can't find it), so it works from any directory.
 
+**Everything runs on the on-device model out of the box** — chat,
+`/task`, `/ask`, and `fm-pcc respond` — with no Shortcuts to install, no
+network, and no cloud quota. On launch fm-pcc checks that the model is
+ready and, if it isn't, says exactly what to do: the one piece of setup
+Apple requires is agreeing to its Foundation Models terms once, which
+`/license` opens for you to read and answer (fm-pcc never agrees on your
+behalf), or that Apple Intelligence is turned on and downloaded. Cloud
+tiers are opt-in, below.
+
 The first time you actually use Cloud or Cloud Pro, if its shortcut isn't
 installed yet, `fm-pcc` opens its iCloud share link for you —
 [Cloud](https://www.icloud.com/shortcuts/9f4e45968b974ef7ad8d29eb06f98a9b),
 [Cloud Pro](https://www.icloud.com/shortcuts/7f7f8e41dfee459a89c28ca0b8c60984)
 — tap **Add Shortcut** in the sheet that appears, and it'll pick up from
-there. On-device chat works with no setup at all.
+there.
 
 **Cloud tiers fail sometimes** — a usage limit, a network blip, Cloud
 Pro specifically also requires the signed-in account to have iCloud+
@@ -63,7 +72,7 @@ Pro specifically also requires the signed-in account to have iCloud+
 falling back rather than just showing an error: **cloud-pro → cloud →
 on-device**, in that order, stopping at the first tier that actually
 works. This applies to normal chat and to `/task`'s and `/ask`'s
-planning role (which defaults to Cloud Pro) — `/compare` is the one
+planning role (if you've set it to a cloud tier) — `/compare` is the one
 exception, since it deliberately wants each tier's own real answer (or a
 clear skip) rather than a substituted one. Whichever tier actually
 answered becomes the active model (and, for `/task`/`/ask`, the new
@@ -96,14 +105,16 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   combinations, in varied phrasings — each checked against the resulting
   files and git history; most batches of it were written and run *before*
   tuning anything for them, as an honest measure of how new phrasings
-  fare. `test_agentic_eval.py` is 56 agentic-coding tasks — features,
-  bug fixes (from a description, an error message, or failing tests),
-  refactors across files, writing tests, scaffolding projects, code
-  questions via `/ask` — each judged by *running* the result (the code
-  has to work, not just look right). Its first 24 cases went from 7/24
-  to 24/24; two later batches, written after that tuning, scored 17/20
-  and 8/12 on their first, untuned runs before their failures were fixed.
-  One case is kept as a documented model limitation (see Limitations).
+  fare. `test_agentic_eval.py` is 71 agentic-coding tasks — features,
+  bug fixes (from a description, a pasted traceback, or failing tests),
+  refactors across files, writing tests, scaffolding projects, a
+  multi-module app, Go and Node projects, code questions via `/ask` —
+  each judged by *running* the result (the code has to work, not just
+  look right). Its first 24 cases went from 7/24 to 24/24; three later
+  batches, each written after the previous round of tuning, scored
+  17/20, 8/12, and 9/15 on their first, untuned runs before their
+  failures were fixed. Two cases are kept as documented model
+  limitations (see Limitations).
   `test_on_device_capabilities.py` covers create/rename/move and the
   push/branch gating. A few minutes in total.
   These guard against cases where the model's real behavior didn't match
@@ -142,8 +153,8 @@ Not on by default — git only trusts a hooks path you've explicitly set.
 ```
 fm-pcc                                    # launch the chat TUI (starts on-device)
 fm-pcc --model cloud-pro                  # start the TUI on cloud pro instead
-fm-pcc respond "What is Swift?"           # one-shot, non-interactive (default: cloud-pro)
-fm-pcc respond -m on-device "..."         # one-shot on-device
+fm-pcc respond "What is Swift?"           # one-shot, non-interactive (default: on-device)
+fm-pcc respond -m cloud-pro "..."         # one-shot on cloud pro
 fm-pcc --model ollama                     # start the TUI on Ollama (first model ollama list has)
 fm-pcc --model ollama --ollama-model llama3.2   # ...or a specific one
 ```
@@ -212,6 +223,7 @@ Slash commands, same spirit as `fm chat`:
 | `/resume [name]`             | Resume a saved conversation, or list saved ones        |
 | `/export [file\|copy]`       | Export the transcript as Markdown (or `.txt`/`.json`), or copy it |
 | `/run <command>`             | Run a shell command here and show its output           |
+| `/license`                   | Read and agree to Apple's on-device model terms (one-time setup) |
 | `/verify [on\|off]`          | Turn `/task`'s automatic checks (tests, syntax) on or off |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
@@ -336,14 +348,26 @@ against the agentic-coding suite in `tests/slow/`:
   test`), and anything your request said to run ("running main.py fails
   with…" re-runs main.py). With no test suite, it has the model write a
   short script that calls the changed code and runs it on a copy of the
-  project; only a crash inside your code counts. On a failure it shows
+  project; only a crash inside a function this task changed counts.
+  Two checks need no model at all: documented examples of the functions
+  it changed (doctests, or `'1h30m' -> 90` in a docstring) are run and
+  compared, and a new standalone script is run as-is (catching, say, an
+  import of a package that isn't installed). Tests that already failed
+  before the task started don't count against a new feature (they do
+  for a fix). On a failure it shows
   the model the output and has it fix the file the failure points at, up
   to 3 rounds, trying a test written in the same run if the code under
   test comes back unchanged (a new test can be wrong too). Nothing is
   committed until the checks pass; if they never do, `/task` stops and
   shows the output. `/verify off` turns all of this off.
 - **"Fix the failing test"** edits the code under test, not the test,
-  unless you ask about the test itself.
+  unless you ask about the test itself; "the tests fail, fix it" runs the
+  tests and fixes whatever file the failures point at. A traceback pasted
+  into the request is used as evidence for the fix.
+- **Rewrites are checked for damage:** an "add" request must keep every
+  existing function and class, and a definition copied in from another
+  file (the model copied a Go test function into the package it tests)
+  is removed along with any import it leaves unused.
 
 `/run <command>` runs a shell command in the current directory and shows
 its output — the explicit way to run something `/task` won't run on its
@@ -356,7 +380,7 @@ model-invoked tool is a weaker guarantee anyway, since a model can simply
 choose not to call it.
 
 `/subagents` controls which model plays each of two roles, **planning**
-(planning/judgment calls — defaults to `cloud-pro`) and **building**
+(planning/judgment calls — defaults to `on-device`) and **building**
 (fast/local execution — defaults to `on-device`), used by both `/task`
 (planning whatever the parser can't read, and picking which section of a
 large file to edit) and `/ask` (below). Either role can be
@@ -508,14 +532,25 @@ character and a space.
 - **4096-token context.** The model sees relevant files and outlines, not
   a whole project; a file over about 4 KB is edited one function or
   section at a time.
-- **Logic without tests.** Syntax checks and smoke runs catch code that
-  doesn't compile or crashes, but not code that runs and is simply wrong.
-  The suite's documented case: asked to cache a function's result, the
-  model wrote a cache that's never filled. With a test suite, `/task`
-  runs it and fixes failures; without one, review the diff.
-- **Edge-case reasoning.** Given the failing test output, the model fixes
-  some of its own mistakes but not all (a quoted-field CSV parser never
-  came out right).
+- **Logic without tests or examples.** Syntax checks, smoke runs, and
+  documented examples catch code that doesn't compile, crashes, or
+  contradicts its own docstring — but not code that runs and is simply
+  wrong where nothing says what "right" is. The suite's documented case:
+  asked to cache a function's result, the model wrote a cache that's
+  never filled. With tests (or docstring examples) `/task` checks the
+  behavior and repairs it; without them, review the diff.
+- **Some logic it can't write at all.** A duration parser
+  (`"1h30m"` → 90 minutes) came out wrong in every attempt measured —
+  fixing its own try with the failing example shown, explaining the bug
+  first, and writing it fresh from the examples. fm-pcc catches the wrong
+  result and stops without committing it, but can't make the model get
+  it right. The same held for a quoted-field CSV parser.
+- **Wording sensitivity.** Small prompt changes flip right answers to
+  wrong ones (one added sentence cost one of six single-function fixes),
+  which is why fm-pcc's prompts are measured rather than guessed.
+- **Self-review doesn't work.** Asked whether its own change was correct,
+  the model flagged every wrong change but also 3 of 4 correct ones, so
+  fm-pcc doesn't use it as a check.
 - **Speed.** Each model call takes a few seconds; a task with a failing
   check and several repair rounds can take a minute or two.
 
