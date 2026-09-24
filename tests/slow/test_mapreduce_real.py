@@ -10,6 +10,7 @@ Exit 0 = all passed (or no on-device model here), 1 = any failed.
 """
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -187,7 +188,10 @@ async def commit_big_diff():
     message = subprocess.run(["git", "log", "-1", "--format=%s"], capture_output=True, text=True).stdout.strip()
     if message == "init":
         return ["nothing was committed"]
-    if message.startswith("Update ") or not (3 <= len(message) <= 72):
+    # The fallback when no message could be written lists file names
+    # ("Update module_0.py, module_14.py and 25 more"); anything else is
+    # the model's own description of the diff.
+    if re.search(r"\.py\b", message) or not (3 <= len(message) <= 72):
         return [f"commit message: {message!r}"]
     return []
 

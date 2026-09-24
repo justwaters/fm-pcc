@@ -1764,12 +1764,15 @@ def check_relevant(instructions: str, original: str, updated: str) -> list[str]:
     file): the change has to actually involve the request -- one of its
     words, or a color when colors were asked for. Seen for real: a "make
     the ui green" rewrite of index.html that only moved tags around."""
-    old_tokens, new_tokens = original.split(), updated.split()
+    # Whole changed lines, not just the changed words: changing
+    # SESSION_TTL_SECONDS = 1800 to 3600 only changes "3600", but the line
+    # it's on is plainly about the session the request mentions.
+    old_lines, new_lines = original.splitlines(), updated.splitlines()
     added = []
-    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False).get_opcodes():
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
         if tag in ("replace", "insert"):
-            added.extend(new_tokens[j1:j2])
-    added_text = " ".join(added).lower()
+            added.extend(new_lines[j1:j2])
+    added_text = " ".join(added).lower().replace("_", " ")
     keywords = {w.lower() for w in re.findall(r"[A-Za-z][\w-]{2,}", instructions)} - _STOPWORDS
     if any(k in added_text for k in keywords):
         return []
