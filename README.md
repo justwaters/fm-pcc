@@ -115,8 +115,11 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   17/20, 8/12, and 9/15 on their first, untuned runs before their
   failures were fixed. Two cases are kept as documented model
   limitations (see Limitations).
-  `test_docs_real.py` downloads every doc set fresh and asks each one a
-  question with a known answer. `test_mapreduce_real.py` runs map-reduce (below) on material that
+  `test_docs_real.py` downloads the doc sets fresh (the eight languages
+  and four smaller Apple frameworks) and asks 20 questions with known
+  answers: the passages the search picks must contain the answer every
+  time (that's fm-pcc's code), and at least 17 answers must be right
+  (that's the model, measured at 19). `test_mapreduce_real.py` runs map-reduce (below) on material that
   can't fit the model's window: a ~100 KB project, a ~40 KB attached
   file, a long chat, a big file needing edits in several places, and a
   large diff to describe. `test_on_device_capabilities.py` covers
@@ -409,6 +412,19 @@ latest version of each:
 | Rust | *The Rust Book* and *The Rust Reference* |
 | React | react.dev's Learn and Reference sections |
 
+Plus Apple's framework references from developer.apple.com, grouped under
+**Apple frameworks** in the picker: Swift Standard Library, SwiftUI,
+Foundation, UIKit, AppKit, SwiftData, Foundation Models, Observation,
+Combine, App Intents, WidgetKit, Swift Charts, MapKit, and Core Data.
+These download each framework's own pages — every type, method, and
+article, rendered from Apple's documentation data with Swift declarations,
+availability, and code samples — starting at the framework's top page and
+following its child pages (deprecated symbols skipped). Small frameworks
+take seconds (Foundation Models: 757 pages, ~20 s); the biggest take a
+few minutes (SwiftUI: 7,117 pages, ~2.5 min), and Foundation, UIKit,
+AppKit, and the Swift Standard Library stop at 12,000 pages each (~4.5
+min), reaching their types and main members first.
+
 Choosing a set downloads it in the background — just the docs folders of
 each source (a sparse, shallow git clone; Python's docs archive), a few
 seconds each — then cleans it into text, splits it at headings, and
@@ -417,10 +433,18 @@ eight together are about 4,100 pages. Choosing an installed set offers
 **Update** (to the newest docs) or **Remove**; `/docs update <set>` and
 `/docs remove <set>` do the same.
 
-`/docs <question>` searches the downloaded docs — just the languages the
-question names, if it names any ("in CSS…", "React's useEffect") — and
-answers on-device from the best-matching passages, listing the official
-pages it used. Searching needs no network once a set is downloaded.
+`/docs <question>` searches the downloaded docs — just the languages or
+frameworks the question names, if it names any ("in CSS…", "React's
+useEffect", "SwiftUI's NavigationStack", "LanguageModelSession") — and
+answers on-device from the best-matching passages that fit one window,
+listing the official pages it used. Search is local full-text ranking,
+tuned on questions with known answers: an API the question names as code
+(`enumerate()`, `Array.at`, `@Model`, `LanguageModelSession`) ranks its
+own entry first, operators are searched by name (`?` as "question mark"),
+and Python's reference is split per function. On 20 test questions across
+the languages and Apple frameworks, the passages handed to the model
+contained the answer for all 20, and the model answered 19 correctly.
+Searching needs no network once a set is downloaded.
 
 Installed docs are used automatically, too: `/ask` adds the passages
 relevant to a question; `/task` adds the docs for the language of each
@@ -631,8 +655,10 @@ character and a space.
 - **Docs answers are only as good as the model's reading.** `/docs`
   finds the right pages reliably (and lists them), but the on-device
   model can still blur what it read — asked how Rust's `String` differs
-  from `&str`, it cited the right pages yet mixed the two up. Check the
-  linked pages for anything important.
+  from `&str`, it cited the right pages yet mixed the two up, and asked
+  what `context.WithTimeout` returns "besides the new context", it
+  described only the context. Check the linked pages for anything
+  important.
 - **Speed.** Each model call takes a few seconds; a task with a failing
   check and several repair rounds can take a minute or two, and reading
   a ~100 KB project through map-reduce takes one to two minutes.

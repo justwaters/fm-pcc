@@ -43,6 +43,27 @@ eq(docs.sets_named_in("how do I go about this"), [])
 eq(docs.sets_named_in("context.WithTimeout in Go"), ["go"])
 eq(docs.sets_named_in("React useEffect cleanup"), ["react"])
 eq(docs.sets_for_files(["a.py", "b.tsx", "c.css"]), ["python", "javascript", "css", "react"])
+eq(docs.sets_named_in("How do I stream a LanguageModelSession response?"), ["apple-foundationmodels"])
+q = "In Apple's Foundation Models framework, which class do you create to get responses?"
+terms = docs.query_terms(q, docs.naming_words(q))
+assert '"Foundation"' not in terms and '"Models"' not in terms and '"class"' in terms and '"responses"' in terms, terms
+eq(docs._symbol_title({"title": "Model()", "fragments": [{"text": "macro"}, {"text": " "}, {"text": "Model"}]}), "@Model")
+eq(docs.sets_named_in("SwiftUI NavigationStack with a path"), ["apple-swiftui"])
+eq(docs.sets_named_in("URLSession in Foundation"), ["apple-foundation"])
+assert "apple-foundation" not in docs.sets_named_in("the Foundation Models framework")
+# rendering Apple's DocC JSON
+title, text = docs.render_apple_page({
+    "metadata": {"title": "respond(to:)", "roleHeading": "Instance Method", "platforms": [{"name": "macOS", "introducedAt": "26.0"}]},
+    "abstract": [{"type": "text", "text": "Produces a response to a "}, {"type": "codeVoice", "code": "Prompt"}, {"type": "text", "text": "."}],
+    "primaryContentSections": [
+        {"kind": "declarations", "declarations": [{"languages": ["swift"], "tokens": [{"text": "func "}, {"text": "respond"}, {"text": "(to prompt: String) async throws -> Response"}]}]},
+        {"kind": "content", "content": [{"type": "heading", "level": 2, "text": "Discussion"},
+                                         {"type": "codeListing", "syntax": "swift", "code": ["let r = try await session.respond(to: \"Hi\")"]}]},
+    ],
+})
+eq(title, "respond(to:)")
+assert "Produces a response to a `Prompt`." in text and "func respond(to prompt: String) async throws -> Response" in text
+assert "## Discussion" in text and "session.respond(to:" in text and "macOS 26.0" in text, text
 print("terms / detection OK")
 
 
@@ -84,7 +105,8 @@ async def app_checks():
             assert palette.display and app._picker_handler == app._docs_picked
             labels = [str(palette.get_option_at_index(i).prompt) for i in range(palette.option_count)]
             assert any("Swift" in l and "not downloaded" in l for l in labels), labels
-            eq(palette.option_count, len(docs.SETS))
+            eq(palette.option_count, len(docs.SETS) + 1)  # + the Apple frameworks heading
+            assert any("Apple frameworks" in l for l in labels) and any("SwiftUI" in l for l in labels), labels
 
             # choosing a set downloads it (the worker run inline)
             download = m.ChatApp._run_docs_download.__wrapped__
@@ -108,6 +130,7 @@ async def app_checks():
             answers = []
             with mock.patch.object(app, "call_from_thread", side_effect=lambda fn, *a, **k: fn(*a, **k)), \
                  mock.patch.object(app, "_ask_answered", side_effect=answers.append), \
+                 mock.patch.object(m, "ask_on_device", return_value="guard let optional binding"), \
                  mock.patch.object(m.mapreduce, "answer_over", return_value=("guard let exits early.", [])) as ao:
                 app._run_docs_question.__wrapped__(app, "how does guard let work in Swift?")
             docs_given = ao.call_args.args[1]

@@ -3500,11 +3500,22 @@ class ChatApp(App):
         palette = self.query_one("#palette", OptionList)
         palette.clear_options()
         installed = self._docs.installed()
-        for doc_set in docs.SETS.values():
+        languages = [d for d in docs.SETS.values() if not d.id.startswith("apple-")]
+        apple = [d for d in docs.SETS.values() if d.id.startswith("apple-")]
+        for doc_set in languages:
             marker = "● " if doc_set.id in installed else "○ "
             palette.add_option(Option(
                 f"{marker}{doc_set.name} — {doc_set.description} ({self._docs_status(doc_set.id)})", id=doc_set.id
             ))
+        if apple:
+            palette.add_option(Option("Apple frameworks (developer.apple.com)", id="_header_apple", disabled=True))
+            for i, doc_set in enumerate(apple):
+                marker = "● " if doc_set.id in installed else "○ "
+                branch = "└─" if i == len(apple) - 1 else "├─"
+                name = doc_set.name.removeprefix("Apple · ")
+                palette.add_option(Option(
+                    f"{branch} {marker}{name} ({self._docs_status(doc_set.id)})", id=doc_set.id
+                ))
         palette.highlighted = 0
         palette.display = True
         palette.focus()
@@ -3567,6 +3578,29 @@ class ChatApp(App):
             f"Ask them with /docs <question>; /ask and /task use them automatically.",
         )
 
+    def _docs_search(self, question: str, sets: list[str] | None, limit: int = 12) -> list[dict]:
+        """One plain search (BM25, plus the exact-API boost in
+        docs.Library.search). Measured on 20 questions with known answers:
+        as accurate as merging three searches (with model-suggested
+        keywords, and with the set-naming words dropped), without the
+        extra model call."""
+        return self._docs.search(question, sets, limit=limit)
+
+    @staticmethod
+    def _docs_passages(question: str, hits: list[dict]) -> list[tuple[str, str]]:
+        """The best-ranked passages that fit one on-device window with the
+        question, as (source, text) -- what a /docs answer is read from."""
+        budget = mapreduce.PIECE_CHARS - len(question) - 600
+        chosen, used = [], 0
+        for h in hits:
+            label, body = docs.format_passage(h)
+            body = body[:1400]
+            if used + len(label) + len(body) + 10 > budget and chosen:
+                break
+            chosen.append((label, body))
+            used += len(label) + len(body) + 10
+        return chosen
+
     @work(thread=True)
     def _run_docs_question(self, question: str) -> None:
         """/docs <question>: search the downloaded docs (just the languages
@@ -3576,7 +3610,7 @@ class ChatApp(App):
         try:
             installed = self._docs.installed()
             named = [s for s in docs.sets_named_in(question) if s in installed]
-            hits = self._docs.search(question, named or None, limit=12)
+            hits = self._docs_search(question, named or None)
             if not hits:
                 where = ", ".join(installed[s]["name"] for s in (named or installed))
                 self.call_from_thread(self._ask_answered, f"Nothing in the downloaded docs ({where}) matched that.")
@@ -3585,17 +3619,13 @@ class ChatApp(App):
             # one window are answered from in a single session (measured:
             # sending all 12 through map-reduce made dense pages like
             # Python's stdtypes run past the session time limit).
-            budget = mapreduce.PIECE_CHARS - len(question) - 600
-            chosen, used = [], 0
-            for h in hits:
-                label, body = docs.format_passage(h)
-                body = body[:1400]
-                if used + len(label) + len(body) + 10 > budget and chosen:
-                    break
-                chosen.append((label, body))
-                used += len(label) + len(body) + 10
+            chosen = self._docs_passages(question, hits)
             self.call_from_thread(self._log_progress, f"reading the {len(chosen)} most relevant passages…")
-            answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+            try:
+                answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+            except EditError:
+                # A runaway generation hit the session time limit: once more.
+                answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
             if re.match(r"I read all of it, but found nothing", answer) and len(chosen) < len(hits):
                 # Not in the best few: read all of them, map-reduce style.
                 answer, _sources = mapreduce.answer_over(

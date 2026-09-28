@@ -294,8 +294,9 @@ def _answer_prompt(question: str, evidence: str) -> str:
     return (
         f"Question: {question}\n\n"
         f"Evidence gathered from the material, with where each part came from:\n{evidence}\n\n"
-        "Answer the question using only this evidence. Name the source (in square brackets) "
-        "for each fact you use. If the evidence doesn't answer it, say what's missing."
+        "Answer the question directly in your first sentence, using only this evidence. Then name "
+        "the source (in square brackets) for each fact you used. If the evidence doesn't answer it, "
+        "say what's missing."
     )
 
 
@@ -314,7 +315,8 @@ def answer_over(
         mr._count()
         material = "\n\n".join(f"--- {s} ---\n{t}" for s, t in docs)
         return ask(f"Question: {question}\n\nMaterial:\n{material}\n\n"
-                   "Answer from this material; say which file or source each fact comes from."), [s for s, _ in docs]
+                   "Answer the question directly in your first sentence, using this material. Then say "
+                   "which file or source the answer comes from."), [s for s, _ in docs]
 
     pieces = split_documents(docs, mr.budget_chars - len(question) - 400)
     summary = wants_summary(question)
