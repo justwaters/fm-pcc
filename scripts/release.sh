@@ -40,6 +40,19 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
     exit 1
 fi
 
+# The version above is read from the working copy, but the tag goes on
+# HEAD: with uncommitted changes they can disagree. (It happened: v0.53.1
+# was first tagged on a commit whose __version__ still said 0.54.)
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "error: uncommitted changes -- commit (and push) them first:" >&2
+    git status --short --untracked-files=no >&2
+    exit 1
+fi
+if [ -n "$(git log --oneline @{u}..HEAD 2>/dev/null)" ]; then
+    echo "error: HEAD has commits that aren't pushed -- git push first" >&2
+    exit 1
+fi
+
 # Every commit already ran the fast suite (pre-commit hook); the slow
 # real-model suite only gates releases, since it takes minutes.
 echo "release: running full test suite before tagging ${tag}…"
@@ -49,10 +62,13 @@ notes_file=$(mktemp)
 trap 'rm -f "$notes_file"' EXIT
 
 {
-    echo "## Install this version"
-    echo ""
-    echo "    uv tool install \"git+https://github.com/justwaters/fm-pcc@${tag}\""
-    echo ""
+    # (Skipped when the notes already start with one.)
+    if [ -z "$1" ] || ! grep -q "^## Install this version" "$1"; then
+        echo "## Install this version"
+        echo ""
+        echo "    uv tool install \"git+https://github.com/justwaters/fm-pcc@${tag}\""
+        echo ""
+    fi
     if [ -n "$1" ]; then
         cat "$1"
     else
