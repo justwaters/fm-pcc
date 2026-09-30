@@ -194,4 +194,18 @@ async def verify_loop():
 
 
 asyncio.run(verify_loop())
+
+# the fix excerpt keeps errors, not the warnings around them
+swiftc_out = """A.swift:4:17: warning: no calls to throwing functions occur within 'try' expression
+2 |
+4 |     let m = try await SystemLanguageModel()
+A.swift:13:12: error: cannot convert return expression of type 'Response<String>' to return type 'String'
+13 |     return response
+A.swift:14:1: note: add '.content'
+"""
+kept = c.errors_only(swiftc_out)
+assert "cannot convert" in kept and "no calls to throwing" not in kept and "add '.content'" not in kept, kept
+assert c.errors_only("Traceback ...\nValueError: x") == "Traceback ...\nValueError: x"
+print("errors_only OK")
+
 print("ALL CODEWORK TESTS PASSED")

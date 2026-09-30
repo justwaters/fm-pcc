@@ -51,6 +51,20 @@ eq(docs._symbol_title({"title": "Model()", "fragments": [{"text": "macro"}, {"te
 eq(docs.sets_named_in("SwiftUI NavigationStack with a path"), ["apple-swiftui"])
 eq(docs.sets_named_in("URLSession in Foundation"), ["apple-foundation"])
 assert "apple-foundation" not in docs.sets_named_in("the Foundation Models framework")
+# Swift files bring in the Apple frameworks they import, not all of them
+eq(docs.sets_imported("import SwiftUI\n@preconcurrency import Combine\nimport struct Foundation.URL\nimport Alamofire\n"),
+   ["apple-swiftui", "apple-combine", "apple-foundation"])
+eq(docs.sets_for_files(["App.swift"]), ["swift", "apple-swift"])
+code_root = tempfile.mkdtemp(prefix="fm-pcc-swift-")
+with open(os.path.join(code_root, "ContentView.swift"), "w") as f:
+    f.write("import SwiftUI\nimport SwiftData\n\nstruct ContentView: View {}\n")
+with open(os.path.join(code_root, "Chat.swift"), "w") as f:
+    f.write("import FoundationModels\n")
+eq(docs.sets_for_code(["ContentView.swift"], code_root), ["swift", "apple-swift", "apple-swiftui", "apple-swiftdata"])
+# a new file takes the imports of the project's other Swift files
+eq(docs.sets_for_code(["NewView.swift"], code_root, ["ContentView.swift", "Chat.swift", "notes.md"]),
+   ["swift", "apple-swift", "apple-swiftui", "apple-swiftdata", "apple-foundationmodels"])
+eq(docs.sets_for_code(["main.py"], code_root, ["ContentView.swift"]), ["python"])
 # rendering Apple's DocC JSON
 title, text = docs.render_apple_page({
     "metadata": {"title": "respond(to:)", "roleHeading": "Instance Method", "platforms": [{"name": "macOS", "introducedAt": "26.0"}]},
@@ -64,6 +78,17 @@ title, text = docs.render_apple_page({
 eq(title, "respond(to:)")
 assert "Produces a response to a `Prompt`." in text and "func respond(to prompt: String) async throws -> Response" in text
 assert "## Discussion" in text and "session.respond(to:" in text and "macOS 26.0" in text, text
+# an API page for a code prompt: a macro as it's written, and the page's
+# example that best matches the request
+ref = docs.api_reference([
+    ("Model()", "Macro: Model()\n\nConverts a Swift class into a stored model.\n\nAvailability: macOS 14.0\n\n"
+                "```swift\n@attached(member, names: arbitrary) @attached(memberAttribute) macro Model()\n```"),
+    ("Model() — Overview", "Unrelated:\n\n```swift\nlet container = try ModelContainer(for: Trip.self)\n```\n\n"
+                           "Annotate your model classes:\n\n```swift\n@Model\nclass Note {\n    var title: String\n}\n```"),
+], 600, "add a model class Note with a title")
+assert "@attached" not in ref and "Write it as `@Model`" in ref and "class Note" in ref, ref
+assert "ModelContainer" not in ref and "Availability" not in ref, ref
+print("API reference OK")
 print("terms / detection OK")
 
 
@@ -142,6 +167,63 @@ async def app_checks():
             ctx = m.docs_context(app._docs, "use guard let to unwrap the optional", ["main.swift"])
             assert ctx.startswith("Relevant documentation:") and "guard let" in ctx, ctx
             eq(m.docs_context(app._docs, "use guard let", ["main.py"]), "")  # no Python docs installed
+            # an edit to a SwiftUI file gets SwiftUI's docs; one that
+            # doesn't import SwiftUI doesn't
+            ui = docs.DocSet("apple-swiftui", "Apple · SwiftUI", "fake SwiftUI", lambda w, p: iter([
+                docs.Page("Toggle", "https://developer.apple.com/documentation/swiftui/toggle",
+                          "A control that toggles between on and off states.\n\n    Toggle(\"Dark mode\", isOn: $dark)")]), ())
+            with mock.patch.dict(docs.SETS, {"apple-swiftui": ui}):
+                app._docs.install("apple-swiftui")
+            ctx = m.docs_context(app._docs, "add a switch to turn dark mode on and off", ["ContentView.swift"], root=code_root)
+            assert "developer.apple.com/documentation/swiftui/toggle" in ctx, ctx
+            ctx = m.docs_context(app._docs, "add a switch to turn dark mode on and off", ["Chat.swift"], root=code_root)
+            assert "swiftui/toggle" not in ctx, ctx
+            # the model picks the APIs it needs from real pages, and sees
+            # their declarations and examples first
+            fm_pages = [
+                docs.Page("LanguageModelSession", "https://developer.apple.com/documentation/foundationmodels/languagemodelsession",
+                          "Class: LanguageModelSession\n\nAn object that represents a session that interacts with a language model.\n\n"
+                          "```swift\nfinal class LanguageModelSession\n```\n\n## Overview\n\nCreate a session and prompt it:\n\n"
+                          "```swift\nlet session = LanguageModelSession()\nlet response = try await session.respond(to: prompt)\n```"),
+                docs.Page("respond(to:options:)", "https://developer.apple.com/documentation/foundationmodels/languagemodelsession/respond(to:options:)",
+                          "Instance Method: respond(to:options:)\n\nProduces a response to a prompt."),
+                docs.Page("Prompting an on-device foundation model", "https://developer.apple.com/documentation/foundationmodels/prompting",
+                          "Article: Prompting an on-device foundation model\n\nTailor your prompts to the language model."),
+            ]
+            fmset = docs.DocSet("apple-foundationmodels", "Apple · Foundation Models", "fake", lambda w, p: iter(fm_pages), ())
+            with mock.patch.dict(docs.SETS, {"apple-foundationmodels": fmset}):
+                app._docs.install("apple-foundationmodels")
+            request = "send the prompt to the language model session and return the response text"
+            cands = app._docs.api_candidates(request, ["apple-foundationmodels"])
+            eq([c["title"] for c in cands], ["LanguageModelSession"])  # members count toward their type; no articles
+            eq(cands[0]["summary"], "An object that represents a session that interacts with a language model.")
+            seen = []
+            ctx = m.docs_context(app._docs, request, ["Chat.swift"], 1500, root=code_root,
+                                 pick_apis=lambda req, cs: seen.append(cs) or ["LanguageModelSession"])
+            assert seen and ctx.index("[LanguageModelSession <") < ctx.index("session.respond(to: prompt)"), ctx
+            assert ctx.startswith("Relevant documentation:\n[LanguageModelSession"), ctx
+            # compiler errors answered from the docs: real members, where a
+            # name lives, the shared instance, the documented signatures
+            fm_pages.append(docs.Page("SystemLanguageModel", "https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel",
+                                      "Class: SystemLanguageModel\n\nAn on-device model.\n\n## Getting the default model\n\n"
+                                      "- `default`: The base version of the model.\n\n- `isAvailable`: Whether it's ready."))
+            fm_pages.append(docs.Page("respond(to:options:)", "https://developer.apple.com/documentation/foundationmodels/languagemodelsession/respond(to:options:)",
+                                      "Instance Method: respond(to:options:)\n\nProduces a response.\n\n```swift\nfunc respond(to prompt: String) async throws -> Response<String>\n```"))
+            with mock.patch.dict(docs.SETS, {"apple-foundationmodels": fmset}):
+                app._docs.install("apple-foundationmodels")
+            facts = app._docs.explain_errors(
+                "A.swift:5:36: error: value of type 'SystemLanguageModel' has no member 'respond'\n"
+                "A.swift:6:1: error: instance member 'isAvailable' cannot be used on type 'SystemLanguageModel'\n"
+                "A.swift:7:1: error: no exact matches in call to instance method 'respond'\n"
+                "A.swift:8:1: warning: unrelated", ["apple-foundationmodels"])
+            assert "`respond` isn't on `SystemLanguageModel`; it exists on `LanguageModelSession`" in facts, facts
+            assert "its members are `default`, `isAvailable`" in facts, facts
+            assert "use `SystemLanguageModel.default.isAvailable`" in facts, facts
+            assert "`func respond(to prompt: String) async throws -> Response<String>`" in facts, facts
+            eq(app._docs.explain_errors("A.swift:1:1: error: something else entirely", ["apple-foundationmodels"]), "")
+            print("compiler errors explained from the docs OK")
+            app._docs.remove("apple-foundationmodels")
+            app._docs.remove("apple-swiftui")
             print("docs as /task context OK")
 
             app._handle_command("/docs remove swift")
@@ -153,4 +235,5 @@ async def app_checks():
 
 asyncio.run(app_checks())
 shutil.rmtree(root, ignore_errors=True)
+shutil.rmtree(code_root, ignore_errors=True)
 print("ALL DOCS TESTS PASSED")

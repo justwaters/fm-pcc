@@ -435,6 +435,25 @@ _FOREIGN_PATH_RE = re.compile(r"/(?:lib/python[\d.]*|site-packages|dist-packages
                               r"\.pyenv|\.venv|venv|Cellar|go/pkg|\.cargo)/|^<frozen|^node:")
 
 
+_DIAGNOSTIC_RE = re.compile(r"^\S[^\n]*?:\d+(?::\d+)?:\s*(error|warning|note|remark)\b", re.MULTILINE)
+
+
+def errors_only(output: str) -> str:
+    """Compiler output with its warning and note blocks dropped when there
+    are errors -- measured: swiftc's "no calls to throwing functions occur
+    within 'try'" warnings filled the excerpt the model was shown, and the
+    one real error never reached it."""
+    starts = [(m.start(), m.group(1)) for m in _DIAGNOSTIC_RE.finditer(output)]
+    if not any(kind == "error" for _, kind in starts):
+        return output
+    kept = [output[:starts[0][0]]]
+    for i, (start, kind) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(output)
+        if kind == "error":
+            kept.append(output[start:end])
+    return "".join(kept).strip()
+
+
 def files_in_output(output: str, candidates: list[str], cwd: str | None = None) -> list[str]:
     """Which of `candidates` a failure's output points at (tracebacks,
     compiler errors), most-mentioned first. Paths inside the language's

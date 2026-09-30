@@ -125,6 +125,22 @@ norm = t.normalize_model_steps(  # folder the model forgot to create
     "a.md belongs in docs", ["a.md"], [],
 )
 eq([(s["action"], s["path"]) for s in norm], [("CREATE_FOLDER", "docs"), ("MOVE", "a.md")])
+norm = t.normalize_model_steps(  # "creating" a file that exists: an edit of it
+    [{"action": "CREATE_FILE", "path": "Models.swift", "destination": "", "details": "class Note {}"}],
+    "in Models.swift, add a SwiftData model class Note", ["Models.swift"], [],
+)
+eq([(s["action"], s["path"]) for s in norm], [("EDIT", "Models.swift")])
+norm = t.normalize_model_steps(  # "give X a property": edit wording too
+    [{"action": "CREATE_FILE", "path": "EventBus.swift", "destination": "", "details": "..."}],
+    "in EventBus.swift, give EventBus a publisher property named events", ["EventBus.swift"], [],
+)
+eq([(s["action"], s["path"]) for s in norm], [("EDIT", "EventBus.swift")])
+norm = t.normalize_model_steps(  # ...but a request to commit still isn't an edit
+    [{"action": "EDIT", "path": "a.py", "destination": "", "details": "x"},
+     {"action": "COMMIT", "path": "", "destination": "", "details": "wip"}],
+    "commit everything as wip", ["a.py"], [],
+)
+eq([s["action"] for s in norm], ["COMMIT"])
 print("normalize OK")
 
 # ---- edit checks ----

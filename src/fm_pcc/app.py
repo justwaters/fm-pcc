@@ -986,20 +986,50 @@ MAP_SESSION_TIMEOUT_SECONDS = 45
 
 
 def docs_context(library: "docs.Library", request: str, files: list[str] = (), limit_chars: int = 1500,
-                 extra_sets: list[str] = ()) -> str:
+                 extra_sets: list[str] = (), root: str = ".",
+                 pick_apis: Callable[[str, list[dict]], list[str]] | None = None) -> str:
     """The installed documentation passages most relevant to `request`, as
     a context block of at most `limit_chars` -- only from doc sets that
-    match the files involved or the languages the request names. Empty
-    when nothing relevant is installed."""
+    match the files involved (their language, and the Apple frameworks a
+    Swift file imports) or the languages the request names. Empty when
+    nothing relevant is installed."""
     installed = library.installed()
     if not installed:
         return ""
-    wanted = [s for s in dict.fromkeys([*docs.sets_for_files(files), *docs.sets_named_in(request), *extra_sets])
+    new_swift = any(f.endswith(".swift") and not os.path.isfile(os.path.join(root, f)) for f in files)
+    project = codework.project_files(root, limit=200) if new_swift else ()
+    by_code = docs.sets_for_code(files, root, project)
+    wanted = [s for s in dict.fromkeys([*by_code, *docs.sets_named_in(request), *extra_sets])
               if s in installed]
     if not wanted:
         return ""
-    out, used = [], 0
+    out, used, shown = [], 0, set()
+    # Apple's frameworks are mostly API pages. Plain search matches a
+    # request's words against article prose, so first let the model pick
+    # the APIs it needs from real pages and show it their declarations and
+    # examples -- measured on Swift tasks judged by the compiler, the model
+    # otherwise invents APIs (LanguageModel.response, Observation<Counter>).
+    apple = [s for s in wanted if s.startswith("apple-")]
+    if apple and pick_apis:
+        candidates = library.api_candidates(request, apple)
+        try:
+            chosen = pick_apis(request, candidates) if candidates else []
+        except EditError:
+            chosen = []
+        by_title = {c["title"]: c for c in candidates}
+        for title in chosen[:2]:
+            c = by_title.get(title)
+            if not c:
+                continue
+            ref = docs.api_reference(library.page_passages(c["url"]),
+                                     limit_chars // 2 if len(chosen) > 1 else limit_chars, request)
+            if ref and used + len(ref) <= limit_chars:
+                out.append(f"[{c['title']} <{c['url']}>]\n{ref}")
+                used += len(out[-1])
+                shown.add(c["url"])
     for p in library.search(request, wanted, limit=6):
+        if p["url"] in shown:
+            continue
         block = f"[{p['heading']} <{p['url']}>]\n{p['body']}"
         if used + len(block) > limit_chars:
             if not out:
@@ -1039,6 +1069,25 @@ def judge_files_on_device(prompt: str, paths: list[str]) -> list[dict]:
         }},
     }
     return fm_structured(schema, prompt).get("files") or []
+
+
+def pick_apis_on_device(request: str, candidates: list[dict]) -> list[str]:
+    """The APIs (by page title) a coding request needs, chosen from real
+    documentation pages; the titles are an enum, so the model can't name
+    an API that doesn't exist."""
+    titles = list(dict.fromkeys(c["title"] for c in candidates))
+    listing = "\n".join(f"- {c['title']}: {c['summary']}" for c in candidates)
+    schema = {
+        "type": "object", "title": "APIs", "additionalProperties": False,
+        "properties": {"apis": {"type": "array", "items": {"type": "string", "enum": titles},
+                                "minItems": min(2, len(titles)), "maxItems": 2,
+                                "description": "The one or two APIs the code will use, most important first"}},
+        "required": ["apis"], "x-order": ["apis"],
+    }
+    prompt = (f"Task: {request}\n\nThese APIs are documented:\n{listing}\n\n"
+              "Which two of them will the code for this task use? Pick the main types or modifiers the "
+              "task needs, most important first.")
+    return fm_structured(schema, prompt).get("apis") or []
 
 
 def judge_yes_on_device(prompt: str) -> bool:
@@ -3061,7 +3110,7 @@ class ChatApp(App):
         )
         if s.get("note"):
             context = f"Planner's note for {path}: {s['note']}\n\n{context}"
-        reference = docs_context(self._docs, f"{details} {task}", [path], 1200)
+        reference = docs_context(self._docs, f"{details} {task}", [path], 1800, root=cwd, pick_apis=pick_apis_on_device)
         if reference:
             context = f"{context}\n\n{reference}".strip()
         shared = bool(s.get("shared"))
@@ -3329,7 +3378,7 @@ class ChatApp(App):
                 )
                 break
             label, argv, out = failure
-            tail = out[-1500:]
+            tail = codework.errors_only(out)[-1500:]
             if round_number == VERIFY_ROUNDS:
                 self.call_from_thread(
                     self._log_progress,
@@ -3374,9 +3423,17 @@ class ChatApp(App):
                 )
                 # Look the error itself up in the installed docs for that language.
                 error_lines = " ".join(l for l in out.splitlines()[-6:] if re.search(r"error|Error|exception|cannot|undefined", l))
-                reference = docs_context(self._docs, error_lines or task, [target], 1000)
+                reference = docs_context(self._docs, f"{task} {error_lines}".strip(), [target], 1500, root=cwd,
+                                         pick_apis=pick_apis_on_device)
                 if reference:
                     context = f"{context}\n\n{reference}".strip()
+                # The compiler's "no member"/"cannot find" errors, answered
+                # from the docs: the real members, and where a name lives.
+                installed = self._docs.installed()
+                facts = self._docs.explain_errors(
+                    out, [s for s in docs.sets_for_code([target], cwd) if s.startswith("apple-") and s in installed])
+                if facts:
+                    context = f"{context}\n\nWhat Apple's documentation says about these errors:\n{facts}".strip()
                 try:
                     proposal = propose_edit(
                         target, task, cwd, context=context, task=task, expectations=False,
@@ -3488,7 +3545,8 @@ class ChatApp(App):
         named = [s for s in docs.sets_named_in(text) if s in installed]
         if named:
             return named
-        return [s for s in docs.sets_for_files(codework.project_files(cwd, limit=200)) if s in installed]
+        files = codework.project_files(cwd, limit=200)
+        return [s for s in docs.sets_for_code(files, cwd) if s in installed]
 
     def _docs_status(self, set_id: str) -> str:
         info = self._docs.installed().get(set_id)
@@ -3984,7 +4042,7 @@ class ChatApp(App):
                 definitions = codework.find_definitions(cwd, question)
                 found = ("Definitions matching the question:\n" + "\n".join(definitions) + "\n\n") if definitions else ""
                 reference = docs_context(self._docs, question, codework.project_files(cwd, limit=200), 1500,
-                                         self._relevant_doc_sets(question, cwd))
+                                         self._relevant_doc_sets(question, cwd), root=cwd, pick_apis=pick_apis_on_device)
                 if reference:
                     found += reference + "\n\n"
                 answer = self.backend.classify(

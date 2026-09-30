@@ -119,12 +119,17 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   and four smaller Apple frameworks) and asks 20 questions with known
   answers: the passages the search picks must contain the answer every
   time (that's fm-pcc's code), and at least 17 answers must be right
-  (that's the model, measured at 19). `test_mapreduce_real.py` runs map-reduce (below) on material that
-  can't fit the model's window: a ~100 KB project, a ~40 KB attached
+  (that's the model, measured at 19). `test_swift_docs_real.py` has
+  `/task` write Swift against eight Apple frameworks with their docs
+  installed, 18 tasks judged by `swiftc`: the API each task needs must be
+  among the ones offered to the model every time (fm-pcc's code), and at
+  least 6 must pass (the model; measured 7–12, and 7 without docs); its
+  Apple downloads are cached for a week. `test_mapreduce_real.py` runs
+  map-reduce (below) on material that can't fit the model's window: a ~100 KB project, a ~40 KB attached
   file, a long chat, a big file needing edits in several places, and a
   large diff to describe. `test_on_device_capabilities.py` covers
-  create/rename/move and the push/branch gating. About 15 minutes in
-  total.
+  create/rename/move and the push/branch gating. About 25 minutes in
+  total, plus about 6 minutes the first time to download Apple's docs.
   These guard against cases where the model's real behavior didn't match
   what the code assumed (a small on-device model asked to "create a
   folder" once created a *file* named `test` instead, because `/task` had
@@ -451,6 +456,47 @@ relevant to a question; `/task` adds the docs for the language of each
 file it edits, and when a check fails it looks the error up before asking
 the model to fix it.
 
+For Swift, `/task` goes further with the Apple frameworks you've
+downloaded, because the on-device model's knowledge of Apple's newer APIs
+is thin — on its own it invents them (`LanguageModel.response(to:)`,
+`Observation<Counter>`):
+
+- **Only the frameworks a file imports.** Editing a file that says
+  `import SwiftUI` and `import SwiftData` uses those two sets (plus the
+  Swift Standard Library); a new Swift file uses what the project's other
+  Swift files import.
+- **The APIs it needs, with examples.** fm-pcc lists the framework's
+  types, macros and modifiers whose names or summaries match the request
+  (`LanguageModelSession` from "language model … session", `BarMark` from
+  "a bar chart"), the model picks the one or two it will use — from that
+  list only, so it can't name one that doesn't exist — and the edit is
+  written with their declarations and a code example from Apple's page in
+  view. Macros are shown as they're written (`@Model`), not as their
+  declarations.
+- **Compiler errors answered from the docs.** When the Swift type check
+  fails, the fix round is told what the docs say about each error:
+  "`respond` isn't on `SystemLanguageModel`; it exists on
+  `LanguageModelSession`", the type's real members, "use
+  `SystemLanguageModel.default.isAvailable`", the documented forms of a
+  call that didn't match, or which framework to import for a missing name.
+  The error excerpt it sees also leaves out warnings, which used to crowd
+  the actual error out.
+
+On 18 Swift tasks against Apple's frameworks (Foundation Models, SwiftData,
+SwiftUI, Swift Charts, Observation, Foundation, Combine, MapKit), judged by
+whether `swiftc` accepts the result and it does what was asked, `/task`
+got 7/18 in both runs without docs, and 7 to 12/18 with them (seven
+runs: 10, 12, 10 and 10 with all 14 Apple sets installed; 8, 7 and 8 with
+just those eight) — about 9 on average. The model's results swing from run
+to run, so treat this as "noticeably better", not a fixed number. Some
+tasks it now gets right that it never did without docs (checking
+`SystemLanguageModel` availability, a Foundation Models summarizer, a
+SwiftData `ModelContainer`, an `@Observable` class). Some still fail
+either way (adding a SwiftUI search field, a MapKit map, a `@Generable`
+type), and two that passed without docs got worse with them — the model
+followed the old `URLSession.dataTask` API it was shown instead of
+`data(from:)`, and fumbled Swift Charts' `.value(_:_:)` labels.
+
 ### Map-reduce: past the 4096-token window
 
 The on-device model sees about 4,096 tokens at a time (roughly 13 KB of
@@ -659,6 +705,11 @@ character and a space.
   what `context.WithTimeout` returns "besides the new context", it
   described only the context. Check the linked pages for anything
   important.
+- **Apple's newer APIs.** The model barely knows them; with the
+  frameworks downloaded in `/docs`, `/task` gets about half of the Swift
+  tasks measured against them right (compiled and doing what was asked),
+  versus about 4 in 10 without. Download the frameworks your project imports, and expect
+  to finish some Swift changes yourself.
 - **Speed.** Each model call takes a few seconds; a task with a failing
   check and several repair rounds can take a minute or two, and reading
   a ~100 KB project through map-reduce takes one to two minutes.

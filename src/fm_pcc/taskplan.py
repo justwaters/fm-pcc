@@ -809,7 +809,10 @@ _SIGNALS = {
     "EDIT": r"\b(?:add|append|prepend|insert|change|replace|remove|delete|edit|update|fix|set|rewrite|"
             r"modify|make|turn|put|write|include|sort|bump|increase|decrease|rename|convert|translate|"
             r"capitali[sz]e|uppercase|lowercase|comment|document|refactor|clean|improve|correct|style|"
-            r"theme|restyle|redesign|recolou?r|colou?r)(?:s|es|d|ed|ing)?\b",
+            r"theme|restyle|redesign|recolou?r|colou?r|give|implement|extend|wrap|show|display|support|"
+            r"handle|hook|wire|enable|introduce|attach|connect|replac)(?:s|es|d|ed|ing)?\b"
+            # "in Models.swift, a Note class with a title": an edit of the file it names
+            r"|^\s*in\s+[\w./-]+\.\w+\s*,",
     "PUSH": r"\bpush",
     "PULL": r"\bpull",
     "BRANCH_CREATE": r"\bbranch",
@@ -869,6 +872,10 @@ def normalize_model_steps(
         if action == "CREATE_FILE" and not creation_words and len(request_files) == 1 \
                 and path and path not in files and path in new_names:
             action, path, destination = "RENAME", request_files[0], path
+        # R4: "in Models.swift, add a model class Note" planned as
+        # CREATE_FILE Models.swift -- the file exists, so it's an edit of it.
+        if action == "CREATE_FILE" and path in files and (not request_files or path in request_files):
+            action = "EDIT"
         # R3: an "edit" whose instructions are really a rename/move.
         if action == "EDIT" and (rm := re.match(
             r"^(?:rename|move)\s+(?:it\s+|this\s+file\s+)?(?:to|into)\s+(?P<d>[\w.\-/]+)$", details, _I

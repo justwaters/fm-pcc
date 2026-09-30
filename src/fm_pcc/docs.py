@@ -565,8 +565,21 @@ SETS: dict[str, DocSet] = {s.id: s for s in [
     DocSet("go", "Go", "The Go spec, Effective Go, the FAQ, and the standard library (go.dev)", fetch_go, (".go",)),
     DocSet("rust", "Rust", "The Rust Book and the Rust Reference (doc.rust-lang.org)", fetch_rust, (".rs",)),
     DocSet("react", "React", "react.dev's Learn and Reference sections", fetch_react, (".jsx", ".tsx")),
-    *[DocSet(sid, f"Apple · {name}", desc, fetch_apple(path), (".swift",)) for sid, path, name, desc in APPLE_FRAMEWORKS],
+    # Every Swift file uses the standard library; the other frameworks are
+    # matched by what a file imports (sets_for_code), not its extension.
+    *[DocSet(sid, f"Apple · {name}", desc, fetch_apple(path), (".swift",) if sid == "apple-swift" else ())
+      for sid, path, name, desc in APPLE_FRAMEWORKS],
 ]}
+
+# The Swift module each Apple doc set documents, as written after `import`.
+APPLE_MODULES = {
+    "SwiftUI": "apple-swiftui", "Foundation": "apple-foundation", "UIKit": "apple-uikit",
+    "AppKit": "apple-appkit", "SwiftData": "apple-swiftdata", "FoundationModels": "apple-foundationmodels",
+    "Observation": "apple-observation", "Combine": "apple-combine", "AppIntents": "apple-appintents",
+    "WidgetKit": "apple-widgetkit", "Charts": "apple-charts", "MapKit": "apple-mapkit", "CoreData": "apple-coredata",
+}
+_SWIFT_IMPORT = re.compile(r"^\s*(?:@\w+\s+)*import\s+(?:(?:struct|class|enum|protocol|func|var|let|typealias)\s+)?(\w+)",
+                           re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +711,273 @@ class Library:
             hits.sort(key=lambda h: h["rank"])
         return hits[:limit]
 
+    def api_candidates(self, request: str, sets: Iterable[str], limit: int = 30) -> list[dict]:
+        """API pages (types, macros, functions, view modifiers -- not
+        articles) a coding request might need, for the model to choose
+        from: those whose name the request's words spell out
+        (`LanguageModelSession` from "language model ... session") and
+        those whose summary matches it ("a bar chart" -> BarMark, "Chart
+        content that represents data using bars"). A type's members count
+        toward the type itself, since its page is where the usage example
+        is; only the members of huge protocols (SwiftUI's View modifiers)
+        stand on their own. Each is {title, url, summary}."""
+        sets = list(sets)
+        if not sets or not os.path.exists(self.db_path):
+            return []
+        marks = ",".join("?" * len(sets))
+        wanted = [w for w in _name_words(request) if w not in _STOP]
+        named = {i.lstrip("@").split("(")[0].lower() for i in named_identifiers(request)}
+        terms = query_terms(request)
+        db = self._connect()
+        try:
+            pages = db.execute(f"SELECT title, url, body, doc_set FROM passages WHERE heading = title "
+                               f"AND doc_set IN ({marks})", sets).fetchall()
+            by_summary = db.execute(
+                "SELECT url FROM passages WHERE passages MATCH ? AND heading = title "
+                f"AND doc_set IN ({marks}) ORDER BY bm25(passages, 0.0, 6.0, 3.0, 0.0, 1.0) LIMIT ?",
+                [" OR ".join(terms), *sets, limit * 3],
+            ).fetchall() if terms else []
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            db.close()
+        info = {url: (title, body) for title, url, body, _set in pages}
+        set_of = {url: set_id for _t, url, _b, set_id in pages}
+        members: dict[str, int] = {}
+        for url in info:
+            members[_api_root(url)] = members.get(_api_root(url), 0) + 1
+
+        def key(url: str) -> str | None:
+            """The candidate a page counts toward: its type, or itself when
+            its type is a huge protocol. None for framework pages and
+            articles."""
+            root = _api_root(url)
+            if root == url.rstrip("/") or members.get(root, 0) <= 150:
+                target = root
+            else:
+                target = url
+            if target not in info or target.count("/") < 5:
+                return None
+            title = info[target][0]
+            return None if " " in title.split("(")[0] else target
+
+        score: dict[str, float] = {}
+        for url, (title, _body) in info.items():
+            base = title.lstrip("@").split("(")[0]
+            words = [w for w in _name_words(base.split(".")[-1]) if w not in _STOP]
+            if base.lower() in named or base.split(".")[-1].lower() in named:
+                s_ = 100.0
+            else:
+                hit = sum(any(_close(w, r) for r in wanted) for w in words)
+                s_ = hit * hit / len(words) if words else 0
+            k = key(url) if s_ else None
+            if k:
+                # a member's match counts a little less than the type's own name
+                s_ = s_ if k == url else s_ * 0.8
+                score[k] = max(score.get(k, 0), s_)
+        # Frameworks take turns, so a big general one (Foundation's 12,000
+        # pages of dates and strings) can't crowd out a small specific one
+        # (SwiftData's @Model): the ones the request names go first, the
+        # general-purpose ones last.
+        named_sets = set(sets_named_in(request))
+        order = sorted(sets, key=lambda s_: (s_ not in named_sets, s_ in ("apple-foundation", "apple-swift")))
+        queues = {set_id: sorted((u for u in score if set_of.get(u) == set_id),
+                                 key=lambda u: (-score[u], len(info[u][0]))) for set_id in order}
+        by_name: list[str] = []
+        while any(queues.values()) and len(by_name) < limit // 2:
+            for set_id in order:
+                if queues[set_id] and len(by_name) < limit // 2:
+                    by_name.append(queues[set_id].pop(0))
+        picked: list[str] = list(by_name)
+        for (url,) in by_summary:
+            k = key(url)
+            if k and k not in picked:
+                picked.append(k)
+        simplest: dict[tuple[str, str], str] = {}
+        for url, (title, _b) in info.items():
+            name = (url.rsplit("/", 1)[0], title.split("(")[0])
+            if name not in simplest or len(title) < len(info[simplest[name]][0]):
+                simplest[name] = url
+        out, titles = [], set()
+        for url in picked:
+            url = simplest.get((url.rsplit("/", 1)[0], info[url][0].split("(")[0]), url)
+            title, body = info[url]
+            name = (url.rsplit("/", 1)[0], title.split("(")[0])
+            if name in titles:        # overloads: the first one stands for all
+                continue
+            titles.add(name)
+            out.append({"title": title, "url": url, "summary": _summary(body)})
+            if len(out) == limit:
+                break
+        return out
+
+    def explain_errors(self, output: str, sets: Iterable[str], limit_chars: int = 1200) -> str:
+        """What Apple's docs say about a compiler's complaints: for "value of
+        type 'X' has no member 'y'", X's real members and where a `y` does
+        exist ("respond(to:) belongs to LanguageModelSession"); for "cannot
+        find 'X' in scope", which framework to import for X. Empty when the
+        docs have nothing to add. No model involved: these are facts the
+        model was missing when it wrote the code."""
+        sets = list(sets)
+        if not sets or not os.path.exists(self.db_path):
+            return ""
+        missing_members = list(dict.fromkeys(
+            re.findall(r"(?:value of type|type) '([\w.]+)(?:<[^']*>)?' has no member '(\w+)'", output)))
+        missing_names = list(dict.fromkeys(re.findall(r"cannot find (?:type )?'(\w+)' in scope", output)))
+        on_type = list(dict.fromkeys(re.findall(r"instance member '(\w+)' cannot be used on type '([\w.]+)'", output)))
+        bad_calls = list(dict.fromkeys(re.findall(
+            r"no exact matches in call to (?:static method|instance method|global function|initializer|subscript) '(\w+)'"
+            r"|(?:missing|extra) arguments? (?:for parameters?|labels?|in call)[^\n]*?'(\w+)\(", output)))
+        bad_calls = [a or b for a, b in bad_calls if (a or b) != "init"]
+        if not missing_members and not missing_names and not on_type and not bad_calls:
+            return ""
+        marks = ",".join("?" * len(sets))
+        modules = {v: k for k, v in APPLE_MODULES.items()}
+        out: list[str] = []
+        db = self._connect()
+        try:
+            def page(title: str):
+                return db.execute(f"SELECT url, doc_set FROM passages WHERE heading = ? AND title = ? "
+                                  f"AND doc_set IN ({marks}) ORDER BY length(url) LIMIT 1",
+                                  [title, title, *sets]).fetchone()
+
+            for type_name, member in missing_members[:3]:
+                elsewhere = db.execute(
+                    f"SELECT DISTINCT title, url FROM passages WHERE heading = title AND (title = ? OR title LIKE ?) "
+                    f"AND doc_set IN ({marks}) LIMIT 40", [member, member + "(%", *sets]).fetchall()
+                owners = {}
+                for title, url in elsewhere:
+                    parent = db.execute("SELECT title FROM passages WHERE url = ? LIMIT 1",
+                                        (url.rsplit("/", 1)[0],)).fetchone()
+                    if parent and parent[0] != type_name:
+                        owners.setdefault(parent[0], title)
+                if owners:
+                    out.append(f"`{member}` isn't on `{type_name}`; it exists on " + ", ".join(
+                        f"`{owner}` (as `{title}`)" for owner, title in list(owners.items())[:4]) + ".")
+                found = page(type_name) or page(type_name.split(".")[-1])
+                if found:
+                    names = []
+                    for (body,) in db.execute("SELECT body FROM passages WHERE url = ? ORDER BY rowid", (found[0],)):
+                        names += re.findall(r"^- `([^`]+)`: ", body, re.MULTILINE)
+                    names = [n for n in names if not n.endswith("Implementations") and not n.startswith(type_name + ".")]
+                    if names:
+                        out.append(f"`{type_name}` has no `{member}`; its members are " +
+                                   ", ".join(f"`{n}`" for n in names[:20]) + ".")
+            for member, type_name in on_type[:3]:
+                # SystemLanguageModel.isAvailable -> the type's shared
+                # instance: SystemLanguageModel.default.isAvailable
+                found = page(type_name) or page(type_name.split(".")[-1])
+                if not found:
+                    continue
+                names = []
+                for (body,) in db.execute("SELECT body FROM passages WHERE url = ? ORDER BY rowid", (found[0],)):
+                    names += re.findall(r"^- `(\w+)`: ", body, re.MULTILINE)
+                shared = next((n for n in ("default", "shared", "standard", "current", "main") if n in names), None)
+                if shared:
+                    out.append(f"`{member}` belongs to an instance of `{type_name}`, not the type: "
+                               f"use `{type_name}.{shared}.{member}`.")
+            for name in bad_calls[:2]:
+                # the real signatures: .value(sale.month) -> value(_ label:, _ value:)
+                decls = []
+                for (body,) in db.execute(
+                        f"SELECT body FROM passages WHERE heading = title AND title LIKE ? AND doc_set IN ({marks}) "
+                        f"ORDER BY length(title) LIMIT 8", [name + "(%", *sets]):
+                    d = re.search(r"```swift\n(.*?)\n```", body, re.DOTALL)
+                    if d and d.group(1).strip() not in decls:
+                        decls.append(re.sub(r"\s+", " ", d.group(1)).strip()[:220])
+                if decls:
+                    out.append(f"The documented forms of `{name}` are: " + "; ".join(f"`{d}`" for d in decls[:4]) + ".")
+            for name in missing_names[:4]:
+                found = page(name)
+                if found and found[1] in modules:
+                    out.append(f"`{name}` comes from {modules[found[1]]}: add `import {modules[found[1]]}`.")
+        except sqlite3.OperationalError:
+            return ""
+        finally:
+            db.close()
+        text = "\n".join(f"- {l}" for l in out)
+        return text[:limit_chars]
+
+    def page_passages(self, url: str) -> list[tuple[str, str]]:
+        """A page's passages as (heading, body), in page order."""
+        if not os.path.exists(self.db_path):
+            return []
+        db = self._connect()
+        try:
+            return db.execute("SELECT heading, body FROM passages WHERE url = ? ORDER BY rowid", (url,)).fetchall()
+        finally:
+            db.close()
+
+
+def _api_root(url: str) -> str:
+    """The URL of the type an API page belongs to:
+    .../documentation/foundationmodels/languagemodelsession/respond(to:)
+    -> .../documentation/foundationmodels/languagemodelsession."""
+    head, sep, tail = url.partition("/documentation/")
+    parts = tail.strip("/").split("/")
+    return head + sep + "/".join(parts[:2]) if sep else url
+
+
+def _name_words(text: str) -> list[str]:
+    """Words, with code names split apart: "LanguageModelSession" ->
+    language, model, session; "searchable(text:)" -> searchable, text."""
+    return [w.lower() for w in re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+", text)]
+
+
+def _close(a: str, b: str) -> bool:
+    """The same word, give or take an ending: search/searchable,
+    observable/observation, generate/generation."""
+    if a == b:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= max(4, 0.7 * min(len(a), len(b)))
+
+
+def _summary(body: str) -> str:
+    """The one-line abstract from an API page's first passage (after its
+    "Structure: BarMark" role line)."""
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    for l in lines[1:]:
+        if not l.startswith(("Availability:", "```")):
+            return l[:140]
+    return ""
+
+
+def api_reference(passages: list[tuple[str, str]], limit_chars: int, request: str = "") -> str:
+    """An API page boiled down for a code prompt: its declaration and
+    abstract, then the code example on the page that best matches
+    `request` and fits in `limit_chars`. A macro shows how it's written
+    (`@Model`) rather than its declaration, which the model otherwise
+    copies into the code."""
+    if not passages:
+        return ""
+    first = re.sub(r"^Availability:.*\n?", "", passages[0][1], flags=re.MULTILINE).strip()
+    macro = re.search(r"```swift\n(?:@\w+(?:\([^`]*?\))?\s*)*macro\s+(\w+)[^`]*```", first)
+    if macro:
+        first = first.replace(macro.group(0), f"Write it as `@{macro.group(1)}` before the declaration it applies to.")
+    wanted = {w for w in _name_words(request) if w not in _STOP}
+    examples = []
+    for _h, body in passages[1:]:
+        for m in re.finditer(r"```\w*\n.*?```", body, re.DOTALL):
+            lead = body[:m.start()].strip().split("\n\n")[-1]
+            lead = "" if lead.startswith("```") or len(lead) > 400 else lead
+            text = (lead + "\n\n" if lead else "") + m.group(0)
+            found = {w for w in _name_words(text)}
+            examples.append((len(wanted & found), -len(text), text))
+    room = limit_chars - len(first) - len("\n\nExample:\n")
+    fitting = [e for e in examples if len(e[2]) <= room]
+    example = max(fitting or examples, default=None)
+    text = first if example is None else f"{first}\n\nExample:\n{example[2]}"
+    if len(text) > limit_chars:
+        text = text[:limit_chars].rsplit("\n", 1)[0]
+        if text.count("```") % 2:
+            text += "\n    …\n```"
+    return text
+
 
 _STOP = {"the", "and", "for", "with", "that", "this", "what", "how", "does", "do", "is", "are", "can", "use",
          "using", "which", "when", "why", "where", "should", "would", "could", "into", "from", "about", "there",
@@ -771,6 +1051,31 @@ def sets_for_files(paths: Iterable[str]) -> list[str]:
     """Doc sets that match a project's files by extension."""
     exts = {os.path.splitext(p)[1].lower() for p in paths}
     return [s.id for s in SETS.values() if exts & set(s.extensions)]
+
+
+def sets_imported(code: str) -> list[str]:
+    """Apple doc sets for the frameworks Swift code imports."""
+    found = [APPLE_MODULES.get(m) for m in _SWIFT_IMPORT.findall(code)]
+    return list(dict.fromkeys(s for s in found if s))
+
+
+def sets_for_code(paths: Iterable[str], root: str = ".", project: Iterable[str] = ()) -> list[str]:
+    """Doc sets for the files being worked on: by extension, plus the Apple
+    frameworks their Swift imports. A Swift file that doesn't exist yet
+    takes the imports of the project's other Swift files, since it will
+    most likely use the same frameworks."""
+    paths = list(paths)
+    wanted = sets_for_files(paths)
+    sources = [p for p in paths if p.endswith(".swift")]
+    if any(not os.path.isfile(os.path.join(root, p)) for p in sources):
+        sources += [p for p in project if p.endswith(".swift")][:40]
+    for p in dict.fromkeys(sources):
+        try:
+            with open(os.path.join(root, p), errors="replace") as f:
+                wanted += sets_imported(f.read(20_000))
+        except OSError:
+            continue
+    return list(dict.fromkeys(wanted))
 
 
 # How a question names a language. "go" and "react" are ordinary English
