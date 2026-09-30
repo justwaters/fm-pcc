@@ -435,6 +435,38 @@ _FOREIGN_PATH_RE = re.compile(r"/(?:lib/python[\d.]*|site-packages|dist-packages
                               r"\.pyenv|\.venv|venv|Cellar|go/pkg|\.cargo)/|^<frozen|^node:")
 
 
+_KEEP_STOP = _STOP | {"with", "that", "this", "into", "then", "when", "calls", "call", "show", "shows", "make",
+                      "makes", "value", "values", "list", "item", "items", "name", "names",
+                      "new", "return", "returns", "self", "func", "def", "let", "var", "class", "struct", "true",
+                      "false", "none", "null", "nil", "string", "int", "bool"}
+
+
+def requested_additions(request: str, before: str, current: str) -> list[str]:
+    """Identifiers the task added that the request asks for by name:
+    "...with a button that calls store.increment()" -> `Button`,
+    `increment` -- in the code now, not in the file before the task, and
+    named in the request (any case). A fix for a failing check must keep
+    them: measured, to make SwiftUI code compile, a fix round swapped the
+    requested Button for .onTapGesture and the task counted as done."""
+    words = {w.lower() for w in re.findall(r"[A-Za-z_]\w{2,}", request)} - _KEEP_STOP
+    had = set(re.findall(r"[A-Za-z_]\w*", before))
+    out = []
+    for ident in dict.fromkeys(re.findall(r"[A-Za-z_]\w*", current)):
+        if ident not in had and ident.lower() in words:
+            out.append(ident)
+    return out
+
+
+def check_kept(names: list[str], updated: str) -> list[str]:
+    """Problems when a rewrite dropped any of `names` (see
+    requested_additions)."""
+    gone = [n for n in names if not re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", updated)]
+    if not gone:
+        return []
+    return [f"the fix removed {', '.join(f'`{n}`' for n in gone)}, which the task asked for -- "
+            "fix the error while keeping what was requested"]
+
+
 _DIAGNOSTIC_RE = re.compile(r"^\S[^\n]*?:\d+(?::\d+)?:\s*(error|warning|note|remark)\b", re.MULTILINE)
 
 

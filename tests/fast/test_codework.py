@@ -208,4 +208,26 @@ assert "cannot convert" in kept and "no calls to throwing" not in kept and "add 
 assert c.errors_only("Traceback ...\nValueError: x") == "Traceback ...\nValueError: x"
 print("errors_only OK")
 
+# a fix round must keep what the task added and the request asked for
+before = "import SwiftUI\n\nstruct CounterView: View {\n    var body: some View {\n        Text(\"TODO\")\n    }\n}\n"
+current = before.replace('Text("TODO")', 'Button("Add") { store.increment() }')
+keep = c.requested_additions("show a button that calls store.increment()", before, current)
+assert keep == ["Button", "store", "increment"], keep
+assert c.check_kept(keep, current) == []
+assert "removed `Button`" in c.check_kept(keep, current.replace("Button", "Text"))[0]
+assert c.requested_additions("rename total to grand_total", "total = 1", "grand_total = 1") == ["grand_total"]
+assert c.requested_additions("fix the crash", "x = 1", "x = 2") == []
+d = tempfile.mkdtemp(prefix="fm-pcc-keep-")
+with open(os.path.join(d, "view.py"), "w") as f:
+    f.write("def view(store):\n    return Button('Add', store.increment) + broken\n")
+fixes = iter(["```python\ndef view(store):\n    return Text('Add')\n```",                        # drops Button
+              "```python\ndef view(store):\n    return Button('Add', store.increment)\n```"])  # keeps it
+asked = []
+with mock.patch.object(m, "fm_code", side_effect=lambda p, g=True: asked.append(p) or t.extract_code_block(next(fixes))):
+    out = m.propose_edit("view.py", "fix it", d, feedback="NameError: broken", expectations=False, keep=["Button"])
+assert "Button(" in out["updated"] and len(asked) == 2, out["updated"]
+assert "removed `Button`" in asked[1], asked[1][-300:]
+shutil.rmtree(d, ignore_errors=True)
+print("requested additions kept OK")
+
 print("ALL CODEWORK TESTS PASSED")

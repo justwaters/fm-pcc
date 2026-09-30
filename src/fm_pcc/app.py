@@ -381,6 +381,7 @@ def propose_edit(
     task: str = "",
     feedback: str = "",
     expectations: bool = True,
+    keep: list[str] = (),
 ) -> dict:
     """Ask the on-device model to rewrite `path` (or just `line_range` of
     it, 1-based inclusive) with `instructions` applied.
@@ -398,7 +399,8 @@ def propose_edit(
     it's rejected rather than written. `context` (other files), `task`
     (the whole request this edit is part of), and `feedback` (e.g. a
     failing test's output) go into the prompt only; the checks use
-    `instructions`.
+    `instructions`. `keep`: names the result must still contain (what the
+    task added that a fix mustn't take away).
     """
     full_path = os.path.expanduser(path)
     if not os.path.isabs(full_path):
@@ -515,7 +517,8 @@ def propose_edit(
             + taskplan.check_comment_request(label, instructions, excerpt, text)
             + ([] if _is_prose(label) else codework.check_definitions(
                 label, instructions, excerpt, text, elsewhere=codework.names_defined_elsewhere(cwd, label)))
-            + (taskplan.check_relevant(instructions, excerpt, text) if speculative else []),
+            + (taskplan.check_relevant(instructions, excerpt, text) if speculative else [])
+            + codework.check_kept(list(keep), text),
             original=excerpt,
             repair=lambda text: _drop_copied(label, excerpt, taskplan.match_indentation(
                 excerpt,
@@ -3434,9 +3437,13 @@ class ChatApp(App):
                     out, [s for s in docs.sets_for_code([target], cwd) if s.startswith("apple-") and s in installed])
                 if facts:
                     context = f"{context}\n\nWhat Apple's documentation says about these errors:\n{facts}".strip()
+                # What the task added and asked for by name (a requested
+                # Button) has to survive the fix.
+                current = codework.read_text(cwd, target)
+                keep = codework.requested_additions(task, self._task_originals.get(target, current), current)
                 try:
                     proposal = propose_edit(
-                        target, task, cwd, context=context, task=task, expectations=False,
+                        target, task, cwd, context=context, task=task, expectations=False, keep=keep,
                         feedback=(
                         f"After the change, running `{' '.join(os.path.basename(a) for a in argv)}` "
                         f"fails with:\n{tail}\nFix {target} so it passes."

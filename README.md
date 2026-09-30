@@ -372,9 +372,18 @@ against the agentic-coding suite in `tests/slow/`:
   for a fix). On a failure it shows
   the model the output and has it fix the file the failure points at, up
   to 3 rounds, trying a test written in the same run if the code under
-  test comes back unchanged (a new test can be wrong too). Nothing is
+  test comes back unchanged (a new test can be wrong too). The model sees
+  the errors, not the warnings around them, and a fix may not take away
+  what you asked for: anything the task added that your request names (a
+  requested `Button`, `store.increment()`) has to still be there, or the
+  fix is rejected and retried — seen for real, a fix made SwiftUI code
+  compile by swapping the requested button for a tap gesture. Nothing is
   committed until the checks pass; if they never do, `/task` stops and
   shows the output. `/verify off` turns all of this off.
+- **Edits keep your imports.** A code edit that drops an existing import
+  the request didn't touch is rejected and retried — seen for real,
+  adding `@Observable` to a class also deleted `import SwiftUI`. Requests
+  about imports, cleanup, or switching libraries can still remove them.
 - **"Fix the failing test"** edits the code under test, not the test,
   unless you ask about the test itself; "the tests fail, fix it" runs the
   tests and fixes whatever file the failures point at. A traceback pasted

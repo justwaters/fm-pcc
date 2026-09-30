@@ -1137,6 +1137,19 @@ def _content_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+_IMPORT_LINE_RE = re.compile(r"^(?:@\w+\s+)*(?:import\s+\S|from\s+[\w.]+\s+import\s|#include\s|using\s+[\w.]+;|"
+                             r"(?:const|let|var)\s+[\w{}\s,]+=\s*require\()")
+_IMPORT_REQUEST_RE = re.compile(r"\b(?:imports?|unused|clean\s*up|tidy|refactor|remove|delete|drop|replace|"
+                                r"switch|migrate|instead|dependenc|librar|module|package)", _I)
+
+
+def _import_target(line: str) -> str:
+    """What an import line brings in, ignoring its form: "import os",
+    "import os  # x" -> "os"; "from a.b import c, d" -> "a.b"."""
+    m = re.match(r"^(?:@\w+\s+)*(?:from\s+([\w.]+)|import\s+(?:\w+\s+)?([\w.\"'/@-]+)|#include\s+(\S+))", line)
+    return next((g for g in (m.groups() if m else ()) if g), line)
+
+
 def check_edit(
     instructions: str, original: str, updated: str, code: bool = False, expectations: bool = True
 ) -> list[str]:
@@ -1171,6 +1184,13 @@ def check_edit(
     original_lines = _content_lines(original)
     updated_set = set(_content_lines(updated))
     kept = [line for line in original_lines if line in updated_set]
+    if code and not _IMPORT_REQUEST_RE.search(instructions):
+        # Seen for real: adding @Observable to a class also deleted the
+        # file's `import SwiftUI`, and nothing after it could compile.
+        lost = [line for line in original_lines if _IMPORT_LINE_RE.match(line) and line not in updated_set
+                and not any(_IMPORT_LINE_RE.match(u) and _import_target(u) == _import_target(line) for u in updated_set)]
+        if lost:
+            problems.append(f"imports the request didn't mention were removed: {lost[:3]!r} -- keep them")
     if _ADDITIVE_RE.search(instructions) and not code:
         dropped = [line for line in original_lines if line not in updated_set]
         if dropped:

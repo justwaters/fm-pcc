@@ -298,4 +298,15 @@ eq(t.normalize_model_steps(
     "fix the typo in a.txt", ["a.txt", "b.txt"], []), [])  # named a file: only that file
 print("unnamed-file edits OK")
 
+# a code edit mustn't drop imports it wasn't asked about
+swift = "import SwiftUI\n\nclass Store {\n    var count = 0\n}\n"
+problems = t.check_edit("make Store observable", swift, "@Observable\nclass Store {\n    var count = 0\n}\n", code=True)
+assert any("imports the request didn't mention" in p for p in problems), problems
+assert not t.check_edit("make Store observable", swift,
+                        "import SwiftUI\nimport Observation\n\n@Observable\nclass Store {\n    var count = 0\n}\n", code=True)
+assert not t.check_edit("remove the unused imports", "import os\nimport sys\nprint(sys.argv)\n",
+                        "import sys\nprint(sys.argv)\n", code=True)
+assert not t.check_edit("use sys", "from os import path\nx = 1\n", "from os import path, sep\nx = 2\n", code=True)
+print("imports kept OK")
+
 print("ALL TASKPLAN TESTS PASSED")
