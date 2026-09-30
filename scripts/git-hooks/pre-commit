@@ -3,5 +3,11 @@
 # real-model suite runs before releases instead: tests/run.sh slow.
 set -e
 cd "$(git rev-parse --show-toplevel)"
+# Git runs this hook with GIT_INDEX_FILE (and for some commits GIT_DIR and
+# friends) pointing at the commit being built. The tests make throwaway
+# repos of their own; inheriting these, their `git add`s landed in this
+# commit's index ("invalid object ... for 'archive/new.txt'") and a
+# `git commit -a` failed.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 echo "pre-commit: running fast tests…"
 tests/run.sh fast
