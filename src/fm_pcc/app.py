@@ -518,6 +518,7 @@ def propose_edit(
             + ([] if _is_prose(label) else codework.check_definitions(
                 label, instructions, excerpt, text, elsewhere=codework.names_defined_elsewhere(cwd, label)))
             + (taskplan.check_relevant(instructions, excerpt, text) if speculative else [])
+            + (codework.check_not_copied(cwd, label, excerpt, text) if speculative else [])
             + codework.check_kept(list(keep), text),
             original=excerpt,
             repair=lambda text: _drop_copied(label, excerpt, taskplan.match_indentation(
@@ -598,8 +599,17 @@ def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
     """Remove definitions the model copied in from another file (shown to
     it as context) -- asked not to, it still did; removing them keeps its
     actual change."""
+    # The "--- path ---" headers build_context() puts around other files:
+    # seen for real, a rewrite of report.py started with
+    # "--- inventory/report.py ---", and nothing after it could run.
+    had = set(before.splitlines())
+    text = "\n".join(l for l in text.splitlines()
+                     if l in had or not re.match(r"^--- [\w./ -]+? (?:\(outline\) )?---$", l.strip())) \
+        + ("\n" if text.endswith("\n") else "")
     if _is_prose(label):
         return text
+    if label.endswith(".swift") and os.path.basename(label) != "main.swift":
+        text = codework.drop_copied_statements(cwd, label, before, text)
     copied = (codework.top_level_names(label, text) - codework.top_level_names(label, before)) \
         & codework.names_defined_elsewhere(cwd, label)
     return codework.drop_definitions(label, text, copied) if copied else text
@@ -733,6 +743,9 @@ def propose_new_file(
         prompt, generate,
         lambda text: taskplan.check_new_file(instructions, text, expectations=expectations, code=not _is_prose(label))
         + taskplan.check_structure(label, instructions, "", text),
+        # New files get the same clean-up as edits: seen for real, a new
+        # Shape.swift came back with main.swift's statements pasted in.
+        repair=lambda text: _drop_copied(label, "", text, cwd),
     )
     if content and not content.endswith("\n"):
         content += "\n"
@@ -1261,7 +1274,8 @@ def plan_task(
     parsed = taskplan.parse_task(task, files, folders)
     unparsed = [s for s in parsed if s["action"] == "UNPARSED"]
     if not unparsed:
-        return (_retarget_test_edits(parsed, task, cwd, files) if cwd else parsed), None
+        steps = _retarget_test_edits(parsed, task, cwd, files) if cwd else parsed
+        return (_cover_touched(steps, task, cwd, files) if cwd else steps), None
 
     whole = len(unparsed) == len(parsed)
     steps: list[dict] = []
@@ -1299,8 +1313,106 @@ def plan_task(
         if whole:
             break
     if cwd:
-        steps = _retarget_test_edits(steps, task, cwd, files)
+        steps = _cover_touched(_retarget_test_edits(steps, task, cwd, files), task, cwd, files)
     return steps, model_used
+
+
+_CONTENT_ACTIONS = ("EDIT", "CREATE_FILE")
+
+
+def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> list[dict]:
+    """Make a content-changing plan cover every file the request involves,
+    in dependency order. Measured on changes threaded through several
+    files (a new field from the model through the store to the report and
+    the main script), the plan edited one or two of them and the rest were
+    left calling code that no longer matched.
+
+    - An edit whose instructions name other files but not its own goes to
+      those files instead (seen: "add a debug function to logger.js" sent
+      to config.js).
+    - Each file the request involves (codework.files_touched) without a
+      step gets an optional edit for the whole request -- skipped if it
+      turns out to need no change.
+    - Content edits run definitions-first (codework.dependency_order), so
+      each sees what the edits before it changed."""
+    if not any(s["action"] in _CONTENT_ACTIONS for s in steps) or \
+            any(s["action"] in ("RENAME_SYMBOL", "MOVE_CODE", "FIX_CHECKS", "UNSUPPORTED") for s in steps):
+        return steps
+    def spelled_out(text: str) -> list[str]:
+        """Files `text` names with their extension ("logger.js") -- not a
+        stem that's also a word or a variable ("config.verbose")."""
+        return [f for f in files if re.search(
+            rf"(?<![\w./-])(?:{re.escape(f)}|{re.escape(os.path.basename(f))})(?![\w-])", text)]
+
+    def referred_to(path: str, text: str) -> bool:
+        """`text` names `path` somehow: with its extension, or its stem as a
+        word ("the readme") -- but not a stem used as code (config.verbose)."""
+        stem = os.path.splitext(os.path.basename(path))[0]
+        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", "", text)   # quoted text is content: 'loaded config'
+        return path in spelled_out(text) or bool(re.search(rf"\b{re.escape(stem)}\b(?![.(])", unquoted, re.IGNORECASE))
+
+    fixed: list[dict] = []
+    created: set[str] = set()
+    for s in steps:
+        if s["action"] == "EDIT" and s.get("details"):
+            named = spelled_out(s["details"])
+            # (Not when the step's own file is named too: "add a line to
+            # the readme saying Run main.py to start" stays in the readme.)
+            if named and s["path"] not in named and not referred_to(s["path"], s["details"]):
+                fixed.extend({**s, "path": f, "shared": True} for f in named)
+                continue
+        if s["action"] == "CREATE_FILE":
+            # Seen for real: "create Shape.swift: a Shape protocol", then
+            # "create Shape.swift: make Circle and Square conform to it" --
+            # the second stopped the task ("already exists").
+            if s["path"] in created:
+                fixed.append({**s, "action": "EDIT", "shared": True})
+                continue
+            created.add(s["path"])
+        fixed.append(s)
+    # The same file edited twice for the same request: the second comes
+    # back unchanged, which used to stop the whole task (seen twice). It
+    # stays, as optional -- skipped if there's nothing left to do.
+    seen_edit: set[str] = set()
+    for s in fixed:
+        if s["action"] == "EDIT":
+            if s["path"] in seen_edit:
+                s["optional"] = True
+            seen_edit.add(s["path"])
+    steps = fixed
+    planned = {s["path"] for s in steps if s["action"] in _CONTENT_ACTIONS + ("RENAME", "MOVE")}
+    touched = codework.files_touched(cwd, task, files)
+    for f, names in touched.items():
+        if f in planned:
+            continue
+        what = f" (it defines {', '.join(names)})" if names else ""
+        steps.append(taskplan.step(
+            "EDIT", f, details=task, optional=True, shared=True,
+            note=f"{f} is one of the files this request involves{what}. Change it as far as the request "
+                 f"needs, so it fits the other files' changes -- or leave it as it is if it needs nothing.",
+        ))
+    # Each file's part of the request, spelled out: given only the whole
+    # request, main.py's edit came back unchanged twice and "main.py
+    # applies 10% before printing" never happened.
+    for s in steps:
+        if s["action"] == "EDIT" and (s.get("shared") or s.get("optional")) and s.get("details") == task:
+            part = codework.request_part_for(task, s["path"], touched.get(s["path"], []))
+            if part:
+                s["details"] = f"{task}\n\nThe part of this request about {s['path']}: {part}"
+    # Order: new files first (what the edits will use), then edits with
+    # each file after the files it depends on. A plan that also creates
+    # folders, renames, moves, or commits keeps its own order -- its steps
+    # depend on each other ("create folder test" before "create
+    # test/path.txt", a rename before editing the renamed file).
+    if any(s["action"] not in _CONTENT_ACTIONS for s in steps):
+        return steps
+    creates = [s for s in steps if s["action"] == "CREATE_FILE"]
+    edits = [s for s in steps if s["action"] == "EDIT"]
+    rest = [s for s in steps if s["action"] not in _CONTENT_ACTIONS]
+    order = codework.dependency_order(cwd, list(dict.fromkeys(s["path"] for s in edits)))
+    edits.sort(key=lambda s: order.index(s["path"]))
+    # A file this plan creates is "edited" only after it exists.
+    return creates + edits + rest
 
 
 def describe_step(s: dict) -> str:
@@ -2947,6 +3059,7 @@ class ChatApp(App):
         self._task_created: list[str] = []   # files created in this run
         self._task_originals: dict[str, str] = {}  # contents before this run first changed them
         self._task_baseline: set[str] | None = None  # tests failing before this run
+        self._task_entries_ok: list[str] = []  # programs that ran cleanly before this run
         self._task_unverified = False        # code changed since the last check
         start_time = time.monotonic()
         try:
@@ -2966,6 +3079,7 @@ class ChatApp(App):
                 "plan:\n" + "\n".join(f"{i}. {describe_step(s)}" for i, s in enumerate(steps, 1)),
             )
             self._task_baseline = self._baseline_failures(cwd, task, steps)
+            self._task_entries_ok = self._entries_running(cwd, steps)
 
             for number, s in enumerate(steps, 1):
                 if self._loop_cancel_requested:
@@ -3248,6 +3362,35 @@ class ChatApp(App):
             )
         return failing
 
+    def _entries_running(self, cwd: str, steps: list[dict]) -> list[str]:
+        """The project's programs (main.py, index.js, main.swift...) that
+        run cleanly before this task changes anything; each has to still
+        run cleanly afterwards. Measured: changes threaded through several
+        files passed every syntax check while main.py crashed with
+        "Store.add() got an unexpected keyword argument 'category'"."""
+        if not self._verify_enabled or not any(s["action"] in ("EDIT", "CREATE_FILE", "RENAME_SYMBOL", "MOVE_CODE")
+                                               for s in steps):
+            return []
+        running = []
+        for rel in codework.entry_points(cwd, codework.project_files(cwd)):
+            ok, _out = codework.run_entry(cwd, rel)
+            if ok:
+                running.append(rel)
+        return running
+
+    def _check_entries(self, cwd: str) -> tuple[str, list[str], str] | None:
+        """A program that ran before this task and doesn't now:
+        ("running main.py", argv, output)."""
+        for rel in getattr(self, "_task_entries_ok", []) or []:
+            if not os.path.exists(os.path.join(cwd, rel)):
+                continue
+            self.call_from_thread(self._log_progress, f"checking: running {rel}…")
+            ok, out = codework.run_entry(cwd, rel)
+            if not ok:
+                runner = "swiftc" if rel.endswith(".swift") else ("node" if rel.endswith(".js") else "python")
+                return (f"running {rel}", [runner, rel], out)
+        return None
+
     def _engine(self) -> "mapreduce.MapReduce":
         """A map-reduce engine that reports progress in the chat and stops
         on Esc-Esc."""
@@ -3344,6 +3487,8 @@ class ChatApp(App):
                     failure = (label, argv, out)
                     break
             if failure is None:
+                failure = self._check_entries(cwd)
+            if failure is None:
                 failure = self._check_behavior(cwd)
                 if failure is not None and failure[0] == "behavior":
                     smoke_origin = failure[3]
@@ -3390,6 +3535,13 @@ class ChatApp(App):
                 )
                 return False
             all_files = codework.project_files(cwd)
+            # A missing import is fixed in code, without the model.
+            imported = codework.missing_import_fix(cwd, out, all_files)
+            if imported:
+                rel, before, after = imported
+                self._write_task_change(cwd, rel, before, after, f"added the missing import to {rel}")
+                self.call_from_thread(self._log_progress, f"{label} failed -- added the missing import to {rel}")
+                continue
             candidates = [f for f in self._task_changed if os.path.isfile(os.path.join(cwd, f))]
             candidates += [f for f in codework.files_in_output(out, all_files, cwd) if f not in candidates]
             if not about_tests:

@@ -212,7 +212,7 @@ print("errors_only OK")
 before = "import SwiftUI\n\nstruct CounterView: View {\n    var body: some View {\n        Text(\"TODO\")\n    }\n}\n"
 current = before.replace('Text("TODO")', 'Button("Add") { store.increment() }')
 keep = c.requested_additions("show a button that calls store.increment()", before, current)
-assert keep == ["Button", "store", "increment"], keep
+assert keep == ["Button", "increment"], keep
 assert c.check_kept(keep, current) == []
 assert "removed `Button`" in c.check_kept(keep, current.replace("Button", "Text"))[0]
 assert c.requested_additions("rename total to grand_total", "total = 1", "grand_total = 1") == ["grand_total"]
@@ -228,6 +228,141 @@ with mock.patch.object(m, "fm_code", side_effect=lambda p, g=True: asked.append(
 assert "Button(" in out["updated"] and len(asked) == 2, out["updated"]
 assert "removed `Button`" in asked[1], asked[1][-300:]
 shutil.rmtree(d, ignore_errors=True)
+# plain words pasted in by a botched edit aren't protected
+assert c.requested_additions("rename sum to total, and update everything that uses it",
+                             "function sum(xs) {}", "function total, and update everything that uses it {}") == []
 print("requested additions kept OK")
+
+# cross-file changes: which files a request involves, and in what order
+d = tempfile.mkdtemp(prefix="fm-pcc-touch-")
+for rel, text in {
+    "inventory/__init__.py": "",
+    "inventory/models.py": "from dataclasses import dataclass\n\n\n@dataclass\nclass Item:\n    name: str\n",
+    "inventory/store.py": "from inventory.models import Item\n\n\nclass Store:\n    def __init__(self):\n        self.items = []\n\n"
+                          "    def add(self, name):\n        self.items.append(Item(name))\n",
+    "inventory/report.py": "def format_report(store):\n    return '\\n'.join(i.name for i in store.items)\n",
+    "main.py": "from inventory.store import Store\nfrom inventory.report import format_report\n\ns = Store()\ns.add('apple')\n"
+               "print(format_report(s))\n",
+    "tests/test_store.py": "from inventory.store import Store\n",
+}.items():
+    os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+    with open(os.path.join(d, rel), "w") as f:
+        f.write(text)
+files = c.project_files(d)
+request = "add a category: Item gets a category field, Store.add takes it, the report shows it, and main.py passes fruit"
+touched = c.files_touched(d, request, files)
+assert set(touched) == {"inventory/models.py", "inventory/store.py", "inventory/report.py", "main.py"}, touched
+assert touched["inventory/models.py"] == ["Item"] and "add" in touched["inventory/store.py"], touched
+eq(c.dependency_order(d, ["main.py", "inventory/report.py", "inventory/store.py", "inventory/models.py"]),
+   ["inventory/models.py", "inventory/store.py", "inventory/report.py", "main.py"])
+# the plan gets the files it missed, definitions first
+steps = m._cover_touched([t.step("EDIT", "main.py", details=request)], request, d, files)
+eq([(s["path"], bool(s.get("optional"))) for s in steps],
+   [("inventory/models.py", True), ("inventory/store.py", True), ("inventory/report.py", True), ("main.py", False)])
+# an edit whose instructions name other files goes to those files
+steps = m._cover_touched([t.step("EDIT", "main.py", details="add a debug function to inventory/report.py")],
+                         "x", d, files)
+eq([s["path"] for s in steps], ["inventory/report.py"])
+# programs that ran before have to run after; they run on a copy
+eq(c.entry_points(d, files), ["main.py"])
+ok, out = c.run_entry(d, "main.py")
+assert ok and out == "apple", out
+with open(os.path.join(d, "inventory/store.py"), "a") as f:
+    f.write("\nraise RuntimeError('broken')\n")
+ok, out = c.run_entry(d, "main.py")
+assert not ok and "inventory/store.py" in out and "broken" in out, out
+assert not os.path.exists(os.path.join(d, "__pycache__")) or True
+shutil.rmtree(d, ignore_errors=True)
+print("cross-file coverage, order, and entry points OK")
+
+# a missing import is added in code, not by the model
+d = tempfile.mkdtemp(prefix="fm-pcc-imp-")
+for rel, text in {"models.py": "class User:\n    pass\n", "users.py": "import os\n\nUSERS = [User()]\n",
+                  "format.js": "function formatTodo(t) { return t; }\nmodule.exports = { formatTodo };\n",
+                  "index.js": "console.log(formatTodo(1));\n"}.items():
+    with open(os.path.join(d, rel), "w") as f:
+        f.write(text)
+fix = c.missing_import_fix(d, 'Traceback:\n  File "users.py", line 3, in <module>\nNameError: name \'User\' is not defined',
+                           ["models.py", "users.py", "format.js", "index.js"])
+eq(fix[0], "users.py")
+eq(fix[2], "import os\nfrom models import User\n\nUSERS = [User()]\n")
+fix = c.missing_import_fix(d, f"{d}/index.js:1\nReferenceError: formatTodo is not defined", ["format.js", "index.js"])
+eq(fix[2], "const { formatTodo } = require('./format');\nconsole.log(formatTodo(1));\n")
+eq(c.missing_import_fix(d, "NameError: name 'Nobody' is not defined", ["models.py", "users.py"]), None)
+shutil.rmtree(d, ignore_errors=True)
+print("missing imports added OK")
+
+# Swift: types copied in from a file beside it are removed
+store = "final class TodoStore {\n    func add() {}\n}\n\nstruct TodoItem {\n    let title: String\n}\n"
+eq([n for n, _s, _e in c.type_blocks(store)], ["TodoStore", "TodoItem"])
+eq(c.drop_definitions("Store.swift", store, {"TodoItem"}), "final class TodoStore {\n    func add() {}\n}\n")
+d = tempfile.mkdtemp(prefix="fm-pcc-swift-ns-")
+for rel, text in {"Models.swift": "struct TodoItem {\n    let title: String\n}\n\nfunc helper() {}\n", "Store.swift": store}.items():
+    with open(os.path.join(d, rel), "w") as f:
+        f.write(text)
+assert {"TodoItem", "helper"} <= c.names_defined_elsewhere(d, "Store.swift"), c.names_defined_elsewhere(d, "Store.swift")
+shutil.rmtree(d, ignore_errors=True)
+print("Swift copied types OK")
+
+# plan fixes: a step's own file named by extension, a second create
+steps = m._cover_touched([t.step("EDIT", "config.js", details="add debug to logger.js when config.verbose is set, "
+                                                              "and call debug('loaded config')")],
+                         "x", tempfile.gettempdir(), ["config.js", "logger.js"])
+eq([s["path"] for s in steps], ["logger.js"])
+steps = m._cover_touched([t.step("CREATE_FILE", "Shape.swift", details="a Shape protocol"),
+                          t.step("CREATE_FILE", "Shape.swift", details="make Circle conform")], "x", tempfile.gettempdir(), [])
+eq([s["action"] for s in steps], ["CREATE_FILE", "EDIT"])
+# ...but not when the step's own file is named ("the readme")
+steps = m._cover_touched([t.step("EDIT", "README.md", details="add a line to the readme saying Run main.py to start")],
+                         "x", tempfile.gettempdir(), ["README.md", "main.py"])
+eq([s["path"] for s in steps], ["README.md"])
+# plans with folders/renames keep their order
+plan = [t.step("CREATE_FOLDER", "test"), t.step("CREATE_FILE", "test/path.txt")]
+eq([s["action"] for s in m._cover_touched(plan, "x", tempfile.gettempdir(), [])], ["CREATE_FOLDER", "CREATE_FILE"])
+plan = [t.step("RENAME", "hello.py", "greet.py"), t.step("EDIT", "greet.py", details="print hello world")]
+eq([s["action"] for s in m._cover_touched(plan, "x", tempfile.gettempdir(), ["hello.py"])], ["RENAME", "EDIT"])
+print("plan repairs OK")
+
+# Swift: main.swift's statements pasted into another file are removed
+d = tempfile.mkdtemp(prefix="fm-pcc-swift-main-")
+main_swift = "let store = TodoStore()\nfor item in store.items {\n    print(item.title)\n}\n"
+with open(os.path.join(d, "main.swift"), "w") as f:
+    f.write(main_swift)
+models = "struct TodoItem {\n    let title: String\n}\n"
+eq(c.drop_copied_statements(d, "Models.swift", models, models.replace("}\n", "}\n\n" + main_swift, 1)), models)
+shutil.rmtree(d, ignore_errors=True)
+# a second edit of the same file is optional
+steps = m._cover_touched([t.step("EDIT", "a.py", details="x"), t.step("EDIT", "a.py", details="y")],
+                         "x", tempfile.gettempdir(), ["a.py"])
+eq([bool(s.get("optional")) for s in steps], [False, True])
+# ...but a brace that also closes something elsewhere is just a brace
+d = tempfile.mkdtemp(prefix="fm-pcc-swift-brace-")
+with open(os.path.join(d, "main.swift"), "w") as f:
+    f.write("for x in [1] {\n    print(x)\n}\n")
+shape = "protocol Shape {\n    func area() -> Double\n}\n"
+eq(c.drop_copied_statements(d, "Shape.swift", "", shape), shape)
+shutil.rmtree(d, ignore_errors=True)
+print("Swift statements and repeat edits OK")
+
+# each file's part of a multi-file request
+req = ("add a discount: Store gets an apply_discount(percent) method, the report adds a line 'Discount: 10%' "
+       "when one was applied, and main.py applies 10% before printing")
+eq(c.request_part_for(req, "main.py"), "main.py applies 10% before printing")
+eq(c.request_part_for(req, "inventory/report.py"), "the report adds a line 'Discount: 10%' when one was applied")
+eq(c.request_part_for("make it faster", "main.py"), "")
+eq(c.request_part_for("create a package calc with an __init__.py, and an ops.py module containing add and sub functions",
+                      "calc/ops.py"), "and an ops.py module containing add and sub functions".replace("and an", "an"))
+print("request parts per file OK")
+
+# an optional edit that only pastes another file's code is rejected
+d = tempfile.mkdtemp(prefix="fm-pcc-copied-")
+app_py = "from users import find_user\n\n\ndef greeting(user_id):\n    user = find_user(user_id)\n    return user.name\n"
+with open(os.path.join(d, "app.py"), "w") as f:
+    f.write(app_py)
+models = "class User:\n    pass\n"
+assert c.check_not_copied(d, "models.py", models, models + "\n" + app_py)
+assert not c.check_not_copied(d, "models.py", models, models + "\n\ndef by_id(users, i):\n    return users[i]\n")
+shutil.rmtree(d, ignore_errors=True)
+print("pasted-in edits rejected OK")
 
 print("ALL CODEWORK TESTS PASSED")

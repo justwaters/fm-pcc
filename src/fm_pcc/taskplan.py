@@ -184,11 +184,12 @@ _RENAME_RE = re.compile(
 _RENAME_SYMBOL_RE = re.compile(
     r"^(?:rename|change\s+the\s+name\s+of)\s+(?:the\s+)?"
     r"(?:(?P<kind>function|method|class|variable|var|constant|const|field|property|parameter|param|symbol|identifier)\s+)?"
-    r"(?P<a>[A-Za-z_$][\w$]*)(?:\(\))?(?:\s+(?:function|method|class|variable|constant))?\s+(?:to|as)\s+"
+    r"(?:[A-Za-z_$][\w$]*\.)?(?P<a>[A-Za-z_$][\w$]*)(?:\(\))?(?:\s+(?:function|method|class|variable|constant))?"
+    r"(?:\s+in\s+(?P<f1>[\w./-]+\.\w+))?\s+(?:to|as)\s+"
     r"(?P<b>[A-Za-z_$][\w$]*)(?:\(\))?"
     r"(?P<where>\s+(?:everywhere|in\s+all\s+(?:the\s+)?files|across\s+(?:the\s+)?(?:whole\s+)?(?:project|codebase|repo|code)|"
     r"throughout(?:\s+the\s+(?:project|code|codebase))?))?"
-    r"(?:\s+in\s+(?P<f>[\w./-]+\.\w+))?$",
+    r"(?:\s+in\s+(?P<f>[\w./-]+\.\w+))?(?:,?\s+including\b.*)?$",
     _I,
 )
 _MOVE_CODE_RE = re.compile(
@@ -460,11 +461,24 @@ def parse_clause(clause: str, quotes: list[str], state: TaskParseState, previous
 
     if (m := _RENAME_SYMBOL_RE.match(clause)):
         old_name, new_name = m.group("a"), m.group("b")
-        scope = m.group("f")
-        in_file = resolve_existing(scope, state.files) if scope else None
+        scope = m.group("f") or m.group("f1")
+        # "rename sum in math.js to total": the file says where it's
+        # defined; every use across the project is renamed either way.
+        in_file = resolve_existing(scope, state.files) if m.group("f") else None
+        named_file = bool(m.group("f1") and resolve_existing(m.group("f1"), state.files))
         is_file = resolve_existing(old_name, everything) is not None or "." in old_name
-        if not is_file and (m.group("kind") or m.group("where") or in_file or re.search(r"[_A-Z]", old_name)):
+        if not is_file and (m.group("kind") or m.group("where") or in_file or named_file
+                            or re.search(r"[_A-Z]", old_name)):
             return [step("RENAME_SYMBOL", in_file or "", old_name, details=new_name)]
+
+    # "..., and update everything that uses it" / "including the tests"
+    # after a symbol rename: renaming already covers every use.
+    if previous and previous[-1]["action"] == "RENAME_SYMBOL" and re.match(
+        r"^(?:and\s+)?(?:(?:also\s+)?(?:update|change|fix)\s+(?:everything|all|every\b|the\s+(?:callers|uses|code|references))"
+        r"|including\b|everywhere\b|(?:and\s+)?(?:its|all\s+(?:the\s+)?)\s*(?:callers|uses|usages|references))",
+        clause, _I,
+    ):
+        return []
 
     if (m := _MOVE_CODE_RE.match(clause)):
         src = resolve_existing(_unquote_name(m.group("src"), quotes), state.files)
@@ -835,6 +849,26 @@ def _clean_path(value: str) -> str:
     return "" if value in (".", "..") else value
 
 
+def _requested_without_wording(action: str, path: str, request_files: list[str], new_names: list[str],
+                               lowered: str) -> bool:
+    """Steps the request asks for even without the usual verbs: an EDIT of
+    a file it names ("let callers of get_user in service.py pass a
+    timeout"), unless it's about git or moving files; a CREATE_FILE of a
+    new file it names ("add a validators.py with ...") or of a file named
+    after what it adds ("add a Shape protocol" -> Shape.swift). Measured:
+    all three were dropped and /task said it couldn't work out what to do."""
+    if action == "EDIT":
+        return resolve_existing(path, request_files) is not None and not re.search(
+            r"\b(?:commit|push|pull|branch|rename|move)\b", lowered)
+    if action == "CREATE_FILE" and path:
+        if path in new_names or os.path.basename(path) in new_names:
+            return True
+        stem = os.path.splitext(os.path.basename(path))[0].lower()
+        return bool(re.search(r"\b(?:add|new)\b", lowered)) and len(stem) > 2 and bool(
+            re.search(rf"\b{re.escape(stem)}\b", lowered))
+    return False
+
+
 def normalize_model_steps(
     steps: list[dict], request: str, files: list[str], folders: list[str], related: tuple[str, ...] = ()
 ) -> list[dict]:
@@ -904,7 +938,8 @@ def normalize_model_steps(
         path, destination, details = raw["path"], raw["destination"], raw["details"]
 
         signal = _SIGNALS.get(action)
-        if signal and not re.search(signal, lowered):
+        if signal and not re.search(signal, lowered) and not _requested_without_wording(
+                action, path, request_files, new_names, lowered):
             continue
 
         if action in ("CREATE_FILE", "CREATE_FOLDER") and not path and destination:
@@ -1146,6 +1181,9 @@ _IMPORT_REQUEST_RE = re.compile(r"\b(?:imports?|unused|clean\s*up|tidy|refactor|
 def _import_target(line: str) -> str:
     """What an import line brings in, ignoring its form: "import os",
     "import os  # x" -> "os"; "from a.b import c, d" -> "a.b"."""
+    req = re.search(r"require\(\s*['\"]([^'\"]+)['\"]\s*\)", line)
+    if req:
+        return req.group(1)
     m = re.match(r"^(?:@\w+\s+)*(?:from\s+([\w.]+)|import\s+(?:\w+\s+)?([\w.\"'/@-]+)|#include\s+(\S+))", line)
     return next((g for g in (m.groups() if m else ()) if g), line)
 

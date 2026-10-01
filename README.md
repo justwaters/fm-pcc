@@ -127,7 +127,15 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   Apple downloads are cached for a week. `test_mapreduce_real.py` runs
   map-reduce (below) on material that can't fit the model's window: a ~100 KB project, a ~40 KB attached
   file, a long chat, a big file needing edits in several places, and a
-  large diff to describe. `test_on_device_capabilities.py` covers
+  large diff to describe. `test_crossfile_real.py` is 12 changes that
+  have to be threaded through several files (a field from the model to
+  the output, a parameter passed down three layers, a return type and
+  its callers, a feature spanning three modules) in Python, JavaScript
+  and Swift, each judged by running the program; written before any of
+  the cross-file work, they went from 0/12 (both baseline runs) to
+  9/12 (both final runs);
+  at least 7 must pass.
+  `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
   These guard against cases where the model's real behavior didn't match
@@ -356,6 +364,17 @@ against the agentic-coding suite in `tests/slow/`:
   30 to config.json" edits the JSON as data; "add a docstring to every
   function" works through them one at a time; a request naming one
   function in a bigger file edits just that function.
+- **Changes across files.** A request that has to be carried through
+  several files — "add a category: Item gets a field, Store.add takes
+  it, the report shows it, and main.py passes it" — gets a step for every
+  file it involves, not just the ones the planner thought of: files it
+  names, files defining the code it names (`Item`, `Store.add`,
+  `createTodo`), and files it refers to by name ("the report"). Each of
+  those edits is told its own part of the request ("main.py applies 10%
+  before printing"), and they run definitions first — models, then the
+  store, then the report, then the script — so every edit sees the ones
+  before it. Renames like "rename `sum` in math.js to `total`, and update
+  everything that uses it" are done in code across every file.
 - **It checks its work.** After changing code, `/task` runs the
   project's own checks: syntax checks of what changed (Python, `node
   --check`, a Swift type check, valid JSON), the test suite if there is
@@ -364,6 +383,12 @@ against the agentic-coding suite in `tests/slow/`:
   with…" re-runs main.py). With no test suite, it has the model write a
   short script that calls the changed code and runs it on a copy of the
   project; only a crash inside a function this task changed counts.
+  Programs that ran before the task (`main.py`, `app.py`, `index.js`,
+  `main.swift`) are run again on a copy of the project, and have to
+  still run — a change threaded through three of four files used to pass
+  every syntax check while `main.py` crashed. A crash from a missing
+  import (`NameError: name 'User' is not defined`, with `User` in
+  models.py) is fixed in code, without the model.
   Two checks need no model at all: documented examples of the functions
   it changed (doctests, or `'1h30m' -> 90` in a docstring) are run and
   compared, and a new standalone script is run as-is (catching, say, an
@@ -684,10 +709,13 @@ character and a space.
 
 **On-device coding**, measured with `tests/slow/test_agentic_eval.py`:
 
-- **4096-token context.** Map-reduce lets fm-pcc read past it — but each
-  session still reasons about only one window's worth at a time, so a
-  change that needs several distant files understood *together* (not
-  just found) is harder than one that doesn't.
+- **4096-token context.** Map-reduce lets fm-pcc read past it, and
+  `/task` now plans a change across every file it involves — but each
+  edit is still written one file at a time, so the files can disagree in
+  ways no check catches. On 12 cross-file changes it gets 9
+  right (0 before); the misses are the model's own code (an email check that
+  rejects `a@b.co`, nested JavaScript template strings that don't parse,
+  a Swift protocol requirement its conforming types can't meet).
 - **Logic without tests or examples.** Syntax checks, smoke runs, and
   documented examples catch code that doesn't compile, crashes, or
   contradicts its own docstring — but not code that runs and is simply

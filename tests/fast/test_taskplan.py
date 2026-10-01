@@ -307,6 +307,37 @@ assert not t.check_edit("make Store observable", swift,
 assert not t.check_edit("remove the unused imports", "import os\nimport sys\nprint(sys.argv)\n",
                         "import sys\nprint(sys.argv)\n", code=True)
 assert not t.check_edit("use sys", "from os import path\nx = 1\n", "from os import path, sep\nx = 2\n", code=True)
+assert not t.check_edit("call debug in app.js", "const { info } = require('./logger');\ninfo('x');\n",
+                        "const { info, debug } = require('./logger');\ninfo('x');\ndebug('y');\n", code=True)
 print("imports kept OK")
+
+# steps a request asks for without the usual verbs
+norm = t.normalize_model_steps(
+    [{"action": "EDIT", "path": "service.py", "destination": "", "details": "x"}],
+    "let callers of get_user in service.py pass a timeout", ["service.py", "client.py"], [])
+eq([(s["action"], s["path"]) for s in norm], [("EDIT", "service.py")])
+norm = t.normalize_model_steps(
+    [{"action": "CREATE_FILE", "path": "validators.py", "destination": "", "details": "x"}],
+    "add a validators.py with validate_email(email)", ["signup.py"], [])
+eq([(s["action"], s["path"]) for s in norm], [("CREATE_FILE", "validators.py")])
+norm = t.normalize_model_steps(
+    [{"action": "CREATE_FILE", "path": "Shape.swift", "destination": "", "details": "x"}],
+    "add a Shape protocol with an area() method", ["Circle.swift"], [])
+eq([(s["action"], s["path"]) for s in norm], [("CREATE_FILE", "Shape.swift")])
+norm = t.normalize_model_steps(  # still not for git requests
+    [{"action": "EDIT", "path": "a.py", "destination": "", "details": "x"}], "push a.py", ["a.py"], [])
+eq(norm, [])
+print("steps without the usual wording OK")
+
+# symbol renames: a file named before "to", an owner prefix, and
+# follow-ups that only restate "everywhere"
+F = ["math.js", "stats.js", "inventory/store.py", "notes.txt"]
+eq([(s["action"], s["destination"], s["details"]) for s in t.parse_task(
+    "rename sum in math.js to total, and update everything that uses it", F, [])], [("RENAME_SYMBOL", "sum", "total")])
+eq([(s["action"], s["destination"], s["details"]) for s in t.parse_task(
+    "rename Store.total_value to total_cost everywhere, including the report and the tests", F, [])],
+   [("RENAME_SYMBOL", "total_value", "total_cost")])
+eq(t.parse_task("rename notes.txt to todo.txt", F, [])[0]["action"], "RENAME")
+print("symbol rename forms OK")
 
 print("ALL TASKPLAN TESTS PASSED")
