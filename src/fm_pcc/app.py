@@ -530,7 +530,11 @@ def propose_edit(
             + ([] if _is_prose(label) else codework.check_definitions(
                 label, instructions, excerpt, text, elsewhere=codework.names_defined_elsewhere(cwd, label)))
             + (taskplan.check_relevant(instructions, excerpt, text) if speculative else [])
-            + (codework.check_not_copied(cwd, label, excerpt, text) if speculative else [])
+            # Any code edit, not just optional ones: seen for real, the
+            # required edit of config.js pasted app.js's code into it.
+            + ([] if _is_prose(label) or re.search(r"\b(?:cop(?:y|ies)|move|duplicate|same\s+as|like\s+in)\b",
+                                                     instructions, re.IGNORECASE)
+               else codework.check_not_copied(cwd, label, excerpt, text))
             + codework.check_kept(list(keep), text),
             original=excerpt,
             repair=lambda text: _drop_copied(label, excerpt, taskplan.match_indentation(
