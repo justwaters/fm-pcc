@@ -1410,7 +1410,7 @@ def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> 
         """`text` names `path` somehow: with its extension, or its stem as a
         word ("the readme") -- but not a stem used as code (config.verbose)."""
         stem = os.path.splitext(os.path.basename(path))[0]
-        unquoted = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", "", text)   # quoted text is content: 'loaded config'
+        unquoted = re.sub(r"(?<![\w])'[^']*'(?![\w])|\"[^\"]*\"|`[^`]*`", "", text)   # quoted text is content: 'loaded config'
         return path in spelled_out(text) or bool(re.search(rf"\b{re.escape(stem)}\b(?![.(])", unquoted, re.IGNORECASE))
 
     fixed: list[dict] = []

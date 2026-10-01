@@ -183,7 +183,7 @@ def names_something(request: str) -> bool:
     names anything that changes."""
     if _TIME_WORDS.search(request):
         return True
-    text = re.sub(r"[`'\"][^`'\"]*[`'\"]", " ", request)               # quoted text is content
+    text = re.sub(r"(?<![\w])[`'\"][^`'\"]*[`'\"](?![\w])", " ", request)   # quoted text is content
     text = re.sub(r"\b[\w./-]+\.[A-Za-z]{1,5}\b", " ", text)           # file names
     for word in re.findall(r"\b[A-Za-z][\w.+-]*", text):
         if word in _NOT_NAMES:

@@ -759,7 +759,8 @@ def files_touched(cwd: str, request: str, files: list[str]) -> dict[str, list[st
     # main.py (seen for real: main.py got edited too).
     request = re.sub(r"\b(?:saying|that\s+says|which\s+says|to\s+say|reading|with\s+the\s+(?:text|words|message))\b.*$",
                      "", request, flags=re.IGNORECASE)
-    request = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", " ", request)
+    # (a quote inside a word is an apostrophe: "item's price ... 'Discount'")
+    request = re.sub(r"(?<![\w])'[^']*'(?![\w])|\"[^\"]*\"|`[^`]*`", " ", request)
     for f in taskplan.mentioned_files(request, candidates):
         out.setdefault(f, [])
     # code-like names: CamelCase, snake_case, dotted (Store.add), or calls

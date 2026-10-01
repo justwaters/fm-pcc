@@ -275,6 +275,14 @@ assert not os.path.exists(os.path.join(d, "__pycache__")) or True
 shutil.rmtree(d, ignore_errors=True)
 eq(list(c.files_touched(tempfile.gettempdir(), "add a line to the readme saying Run main.py to start", ["README.md", "main.py"])),
    [])   # (main.py is text to write; .md files aren't code to cover)
+# ...but an apostrophe isn't a quote: "item's price ... 'Discount: 10%'" still names the report
+d2 = tempfile.mkdtemp(prefix="fm-pcc-apos-")
+for rel in ("report.py", "store.py", "main.py"):
+    open(os.path.join(d2, rel), "w").write("x = 1\n")
+req = ("add a discount: Store gets an apply_discount(percent) method that lowers every item's price by that percent, "
+       "the report adds a line 'Discount: 10%' when one was applied, and main.py applies 10% before printing")
+assert "report.py" in c.files_touched(d2, req, ["report.py", "store.py", "main.py"]), c.files_touched(d2, req, ["report.py", "store.py", "main.py"])
+shutil.rmtree(d2, ignore_errors=True)
 print("cross-file coverage, order, and entry points OK")
 
 # a missing import is added in code, not by the model
