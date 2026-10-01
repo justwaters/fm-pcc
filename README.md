@@ -748,9 +748,13 @@ character and a space.
   `/task` already got 9 right, and about 1 in 30 of the examples the
   model proposed — even after a second, independent answer had to agree
   — was wrong, which would have "fixed" correct code.) And when a check
-  does catch the model's mistake, three fix rounds don't always repair it
-  (a FizzBuzz loop that started at 0) — `/task` then stops without
-  committing.
+  does catch the model's mistake, the fix rounds repair it about 7 times
+  in 10 (measured on 10 bugs from real runs, 5 runs each), nearly always
+  in the first round; the rest are the same few every time ("each extra
+  kilogram or part of one" was never fixed). Rewriting the failing
+  function from scratch instead was measured too (38 of 50 against 36 of
+  50, within the run-to-run noise) and left out. When it can't repair
+  the code, `/task` stops without committing.
 - **Some logic it can't write at all.** A quoted-field CSV parser came
   out wrong in every attempt measured. fm-pcc catches the wrong result
   and stops without committing it, but can't make the model get it
