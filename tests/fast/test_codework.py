@@ -273,6 +273,8 @@ ok, out = c.run_entry(d, "main.py")
 assert not ok and "inventory/store.py" in out and "broken" in out, out
 assert not os.path.exists(os.path.join(d, "__pycache__")) or True
 shutil.rmtree(d, ignore_errors=True)
+eq(list(c.files_touched(tempfile.gettempdir(), "add a line to the readme saying Run main.py to start", ["README.md", "main.py"])),
+   [])   # (main.py is text to write; .md files aren't code to cover)
 print("cross-file coverage, order, and entry points OK")
 
 # a missing import is added in code, not by the model

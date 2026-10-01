@@ -754,6 +754,12 @@ def files_touched(cwd: str, request: str, files: list[str]) -> dict[str, list[st
     candidates = [f for f in files if os.path.splitext(f)[1] in CODE_EXTS and (about_tests or not is_test_file(f))
                   and os.path.splitext(f)[1] not in (".md", ".json", ".toml", ".yml", ".yaml")]
     out: dict[str, list[str]] = {}
+    # Text the request asks to write isn't a reference to a file: "add a
+    # line to the readme saying Run main.py to start" doesn't involve
+    # main.py (seen for real: main.py got edited too).
+    request = re.sub(r"\b(?:saying|that\s+says|which\s+says|to\s+say|reading|with\s+the\s+(?:text|words|message))\b.*$",
+                     "", request, flags=re.IGNORECASE)
+    request = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", " ", request)
     for f in taskplan.mentioned_files(request, candidates):
         out.setdefault(f, [])
     # code-like names: CamelCase, snake_case, dotted (Store.add), or calls

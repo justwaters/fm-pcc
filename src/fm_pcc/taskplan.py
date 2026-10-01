@@ -1070,7 +1070,13 @@ _ADDITIVE_RE = re.compile(r"^\s*(?:please\s+)?(?:add|append|insert|prepend|inclu
 _SAYS_RE = re.compile(
     r"\b(?:that\s+says|says|saying|that\s+reads|reads|reading|with\s+the\s+text|"
     r"containing(?:\s+the\s+(?:word|text|line|phrase))?|the\s+(?:word|line|text|phrase))\s+"
-    r"(?P<w>⟦\d+⟧|[^\s,⟦]+(?:\s+[^\s,⟦]+)*?)(?=\s+(?:to|in|into|at|on|after|before|below|above|under|from|with)\s|\s*$|\s*,)",
+    # The text ends where a place begins ("... to notes.txt", "... at the
+    # top") -- not at any "to": "saying Run main.py to start" lost its
+    # "to start", and a README missing it passed the check.
+    r"(?P<w>⟦\d+⟧|[^\s,⟦]+(?:\s+[^\s,⟦]+)*?)(?=\s+(?:to|in|into|at|on|after|before|below|above|under|from|with)\s+"
+    r"(?:the\s+|my\s+|this\s+|a\s+|an\s+)?(?:[\w./-]+\.[A-Za-z]{1,5}\b|(?:top|bottom|end|beginning|middle|header|"
+    r"footer|title|page|list|section|file|readme|paragraph|document|table|menu|sidebar|line|heading|it|them)\b)"
+    r"|\s*$|\s*,)",
     _I,
 )
 _REPLACE_RE = re.compile(r"\breplace\s+(?:all\s+)?(?P<a>.+?)\s+with\s+(?P<b>.+?)$", _I)

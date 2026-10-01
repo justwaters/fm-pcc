@@ -340,4 +340,13 @@ eq([(s["action"], s["destination"], s["details"]) for s in t.parse_task(
 eq(t.parse_task("rename notes.txt to todo.txt", F, [])[0]["action"], "RENAME")
 print("symbol rename forms OK")
 
+# "saying X": the text ends where a place begins, not at any "to"
+for q, want in [("add a line to the readme saying Run main.py to start", ["Run main.py to start"]),
+                ("add a line saying hi to notes.txt", ["hi"]),
+                ("add a comment saying TODO at the top of main.py", ["TODO"]),
+                ("add a line that says hello world in the header", ["hello world"]),
+                ("add a line saying welcome to the club", ["welcome to the club"])]:
+    eq(t.edit_expectations(q, "")[0], want)
+print("says-text boundaries OK")
+
 print("ALL TASKPLAN TESTS PASSED")
