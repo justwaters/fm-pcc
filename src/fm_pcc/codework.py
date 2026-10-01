@@ -587,6 +587,54 @@ def run_smoke(cwd: str, script: str, lang: str, timeout: float = 20) -> tuple[bo
 
 
 _ENTRY_NAMES = ("main.py", "app.py", "__main__.py", "index.js", "app.js", "main.js", "main.swift")
+ENTRY_NAMES = _ENTRY_NAMES + ("cli.py", "cli.js", "server.js", "server.py", "run.py", "manage.py")
+_NEW_CODE_EXTS = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".swift", ".go", ".rs", ".rb", ".java", ".kt",
+                  ".c", ".h", ".cpp", ".cs", ".php", ".sh", ".html", ".htm", ".css", ".scss")
+
+
+def new_files_named(request: str, files: list[str]) -> list[str]:
+    """Code files a request names that don't exist yet: "wordfreq.py ...
+    and tests for it in test_wordfreq.py" -> both. Data files (todos.json,
+    sales.csv) are left out -- the program creates or reads those -- and so
+    are names inside text to write or quotes."""
+    text = re.sub(r"\b(?:saying|that\s+says|which\s+says|to\s+say|reading)\b.*$", "", request, flags=re.IGNORECASE)
+    text = re.sub(r"(?<![\w])'[^']*'(?![\w])|\"[^\"]*\"", " ", text)
+    existing = set(files) | {os.path.basename(f) for f in files}
+    # "a package shapes with modules circle.py and square.py": those live in shapes/
+    package = re.search(r"\bpackage\s+(?:called\s+|named\s+)?([A-Za-z_]\w*)\s+with\s+(?:the\s+)?(?:modules?|files?)\s+"
+                        r"(.+?)(?:,|;|\band\s+an?\b|$)", text, re.IGNORECASE)
+    in_package = set(re.findall(r"[\w-]+\.py\b", package.group(2))) if package else set()
+    out = []
+    for name in re.findall(r"(?<![\w./-])((?:[\w-]+/)*[\w-]+\.[A-Za-z]{1,5})(?![\w-])", text):
+        if name.lower() in _PRODUCT_NAMES or os.path.splitext(name)[1].lower() not in _NEW_CODE_EXTS:
+            continue
+        if name in in_package:
+            name = f"{package.group(1)}/{name}"
+        if name not in existing and name not in out:
+            out.append(name)
+    return out
+
+
+# Names that look like files but are products ("a Node.js script").
+_PRODUCT_NAMES = {"node.js", "next.js", "nuxt.js", "vue.js", "react.js", "express.js", "three.js", "d3.js", "chart.js",
+                  "angular.js", "ember.js", "socket.io", "p5.js", "nest.js", "deno.land", "asp.net"}
+
+
+def cut_other_file(rel: str, text: str, before: str, cwd: str) -> str:
+    """`text` up to a marker line naming another file ("// main.swift",
+    "# test_bank.py", "<!-- about.html -->") after some content of its own:
+    the model writing the next file into this one."""
+    own = os.path.basename(rel)
+    had = set(before.splitlines())
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*(?://+|#+|<!--|/\*+|--+)\s*(?:file:?\s*)?([\w./-]+\.[A-Za-z]{1,5})\s*(?:-->|\*/|-+)?\s*$", line)
+        if not m or line in had or os.path.basename(m.group(1)) == own:
+            continue
+        if any(l.strip() and not l.strip().startswith(("//", "#", "<!--")) for l in lines[:i]):
+            kept = "\n".join(lines[:i]).rstrip()
+            return kept + ("\n" if text.endswith("\n") else "")
+    return text
 
 
 def entry_points(cwd: str, files: list[str]) -> list[str]:
@@ -1244,6 +1292,55 @@ def undefined_names(rel: str, text: str, functions: set[str]) -> list[tuple[str,
                     if (node.name, inner.id) not in out:
                         out.append((node.name, inner.id))
     return out
+
+
+_COMMAND_RE = re.compile(r"`((?:python3?|node|swift|ruby|go run|bash|sh)\s+[^`]+)`(?P<after>[^`]{0,80})")
+
+
+def request_commands(request: str) -> list[tuple[list[str], str | None]]:
+    """Commands a request spells out in backticks ("`python todo.py add
+    <text>` adds an item, `python todo.py list` prints them"), as (argv,
+    what it must print): None when the request doesn't say it prints, ""
+    when it prints something unspecified, or the expected text ("`node
+    cli.js 100 C` prints 212 F"). Placeholders (<text>, <n>) are filled
+    with simple values."""
+    out = []
+    for m in _COMMAND_RE.finditer(request):
+        command = m.group(1).strip()
+        command = re.sub(r"<(?:n|num|number|index|id|count)>", "1", command, flags=re.IGNORECASE)
+        command = re.sub(r"<[^>]+>", "example", command)
+        after = m.group("after")
+        prints = None
+        pm = re.match(r"\s*(?:,\s*)?(?:then\s+|should\s+|it\s+)?(?:prints?|outputs?|shows?|displays?)\b\s*(?P<what>[^,;.`]*)", after, re.I)
+        if pm:
+            what = pm.group("what").strip()
+            prints = what if re.fullmatch(r"[\w$.%:\- ]{1,30}", what or "") and re.search(r"\d", what) else ""
+        argv = command.split()
+        if argv[0] in ("python", "python3"):
+            argv[0] = "python"
+        out.append((argv, prints))
+    return out
+
+
+def run_commands(cwd: str, commands: list[tuple[list[str], str | None]], timeout: float = 20) -> tuple[bool, str]:
+    """Run the request's commands in order on a copy of the project (state
+    carries over: an add, then a list); (ok, what went wrong)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="fm-pcc-commands-") as tmp:
+        copy = os.path.join(os.path.realpath(tmp), "project")
+        shutil.copytree(cwd, copy, ignore=shutil.ignore_patterns(*_SKIP_DIRS, ".*"), symlinks=True)
+        for argv, prints in commands:
+            real = [_python(cwd)] + argv[1:] if argv[0] == "python" else argv
+            ok, out = run_check(real, copy, timeout=timeout)
+            shown = " ".join(argv)
+            if not ok:
+                return False, f"`{shown}` failed:\n{out[-800:]}"
+            if prints is not None and not out.strip():
+                return False, f"`{shown}` printed nothing, but the request says it prints {prints or 'something'}"
+            if prints and prints.lower() not in out.lower():
+                return False, f"`{shown}` printed:\n{out[-400:]}\nbut the request says it prints {prints!r}"
+    return True, ""
 
 
 def names_defined_elsewhere(cwd: str, rel: str) -> set[str]:

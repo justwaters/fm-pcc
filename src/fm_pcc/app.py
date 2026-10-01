@@ -658,6 +658,10 @@ def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
     if any(echoed.match(l) and l not in had_lines for l in text.splitlines()):
         kept = "\n".join(l for l in text.splitlines() if l in had_lines or not echoed.match(l))
         text = re.sub(r"\n{3,}", "\n\n", kept) + ("\n" if text.endswith("\n") else "")
+    # Another file written into this one: a marker line naming it ("//
+    # main.swift", "# test_bank.py") and its code after -- seen for real,
+    # Counter.swift came back with main.swift's code below it.
+    text = codework.cut_other_file(label, text, before, cwd)
     # The "--- path ---" headers build_context() puts around other files:
     # seen for real, a rewrite of report.py started with
     # "--- inventory/report.py ---", and nothing after it could run.
@@ -1038,7 +1042,8 @@ _PLAN_SCHEMA = {
                      "The existing file/folder acted on, the new path for CREATE_*, or the branch name"},
             "destination": {"type": "string", "description": "RENAME/MOVE only: the new path. Otherwise empty."},
             "details": {"type": "string", "description":
-                        "EDIT/CREATE_FILE: what to change or write. COMMIT: the commit message. Otherwise empty."},
+                        "EDIT/CREATE_FILE: one short sentence on what to change or write -- not the file's contents. "
+                        "COMMIT: the commit message. Otherwise empty."},
         },
         "required": ["action", "path", "destination", "details"],
         "x-order": ["action", "path", "destination", "details"],
@@ -1347,8 +1352,15 @@ def plan_task(
             continue
         request = task if whole else s["details"]
         now_files, now_folders = s.get("files", files), s.get("folders", folders)
-        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd, progress,
-                                          research=research)
+        try:
+            raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd, progress,
+                                              research=research)
+        except EditError:
+            # Seen for real: planning a whole new app ran past the model's
+            # window ("the session's transcript exceeded the model's context
+            # size") and nothing was built. The files the request names are
+            # still created (_cover_touched).
+            raw, model_used = [], model
         named = taskplan.mentioned_files(request, now_files)
         related = tuple(r for n in named for r in codework.local_imports(cwd, n, now_files)) if cwd else ()
         try:
@@ -1397,9 +1409,39 @@ def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> 
       turns out to need no change.
     - Content edits run definitions-first (codework.dependency_order), so
       each sees what the edits before it changed."""
-    if not any(s["action"] in _CONTENT_ACTIONS for s in steps) or \
+    # New code files the request names ("... and tests for it in
+    # test_wordfreq.py", "cli.js that converts ...") that no step creates:
+    # measured, a one-sentence build request left them out every time.
+    to_create = codework.new_files_named(task, files)
+    # ...but not what a rename or move will produce ("rename index.htm to
+    # index.html": index.html is the destination, not a new file).
+    produced = {s["destination"] for s in steps if s["action"] in ("RENAME", "MOVE") and s.get("destination")}
+    produced |= {os.path.basename(p) for p in produced}
+    to_create = [f for f in to_create if f not in produced and os.path.basename(f) not in produced]
+    if to_create and all(s["action"] == "UNSUPPORTED" for s in steps):
+        steps = []                          # planning failed outright: build from the names
+    if (not any(s["action"] in _CONTENT_ACTIONS for s in steps) and not to_create) or \
             any(s["action"] in ("RENAME_SYMBOL", "MOVE_CODE", "FIX_CHECKS", "UNSUPPORTED") for s in steps):
         return steps
+    # A program file the request names bare ("a main.py that prints ...")
+    # belongs at the top, not in the package beside it -- seen for real:
+    # shapes/main.py, so `python main.py` found nothing.
+    # (Any file the request names bare, unless it mentions the folder: the
+    # planner also put style.css in a styles/ the request never mentioned.)
+    for s in steps:
+        base = os.path.basename(s["path"])
+        folder = s["path"].split("/")[0]
+        if s["action"] != "CREATE_FILE" or "/" not in s["path"] or base not in to_create:
+            continue
+        if base in codework.ENTRY_NAMES:
+            if not re.search(rf"[\w-]+/{re.escape(base)}", task):
+                s["path"] = base          # a program file: at the top unless a folder is spelled out for it
+        elif not re.search(rf"\b{re.escape(folder)}\b", task, re.IGNORECASE):
+            s["path"] = base
+    planned_paths = {s["path"] for s in steps if s["action"] in _CONTENT_ACTIONS}
+    for f in to_create:
+        if f not in planned_paths and not any(os.path.basename(p) == os.path.basename(f) for p in planned_paths):
+            steps.append(taskplan.step("CREATE_FILE", f, details=task, shared=True))
     def spelled_out(text: str) -> list[str]:
         """Files `text` names with their extension ("logger.js") -- not a
         stem that's also a word or a variable ("config.verbose")."""
@@ -1457,7 +1499,7 @@ def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> 
     # request, main.py's edit came back unchanged twice and "main.py
     # applies 10% before printing" never happened.
     for s in steps:
-        if s["action"] == "EDIT" and (s.get("shared") or s.get("optional")) and s.get("details") == task:
+        if s["action"] in ("EDIT", "CREATE_FILE") and (s.get("shared") or s.get("optional")) and s.get("details") == task:
             part = codework.request_part_for(task, s["path"], touched.get(s["path"], []))
             if part:
                 s["details"] = f"{task}\n\nThe part of this request about {s['path']}: {part}"
@@ -3561,6 +3603,16 @@ class ChatApp(App):
                 ok, out, origin = codework.run_smoke(cwd, runner, "python")
                 if not ok and origin == rel:
                     return ("behavior", [f"python {rel}"], out, rel)
+        # Commands the request spells out ("`python todo.py add <text>` adds
+        # an item, `python todo.py list` prints them") have to work, in
+        # order -- seen for real: a to-do app whose list printed nothing.
+        commands = codework.request_commands(task) if task and self._task_changed else []
+        if commands:
+            self.call_from_thread(self._log_progress, "checking: the commands in the request…")
+            ok, problem = codework.run_commands(cwd, commands)
+            if not ok:
+                script = next((a for argv, _p in commands for a in argv[1:2] if os.path.exists(os.path.join(cwd, a))), "")
+                return ("behavior", ["the commands in the request"], problem, script or self._task_changed[0])
         # "...it should print 'Total: $10.80'": the program's output has to.
         if printed and self._task_changed:
             for rel in codework.entry_points(cwd, codework.project_files(cwd)):
@@ -3624,7 +3676,14 @@ class ChatApp(App):
                 self.call_from_thread(self._log_progress, f"checking: {label}…")
                 ok, out = codework.run_check(argv, cwd)
                 if not ok and label == "tests" and codework.no_tests_ran(out):
-                    ok = True  # a test command that found nothing hasn't failed
+                    written = [f for f in self._task_changed if codework.is_test_file(f)]
+                    if written:
+                        # Seen for real: a requested test_bank.py with no
+                        # tests in it, counted as passing.
+                        out = (f"{written[0]} was written for this request, but the test runner found no tests in it "
+                               f"-- write test functions (test_...) that check the code.\n{out}")
+                    else:
+                        ok = True  # a test command that found nothing hasn't failed
                 baseline = getattr(self, "_task_baseline", None)
                 if not ok and label == "tests" and baseline:
                     now = codework.failing_tests(out)

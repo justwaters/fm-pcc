@@ -428,4 +428,52 @@ eq(m._drop_copied("README.md", "# Demo\n", "# Demo\n\nChange request: add a line
    "# Demo\n\nhi\n")
 print("echoed prompt lines removed OK")
 
+# building from one sentence: every named file gets made, in the right place
+eq(c.new_files_named("write wordfreq.py, a tool that ..., and tests for it in test_wordfreq.py", []),
+   ["wordfreq.py", "test_wordfreq.py"])
+eq(c.new_files_named("create a Python package shapes with modules circle.py and square.py, and a main.py", []),
+   ["shapes/circle.py", "shapes/square.py", "main.py"])
+eq(c.new_files_named("write summary.js, a Node.js script that reads sales.csv", ["sales.csv"]), ["summary.js"])
+eq(c.new_files_named("the items are saved in todos.json", []), [])
+eq(c.cut_other_file("Counter.swift", "struct Counter {}\n\n// main.swift\nlet c = Counter()\n", "", "."),
+   "struct Counter {}\n")
+eq(c.cut_other_file("main.swift", "// main.swift\nprint(1)\n", "", "."), "// main.swift\nprint(1)\n")
+req = "make convert.js exporting cToF; cli.js that converts a number; and test.js that checks it"
+steps = m._cover_touched([t.step("CREATE_FILE", "convert.js", details=req), t.step("CREATE_FILE", "test.js", details=req)],
+                         req, tempfile.gettempdir(), [])
+eq(sorted(s["path"] for s in steps), ["cli.js", "convert.js", "test.js"])
+req = "create a package shapes with modules circle.py and square.py, and a main.py that prints their areas"
+steps = m._cover_touched([t.step("CREATE_FILE", "shapes/circle.py", details=req), t.step("CREATE_FILE", "shapes/main.py", details=req)],
+                         req, tempfile.gettempdir(), [])
+eq(sorted(s["path"] for s in steps), ["main.py", "shapes/circle.py", "shapes/square.py"])
+# planning failed outright: the named files are still built
+steps = m._cover_touched([t.step("UNSUPPORTED", details="x")], "build todo.py, a to-do app", tempfile.gettempdir(), [])
+eq([(s["action"], s["path"]) for s in steps], [("CREATE_FILE", "todo.py")])
+print("building from one sentence OK")
+
+# commands the request spells out have to work, in order
+cmds = c.request_commands("`python todo.py add <text>` adds an item, `python todo.py list` prints them numbered, "
+                          "and `python todo.py done <n>` removes item n")
+eq(cmds, [(["python", "todo.py", "add", "example"], None), (["python", "todo.py", "list"], ""),
+          (["python", "todo.py", "done", "1"], None)])
+eq(c.request_commands("so `node cli.js 100 C` prints 212 F; and test.js"), [(["node", "cli.js", "100", "C"], "212 F")])
+d = tempfile.mkdtemp(prefix="fm-pcc-cmds-")
+with open(os.path.join(d, "todo.py"), "w") as f:
+    f.write("import json, os, sys\nF = 'todos.json'\nitems = json.load(open(F)) if os.path.exists(F) else []\n"
+            "if sys.argv[1] == 'add':\n    items.append(sys.argv[2])\nelif sys.argv[1] == 'list':\n    pass\n"
+            "json.dump(items, open(F, 'w'))\n")
+ok, problem = c.run_commands(d, cmds)
+assert not ok and "`python todo.py list` printed nothing" in problem, problem
+assert not os.path.exists(os.path.join(d, "todos.json"))            # ran on a copy
+shutil.rmtree(d, ignore_errors=True)
+# a file named bare goes at the top unless the request mentions its folder
+req = "make index.html, about.html and contact.html, all styled by one style.css"
+steps = m._cover_touched([t.step("CREATE_FILE", "index.html", details=req), t.step("CREATE_FILE", "styles/style.css", details=req)],
+                         req, tempfile.gettempdir(), [])
+assert "style.css" in [s["path"] for s in steps] and "styles/style.css" not in [s["path"] for s in steps], steps
+eq([s["action"] for s in m._cover_touched([t.step("RENAME", "index.htm", "index.html")],
+                                          "Rename the file index.htm to index.html.", tempfile.gettempdir(), ["index.htm"])],
+   ["RENAME"])
+print("request commands and placement OK")
+
 print("ALL CODEWORK TESTS PASSED")

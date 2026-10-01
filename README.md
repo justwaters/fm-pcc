@@ -151,6 +151,11 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   always): four requests needing current facts must come out current (at
   least 3; measured 4 of 4 in two runs), and plain coding requests must
   not search.
+  `test_build_real.py` builds 8 small projects from one sentence each
+  (a to-do CLI, a word-frequency tool with tests, a Python package, a
+  three-page site, a Node CSV summary, a Swift program, a bank account
+  with tests, a Node converter with a CLI and tests), judged by running
+  them: 2/8 before the build work, 4/8 after (at least 3 must pass).
   `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
@@ -393,6 +398,16 @@ against the agentic-coding suite in `tests/slow/`:
   store, then the report, then the script — so every edit sees the ones
   before it. Renames like "rename `sum` in math.js to `total`, and update
   everything that uses it" are done in code across every file.
+- **Building from one sentence.** "Build a command-line to-do app in
+  Python…", "make convert.js, a Node module…; cli.js that…; and test.js
+  that…" — every code file the request names gets made, even ones the
+  planner left out (test files especially), each told its own part of the
+  request, where the request puts it (a bare `main.py` at the top, not
+  inside the package beside it; `style.css` where the pages look for it).
+  A file that comes back with another file written into it (`//
+  main.swift` and its code below a struct) is cut back to its own part,
+  and a planner that runs out of room still builds the files the request
+  names.
 - **It checks its work.** After changing code, `/task` runs the
   project's own checks: syntax checks of what changed (Python, `node
   --check`, a Swift type check, valid JSON), the test suite if there is
@@ -412,7 +427,12 @@ against the agentic-coding suite in `tests/slow/`:
   gives 90", "1994 is 'MCMXCIV'") are run against the changed code,
   inputs it mentions ("strings like '1h30m', '45m' or '2h'") have to at
   least not crash, and "it should print 'Total: $10.80'" is checked
-  against what the program prints. A wrong result goes to the fix loop as
+  against what the program prints. Commands it spells out ("`python
+  todo.py add <text>` adds an item, `python todo.py list` prints them")
+  are run in order on a copy of the project, and have to work and print
+  what it says. A test file written for the request has to contain
+  tests: one the runner finds nothing in no longer counts as passing.
+  A wrong result goes to the fix loop as
   "returned X, but the request says it should give Y". So does a changed
   Python function using a name nothing defines (it would crash with a
   NameError the moment it ran). And a function that's only a placeholder
@@ -847,6 +867,12 @@ character and a space.
   tasks measured against them right (compiled and doing what was asked),
   versus about 4 in 10 without. Download the frameworks your project imports, and expect
   to finish some Swift changes yourself.
+- **Whole projects from one sentence.** `/task` gets about half of a set
+  of small multi-file builds working end to end (4 of 8). The rest are
+  the model's own code — a circle's area without π, results written to a
+  file instead of printed — or bugs the checks catch (a to-do list
+  command printing nothing) that three fix rounds can't repair; `/task`
+  then stops and says so rather than reporting a broken app as done.
 - **Speed.** Each model call takes a few seconds; a task with a failing
   check and several repair rounds can take a minute or two, and reading
   a ~100 KB project through map-reduce takes one to two minutes.
