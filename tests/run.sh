@@ -38,6 +38,11 @@ for dir in $dirs; do
         # from each other.
         FM_PCC_HOME=$(mktemp -d)
         export FM_PCC_HOME
+        # No automatic web searches unless a test is about them (they turn
+        # it back on): the fast suite never calls the model, and in the
+        # slow suites a "search the web?" prompt would wait for an answer
+        # nobody is there to give.
+        export FM_PCC_AUTO_WEB=0
         if uv run --quiet --with textual --with rich python3 "$test" >"$log" 2>&1; then
             passed=$((passed + 1))
             echo "  ok    $test ($(( $(date +%s) - start ))s)"

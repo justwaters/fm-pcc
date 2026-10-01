@@ -97,4 +97,118 @@ async def app_checks():
 
 
 asyncio.run(app_checks())
+
+# ---- deciding a request needs the web ----
+assert web.names_something("Research the latest ai models and build me an html page")
+assert web.names_something("who is the CEO of OpenAI?") and web.names_something("is Python 3.14 out yet?")
+assert not web.names_something("build me an html page with a contact form")
+assert not web.names_something("make a landing page for my bakery with a menu section")
+assert not web.names_something("add a multiply function to calc.py")
+judge = mock.Mock(return_value={"needs_web": True})
+assert not web.needs_web("make the button blue in style.css", judge) and not judge.called   # no model call
+assert web.needs_web("what's the newest version of Python?", judge)
+assert not web.needs_web("what's the newest version of Python?", lambda s, p: {"needs_web": False})
+def refuse(schema, prompt):
+    raise RuntimeError("Error: The model refused to answer.")
+assert web.needs_web("who is on the current US Supreme Court?", refuse)   # refused: the request names something
+print("needs_web OK")
+
+
+# ---- asking permission, from a worker thread like /task ----
+async def permission_checks():
+    import threading
+    os.environ.pop("FM_PCC_AUTO_WEB", None)
+    app = m.ChatApp()
+    async with app.run_test() as pilot:
+        palette = app.query_one("#palette", m.OptionList)
+        found = ("- GPT-5\n- Claude Opus 5", ["https://example.com/models"])
+
+        def ask_in_background():
+            out = []
+            t = threading.Thread(target=lambda: out.append(app._research_if_needed("research the latest ai models")),
+                                 daemon=True)
+            t.start()
+            return t, out
+
+        async def finished(t):
+            # (never t.join(): the worker logs through the app's own loop)
+            for _ in range(200):
+                await pilot.pause(0.05)
+                if not t.is_alive():
+                    return
+            raise AssertionError("the worker thread never finished")
+
+        with mock.patch.object(m.web, "needs_web", return_value=True), \
+             mock.patch.object(app, "_search_queries", return_value=["latest AI models 2026"]), \
+             mock.patch.object(app, "_research", return_value=found) as research:
+            # Allow once: searches, nothing remembered
+            t, out = ask_in_background()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if palette.display:
+                    break
+            eq([palette.get_option_at_index(i).id for i in range(palette.option_count)], ["once", "always", "deny"])
+            assert any("Allow agent to search the web?" in msg.text and "latest AI models 2026" in msg.text
+                       for msg in app._transcript), [msg.text for msg in app._transcript]
+            app._picker_choose("once")
+            await finished(t)
+            eq(out, [found])
+            assert m.load_state().get("web_permission") is None
+            # Esc closes the prompt: Deny
+            t, out = ask_in_background()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if palette.display:
+                    break
+            app._close_model_picker()
+            await finished(t)
+            eq(out, [None])
+            eq(research.call_count, 1)
+            # Allow always: remembered, and not asked again
+            t, out = ask_in_background()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if palette.display:
+                    break
+            app._picker_choose("always")
+            await finished(t)
+            eq(m.load_state().get("web_permission"), "always")
+            t, out = ask_in_background()
+            await finished(t)
+            eq(out, [found])
+            assert not palette.display
+            # /web never: no searching on its own; /web ask: asked again
+            app._handle_command("/web never")
+            eq(m.load_state().get("web_permission"), "never")
+            eq(app._research_if_needed("research the latest ai models"), None)
+            app._handle_command("/web ask")
+            eq(m.load_state().get("web_permission"), None)
+        # the permission setting and iCloud+ memory share state.json
+        m.save_icloud_plus_unavailable({"cloud-pro"})
+        m.update_state(web_permission="always")
+        eq(m.load_icloud_plus_unavailable(), {"cloud-pro"})
+        m.save_icloud_plus_unavailable(set())
+        eq(m.load_state().get("web_permission"), "always")
+        m.update_state(web_permission=None)
+
+        # what was found reaches the planner, every edit, and chat replies
+        with mock.patch.object(app, "_research_if_needed", return_value=found), \
+             mock.patch.object(app, "call_from_thread", side_effect=lambda fn, *a, **k: fn(*a, **k)), \
+             mock.patch.object(app, "_log_progress"), mock.patch.object(m, "notify"), \
+             mock.patch.object(m, "plan_task", return_value=([], None)) as plan:
+            app._run_task.__wrapped__(app, "research the latest ai models and build me models.html")
+        eq(plan.call_args.kwargs.get("research"), found[0])
+        prompts = []
+        with mock.patch.object(app, "_research_if_needed", return_value=found), \
+             mock.patch.object(app.backend, "respond", side_effect=lambda p, mdl: (prompts.append(p) or "GPT-5 and Claude Opus 5.", mdl)), \
+             mock.patch.object(app, "call_from_thread", side_effect=lambda fn, *a, **k: fn(*a, **k)):
+            app._respond.__wrapped__(app, "what are the latest ai models?")
+        assert "Facts found on the web" in prompts[0] and "Claude Opus 5" in prompts[0], prompts
+        reply = [msg.text for msg in app._message_log if msg.role == "assistant"][-1]
+        assert reply.endswith("Sources:\n- https://example.com/models"), reply
+    os.environ["FM_PCC_AUTO_WEB"] = "0"
+    print("permission prompt, settings, and research plumbing OK")
+
+
+asyncio.run(permission_checks())
 print("ALL WEB TESTS PASSED")

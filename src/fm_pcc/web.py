@@ -2,8 +2,9 @@
 passages locally -- the same split as /docs: code finds and ranks, the
 on-device model only reads the few passages that fit its window.
 
-Nothing here runs unless the user types /web: /task, /ask and chat never
-search on their own, so nothing leaves the device without being asked.
+Nothing here runs without the user's say-so: /web <question> searches when
+typed, and /task and chat search on their own only after asking ("Allow
+agent to search the web?") or once the user chose Allow always.
 
 Search uses DuckDuckGo's HTML results page, which needs no account or
 key. It isn't an official API, so it can change or refuse requests;
@@ -117,10 +118,14 @@ def fetch_all(results: list[dict], limit: int = PAGES) -> list[docs.Page]:
     return [p for p in pages if p][:limit]
 
 
-def rank(question: str, pages: list[docs.Page], results: list[dict] = (), limit: int = 12) -> list[dict]:
+def rank(question: str, pages: list[docs.Page], results: list[dict] = (), limit: int = 12,
+         recent: bool = False) -> list[dict]:
     """The pages' passages (and the search snippets) that best match the
     question -- BM25 over an in-memory index, weighted like /docs -- as
-    hits in docs.Library.search's shape."""
+    hits in docs.Library.search's shape. With `recent`, passages from the
+    search's top results and ones mentioning this year or last count for
+    more: measured, research for "the latest AI models" otherwise quoted
+    2021 models from an old paper."""
     db = sqlite3.connect(":memory:")
     db.execute("CREATE VIRTUAL TABLE passages USING fts5(doc_set UNINDEXED, title, heading, url UNINDEXED, body, "
                "tokenize='porter unicode61')")
@@ -140,4 +145,79 @@ def rank(question: str, pages: list[docs.Page], results: list[dict] = (), limit:
         return []
     finally:
         db.close()
-    return [{"set": "web", "title": t, "heading": h, "url": u, "body": b, "rank": r} for t, h, u, b, r in found]
+    hits = [{"set": "web", "title": t, "heading": h, "url": u, "body": b, "rank": r} for t, h, u, b, r in found]
+    if recent:
+        import time as _time
+        year = int(_time.strftime("%Y"))
+        order = {r["url"]: i for i, r in enumerate(results)}
+        for h in hits:
+            years = [int(y) for y in re.findall(r"\b(20[0-9]{2})\b", h["body"] + " " + h["heading"])]
+            if any(y >= year - 1 for y in years):
+                h["rank"] -= 3
+            elif years and max(years) < year - 2:
+                h["rank"] += 3
+            h["rank"] -= max(0, 3 - order.get(h["url"], 9))          # the search's own top 3
+        hits.sort(key=lambda h: h["rank"])
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Does a request need the web?
+# ---------------------------------------------------------------------------
+
+_TIME_WORDS = re.compile(
+    r"\b(?:latest|newest|current(?:ly)?|recent(?:ly)?|today'?s?|right now|nowadays|up[- ]to[- ]date|"
+    r"this (?:year|season|month|week)'?s?|last (?:month|week|year|season|event|night)'?s?|upcoming|trending|"
+    r"yet|so far|anymore|still|20[2-9]\d)\b", re.I)
+_NOT_NAMES = {"I", "A", "An", "The", "In", "On", "For", "To", "Of", "And", "Or", "But", "With", "Make", "Build",
+              "Add", "Create", "Write", "Research", "What", "Who", "Which", "When", "How", "Is", "Are", "Does", "Do",
+              "Can", "Please", "List", "Show", "Find", "Update", "Explain", "Use", "Put", "Give", "Tell"}
+
+
+def names_something(request: str) -> bool:
+    """Whether a request refers to something specific in the world -- a
+    product, company, person, version ("OpenAI", "M5", "GPT-5", "Python
+    3.14", "Champions League") -- or to a time ("latest", "last month's",
+    "upcoming"). Measured: the model's own judgment flagged a bakery
+    landing page and a page of the planets as needing the web; neither
+    names anything that changes."""
+    if _TIME_WORDS.search(request):
+        return True
+    text = re.sub(r"[`'\"][^`'\"]*[`'\"]", " ", request)               # quoted text is content
+    text = re.sub(r"\b[\w./-]+\.[A-Za-z]{1,5}\b", " ", text)           # file names
+    for word in re.findall(r"\b[A-Za-z][\w.+-]*", text):
+        if word in _NOT_NAMES:
+            continue
+        if word[0].isupper() or re.search(r"\d", word):
+            return True
+    return bool(re.search(r"\b\d+(?:\.\d+)+\b", text))                 # a version number
+
+
+_JUDGE_SCHEMA = {"type": "object", "title": "Verdict", "additionalProperties": False,
+                 "properties": {"needs_web": {"type": "boolean"}}, "required": ["needs_web"], "x-order": ["needs_web"]}
+_JUDGE_EXAMPLES = (
+    "Examples:\n"
+    "- \"add a multiply function to calc.py\" -> false\n- \"make the button blue in style.css\" -> false\n"
+    "- \"build me an html page with a contact form\" -> false\n- \"commit everything\" -> false\n"
+    "- \"how do I reverse a list in Python?\" -> false\n- \"write unit tests for parse.py\" -> false\n"
+    "- \"what's the newest version of Python?\" -> true\n- \"who won the last Super Bowl?\" -> true\n"
+    "- \"Research the latest ai models and build me an html page with a list of them\" -> true\n"
+    "- \"what is the price of bitcoin right now?\" -> true\n- \"what new features came in iOS 26?\" -> true\n")
+
+
+def needs_web(request: str, structured) -> bool:
+    """Whether doing `request` well needs facts from the web: the model's
+    judgment (`structured(schema, prompt)`, guided generation) AND the
+    request naming something specific or a time (names_something). When
+    the model refuses to answer (its guardrails, seen for "members of the
+    current US Supreme Court"), names_something decides alone."""
+    if not names_something(request):
+        return False
+    prompt = ("Does this request need up-to-date facts from the web -- recent events, the latest versions or releases, "
+              "current prices, people in roles, rankings -- rather than programming work or general knowledge?\n\n"
+              f"{_JUDGE_EXAMPLES}\nRequest: {request}")
+    try:
+        return bool(structured(_JUDGE_SCHEMA, prompt).get("needs_web"))
+    except Exception:
+        return True
+

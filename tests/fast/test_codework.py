@@ -413,4 +413,9 @@ ok_code = ("import math\n_SEEN = {}\n\n\ndef get_rate(currency, *args, **kw):\n 
 eq(c.undefined_names("rates.py", ok_code, {"get_rate"}), [])
 print("undefined names OK")
 
+# the prompt's own labels pasted into a file are removed
+eq(m._drop_copied("README.md", "# Demo\n", "# Demo\n\nChange request: add a line saying hi\n\nhi\n", tempfile.gettempdir()),
+   "# Demo\n\nhi\n")
+print("echoed prompt lines removed OK")
+
 print("ALL CODEWORK TESTS PASSED")

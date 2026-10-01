@@ -147,6 +147,10 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   `test_web_real.py` asks `/web` 20 questions with known answers against
   the real web (20/20 measured, the model alone 12/20; at least 17 must
   be right), and skips if the search service can't be reached.
+  `test_autoweb_real.py` has `/task` research on its own (with Allow
+  always): four requests needing current facts must come out current (at
+  least 3; measured 4 of 4 in two runs), and plain coding requests must
+  not search.
   `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
@@ -259,6 +263,7 @@ Slash commands, same spirit as `fm chat`:
 | `/license`                   | Read and agree to Apple's on-device model terms (one-time setup) |
 | `/docs [question]`           | Download language docs (picker), or answer a question from them |
 | `/web <question>`            | Search the web and answer from the pages found, with sources |
+| `/web ask\|always\|never`     | Whether fm-pcc asks before searching the web on its own (default: ask) |
 | `/verify [on\|off]`          | Turn `/task`'s automatic checks (tests, syntax) on or off |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
@@ -573,14 +578,47 @@ own how to undo a commit but keep its changes, the model said
 `git reset --hard` — which throws the changes away; `/web` answered
 `git reset --soft HEAD~1`, with sources.
 
-**Only when you type `/web`.** `/web` is the one thing in fm-pcc that
-sends your words off the device (besides the cloud model tiers you opt
-into): your question goes to DuckDuckGo, and the pages it finds are
-fetched. Chat, `/task`, `/ask` and `/docs` never search on their own.
-The answer itself is still written on-device. DuckDuckGo needs no account
-or key; fm-pcc reads its plain HTML results page, which isn't an official
-API — if it refuses a search (too many in a row, or a captcha), `/web`
-says so instead of guessing.
+**Searching on its own, with your permission.** `/task` and chat also
+notice when a request needs facts newer than the model knows — "Research
+the latest ai models and build me an html page with a list of them",
+"add the current Node.js LTS version to the README" — and ask first:
+
+```
+This needs facts the on-device model may not have. Allow agent to search
+the web? It would look up "latest AI models 2026" on DuckDuckGo.
+  › Allow once
+    Allow always
+    Deny
+```
+
+Allowed, it searches, reads the top pages, and works from notes of what
+they say: the HTML page lists GPT-5, Claude Opus 4.6 and GPT-5.2 Pro
+(or, another run, GPT-6 Astra and Claude Fable 5.1 from September 2026)
+instead of the GPT-4, Claude 3 and BERT the model lists on its own. On
+four such requests (that page, the newest Python, the current Node.js LTS,
+the newest iPhones), it came out current every time in two full runs; on
+its own the model wrote Python 3.11, Node 16 and the iPhone 15.
+Searches include today's date — left alone, the model searched for
+"latest AI models 2024", the year its knowledge ends. Denied, or with
+Esc, it goes on with what the model knows.
+
+Deciding a request needs the web is the model's judgment, kept only when
+the request names something specific (a product, company, person or
+version) or a time ("latest", "last month's", "upcoming"). On 40 requests
+written to test it after it was built, it caught all 20 that needed the
+web, and asked about 4 of 20 that didn't — coding requests naming a tool
+("a GitHub Actions workflow that runs pytest", "a Dockerfile for this
+Python app"). Deny those; with **Allow always**, they quietly spend
+10–20 seconds searching. `/web ask` (the default), `/web always` and
+`/web never` set this, and are remembered in `~/.fm-pcc/state.json`;
+`/web never` keeps fm-pcc fully offline except when you type `/web`.
+
+**What leaves the device.** Your search terms go to DuckDuckGo and the
+pages it finds are fetched — only after you type `/web` or allow it; the
+answers and the work are still done on-device. `/ask` and `/docs` never
+search. DuckDuckGo needs no account or key; fm-pcc reads its plain HTML
+results page, which isn't an official API — if it refuses a search (too
+many in a row, or a captcha), fm-pcc says so instead of guessing.
 
 ### Map-reduce: past the 4096-token window
 

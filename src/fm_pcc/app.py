@@ -650,6 +650,14 @@ def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
     """Remove definitions the model copied in from another file (shown to
     it as context) -- asked not to, it still did; removing them keeps its
     actual change."""
+    # The prompt's own labels echoed back into the file: seen for real, a
+    # README edit that began its new line with "Change request: add a
+    # line to README.md saying ...".
+    echoed = re.compile(r"^\s*(?:Change request|Task|The overall request this is part of):\s")
+    had_lines = set(before.splitlines())
+    if any(echoed.match(l) and l not in had_lines for l in text.splitlines()):
+        kept = "\n".join(l for l in text.splitlines() if l in had_lines or not echoed.match(l))
+        text = re.sub(r"\n{3,}", "\n\n", kept) + ("\n" if text.endswith("\n") else "")
     # The "--- path ---" headers build_context() puts around other files:
     # seen for real, a rewrite of report.py started with
     # "--- inventory/report.py ---", and nothing after it could run.
@@ -1243,7 +1251,7 @@ def _relevant_to(task: str, cwd: str, model: str, progress=None) -> tuple[str, .
 
 def plan_with_model(
     request: str, task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
-    cwd: str | None = None, progress=None,
+    cwd: str | None = None, progress=None, research: str = "",
 ) -> tuple[list[dict], str]:
     """Ask the planning model for raw steps (not yet normalized). A cloud
     model gets asked for JSON in plain text (Shortcuts has no schema
@@ -1255,6 +1263,8 @@ def plan_with_model(
     # measured, it asked to "fix" a failing test by editing the test.
     budget = CONTEXT_BUDGET_ON_DEVICE if model == "on-device" else CONTEXT_BUDGET_CLOUD
     code = codework.build_context(cwd, task, budget, prefer=_relevant_to(task, cwd, model, progress)) if cwd else ""
+    if research:
+        code = f"Facts found on the web for this request:\n{research}\n\n{code}".strip()
     prompt = _plan_prompt(request, task, files, folders, code)
     if model != "on-device":
         reply, used = backend.classify_with_fallback(
@@ -1314,7 +1324,7 @@ def _retarget_test_edits(steps: list[dict], task: str, cwd: str, files: list[str
 
 def plan_task(
     task: str, files: list[str], folders: list[str], backend: "Backend", model: str,
-    cwd: str | None = None, progress=None,
+    cwd: str | None = None, progress=None, research: str = "",
 ) -> tuple[list[dict], str | None]:
     """The whole plan for `task`, up front: deterministic where the request
     has a recognizable shape (taskplan.parse_task), the planning model for
@@ -1337,7 +1347,8 @@ def plan_task(
             continue
         request = task if whole else s["details"]
         now_files, now_folders = s.get("files", files), s.get("folders", folders)
-        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd, progress)
+        raw, model_used = plan_with_model(request, task, now_files, now_folders, backend, model, cwd, progress,
+                                          research=research)
         named = taskplan.mentioned_files(request, now_files)
         related = tuple(r for n in named for r in codework.local_imports(cwd, n, now_files)) if cwd else ()
         try:
@@ -2121,6 +2132,32 @@ def ensure_shortcut_installed(
     return False
 
 
+def load_state() -> dict:
+    try:
+        with open(STATE_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def update_state(**changes) -> None:
+    """Set keys in state.json, keeping the others (a value of None removes
+    the key)."""
+    data = load_state()
+    for key, value in changes.items():
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
 def load_icloud_plus_unavailable() -> set[str]:
     """Which cloud tiers are known to require iCloud+ this account doesn't
     have -- persisted so this survives restarts and updates, not just the
@@ -2136,12 +2173,7 @@ def load_icloud_plus_unavailable() -> set[str]:
 
 
 def save_icloud_plus_unavailable(unavailable: set[str]) -> None:
-    try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        with open(STATE_PATH, "w") as f:
-            json.dump({"icloud_plus_unavailable": sorted(unavailable)}, f, indent=2)
-    except OSError:
-        pass
+    update_state(icloud_plus_unavailable=sorted(unavailable))
 
 
 FALLBACK_CHAIN = {"cloud-pro": "cloud", "cloud": "on-device"}
@@ -2849,6 +2881,10 @@ class ChatApp(App):
         self.query_one(Input).disabled = True
 
     def _close_model_picker(self) -> None:
+        pending = getattr(self, "_web_permission_event", None)
+        if pending is not None and not pending.is_set():
+            self._web_permission_choice = "deny"      # closed without choosing (Esc)
+            pending.set()
         self._model_picker_active = False
         self._picker_handler = None
         self.query_one("#palette", OptionList).display = False
@@ -2927,7 +2963,8 @@ class ChatApp(App):
         "run": "run a shell command in this directory and show its output: /run <command>",
         "license": "read and agree to Apple's on-device model terms (one-time setup)",
         "docs": "download language docs, or ask them: /docs, /docs <question>",
-        "web": "search the web and answer from the pages found: /web <question>",
+        "web": "search the web and answer from the pages found: /web <question>; /web ask, /web always or "
+               "/web never sets whether fm-pcc asks before searching on its own",
         "verify": "turn /task's automatic checks (tests, syntax) on or off: /verify [on|off]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
@@ -3007,6 +3044,14 @@ class ChatApp(App):
             self._handle_license()
         elif name == "docs":
             self._handle_docs(arg)
+        elif name == "web" and arg.strip().lower() in ("always", "ask", "never"):
+            setting = arg.strip().lower()
+            update_state(web_permission=None if setting == "ask" else setting)
+            self._add_message(Message("system", {
+                "always": "fm-pcc will search the web whenever a request needs it, without asking",
+                "ask": "fm-pcc will ask before searching the web (Allow once / Allow always / Deny)",
+                "never": "fm-pcc won't search the web on its own -- only when you type /web <question>",
+            }[setting]))
         elif name == "web":
             if not arg.strip():
                 self._add_message(Message("system", "usage: /web <question> -- searches DuckDuckGo and answers from the pages it finds"))
@@ -3119,13 +3164,17 @@ class ChatApp(App):
         self._task_baseline: set[str] | None = None  # tests failing before this run
         self._task_entries_ok: list[str] = []  # programs that ran cleanly before this run
         self._task_unverified = False        # code changed since the last check
+        self._task_research = ""             # facts found on the web for this request
         start_time = time.monotonic()
         try:
             files, folders = gather_task_tree(cwd)
+            research = self._research_if_needed(task)
+            if research:
+                self._task_research = research[0]
             self.call_from_thread(self._log_progress, "planning…")
             steps, model_used = plan_task(
                 task, files, folders, self.backend, self.subagent_roles["planning"], cwd=cwd,
-                progress=lambda m: self.call_from_thread(self._log_progress, m),
+                progress=lambda m: self.call_from_thread(self._log_progress, m), research=self._task_research,
             )
             if model_used:
                 self._note_planning_fallback(model_used)
@@ -3288,6 +3337,10 @@ class ChatApp(App):
         reference = docs_context(self._docs, f"{details} {task}", [path], 1800, root=cwd, pick_apis=pick_apis_on_device)
         if reference:
             context = f"{context}\n\n{reference}".strip()
+        if getattr(self, "_task_research", ""):
+            # Newer than what the model knows: put it first.
+            context = (f"Facts found on the web for this request (newer than what you know -- use them):\n"
+                       f"{self._task_research}\n\n{context}").strip()
         shared = bool(s.get("shared"))
         if action == "CREATE_FILE":
             proposal = propose_new_file(path, details, cwd, context=context, task=task, expectations=not shared)
@@ -3954,6 +4007,111 @@ class ChatApp(App):
         finally:
             self.call_from_thread(self._enable_input)
 
+    def _research_if_needed(self, request: str) -> tuple[str, list[str]] | None:
+        """(notes, source urls) from the web when `request` needs facts the
+        model may not have ("Research the latest AI models and build me a
+        page of them") and the user allows it; None otherwise. Runs on a
+        worker thread; asks first unless the user chose Allow always."""
+        if load_state().get("web_permission") == "never" or os.environ.get("FM_PCC_AUTO_WEB") == "0":
+            return None
+        try:
+            if not web.needs_web(request, fm_structured):
+                return None
+        except Exception:
+            return None
+        queries = self._search_queries(request)
+        if not self._web_allowed(queries):
+            self.call_from_thread(self._log_progress, "not searching the web -- going on with what the model knows")
+            return None
+        try:
+            return self._research(request, queries)
+        except web.WebError as e:
+            self.call_from_thread(self._log_progress, f"couldn't search the web ({e}) -- going on without it")
+            return None
+
+    def _search_queries(self, request: str) -> list[str]:
+        """One or two web searches for what `request` needs to know."""
+        schema = {"type": "object", "title": "Searches", "additionalProperties": False,
+                  "properties": {"queries": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2}},
+                  "required": ["queries"], "x-order": ["queries"]}
+        today = time.strftime("%B %d, %Y")
+        try:
+            queries = fm_structured(schema, f"Today is {today}.\n\nRequest: {request}\n\nWhat would you search the "
+                                            "web for to get the up-to-date facts this request needs? One or two short "
+                                            "search queries.")
+            queries = [q.strip() for q in queries.get("queries") or [] if q.strip()][:2]
+        except EditError:
+            queries = []
+        # The model doesn't know what year it is: measured, it searched for
+        # "latest AI models 2024" and got pages from 2021-2022.
+        year = int(time.strftime("%Y"))
+        queries = [re.sub(r"\b20[0-9]{2}\b", lambda m: str(year) if int(m.group()) < year else m.group(), q) for q in queries]
+        return queries or [request[:120]]
+
+    def _web_allowed(self, queries: list[str]) -> bool:
+        """Ask "Allow agent to search the web?" (Allow once / Allow always /
+        Deny), unless the user already chose Allow always. Blocks the worker
+        thread until the user answers; closing the prompt counts as Deny."""
+        if load_state().get("web_permission") == "always":
+            self.call_from_thread(self._log_progress, "searching the web (allowed always -- /web ask to be asked again)")
+            return True
+        import threading
+        self._web_permission_event = threading.Event()
+        self._web_permission_choice = "deny"
+        self.call_from_thread(self._open_web_permission, queries)
+        self._web_permission_event.wait()
+        self._web_permission_event = None
+        choice = self._web_permission_choice
+        if choice == "always":
+            update_state(web_permission="always")
+        return choice in ("once", "always")
+
+    def _open_web_permission(self, queries: list[str]) -> None:
+        looking_up = "; ".join(f"\u201c{q}\u201d" for q in queries)
+        self._add_message(Message("system", f"This needs facts the on-device model may not have. Allow agent to search "
+                                            f"the web? It would look up {looking_up} on DuckDuckGo."))
+        palette = self.query_one("#palette", OptionList)
+        palette.clear_options()
+        palette.add_option(Option("Allow once", id="once"))
+        palette.add_option(Option("Allow always", id="always"))
+        palette.add_option(Option("Deny", id="deny"))
+        palette.highlighted = 0
+        palette.display = True
+        palette.focus()
+        self._model_picker_active = True
+        self._picker_handler = self._web_permission_chosen
+
+    def _web_permission_chosen(self, choice: str) -> None:
+        self._web_permission_choice = choice
+        if self._web_permission_event is not None:
+            self._web_permission_event.set()
+
+    def _research(self, request: str, queries: list[str]) -> tuple[str, list[str]]:
+        """Search, read the top pages, and condense what they say into notes
+        for `request`: (notes, source urls)."""
+        results, pages = [], []
+        for q in queries:
+            self.call_from_thread(self._log_progress, f"searching the web: {q}")
+            found = web.search(q)
+            results += found
+            pages += web.fetch_all(found, limit=3)
+        hits = web.rank(f"{request} {' '.join(queries)}", pages, results, recent=True)
+        if not hits:
+            return "", []
+        chosen = self._docs_passages(request, hits)
+        self.call_from_thread(self._log_progress, f"reading {len(chosen)} passages from {len(pages)} pages…")
+        question = (f"Today is {time.strftime('%B %d, %Y')}. This request needs up-to-date facts: {request}\n"
+                    "List the specific facts from these pages that it needs -- names, versions, dates, numbers -- "
+                    "as a short list. Prefer the newest facts; leave out anything the pages show is years old.")
+        try:
+            notes, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+        except EditError:
+            notes, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+        urls = list(dict.fromkeys(h["url"] for h in hits[: len(chosen)]))[:5]
+        self.call_from_thread(self._log_progress, "found on the web:\n" + notes.strip()[:1200]
+                              + ("\nsources: " + ", ".join(urls) if urls else ""))
+        return notes.strip(), urls
+
     @work(thread=True)
     def _run_web_question(self, question: str) -> None:
         """/web <question>: search DuckDuckGo, fetch the top pages, rank
@@ -4555,6 +4713,10 @@ class ChatApp(App):
         self._picker_choose(event.option.id)
 
     def _picker_choose(self, option_id: str) -> None:
+        if self._picker_handler == self._web_permission_chosen:
+            self._web_permission_chosen(option_id)       # before closing, which would count as Deny
+            self._close_model_picker()
+            return
         handler = self._picker_handler or self._select_model
         self._close_model_picker()
         handler(option_id)
@@ -4720,7 +4882,15 @@ class ChatApp(App):
     def _respond(self, prompt: str) -> None:
         model = self.model
         try:
+            research = self._research_if_needed(prompt)
+            sources = ""
+            if research:
+                notes, urls = research
+                sources = "\n\nSources:\n" + "\n".join(f"- {u}" for u in urls) if urls else ""
+                prompt = (f"Facts found on the web just now (newer than what you know -- answer from them):\n{notes}"
+                          f"\n\n{prompt}")
             text, model_used = self.backend.respond(prompt, model)
+            text = text + sources if text else text
             fell_back = (model, model_used) if model_used != model else None
             self.call_from_thread(self._finish_turn, text, None, fell_back)
         except GenerationCancelled:
