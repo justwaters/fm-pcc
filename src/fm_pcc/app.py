@@ -449,6 +449,18 @@ def propose_edit(
         if updated is not None:
             return result(updated, f"edited {label}: {instructions}")
 
+    # A request to write a function that's only a placeholder: shown the
+    # stub, the model handed it back unchanged four times out of four
+    # ("raise NotImplementedError"); asked to write the function from its
+    # signature, it wrote it.
+    if not line_range and not _is_prose(label) and not feedback:
+        stubs = codework.stub_functions(label, original)
+        named = [n for n in stubs if re.search(rf"(?<![\w$]){re.escape(n)}(?![\w$])", instructions)]
+        if len(named) == 1:
+            written = _write_stub(label, original, named[0], stubs[named[0]], instructions, context, task, cwd)
+            if written is not None:
+                return result(written, f"wrote {named[0]} in {label}")
+
     lines = original.splitlines()
     lo, hi = line_range if line_range else (1, len(lines))
     excerpt = "\n".join(lines[lo - 1 : hi])
@@ -593,6 +605,41 @@ def _hoist_imports(before: str, after: str) -> tuple[str, list[str]]:
     while trimmed and not trimmed[-1].strip():
         trimmed.pop()
     return "\n".join(trimmed), hoisted
+
+
+def _write_stub(label: str, original: str, name: str, span: tuple[int, int], instructions: str,
+                context: str, task: str, cwd: str) -> str | None:
+    """`original` with the placeholder function `name` written for real:
+    the model writes just that function from its signature, and it's
+    spliced in where the stub was. None if it can't."""
+    lines = original.splitlines()
+    start, end = span
+    signature = lines[start]
+    lang = _FENCE_LANGS.get(os.path.splitext(label)[1].lower(), "")
+    rest = "\n".join(lines[:start] + lines[end:]).strip()
+    prompt = (
+        _context_block(context, task, instructions)
+        + (f"The rest of {label} (unchanged):\n```{lang}\n{rest}\n```\n\n" if rest else "")
+        + f"Task: {instructions}\n\n"
+        + f"Write the complete function {name}, starting with this line:\n```{lang}\n{signature.strip()}\n```\n\n"
+        "Make sure it actually implements the request correctly. Reply with just the function in a code block."
+    )
+
+    def check(text: str) -> list[str]:
+        if not re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", text):
+            return [f"the reply doesn't define {name}"]
+        if name in codework.stub_functions(label, text) or text.strip() == "\n".join(lines[start:end]).strip():
+            return [f"{name} is still a placeholder -- write its body"]
+        return []
+
+    try:
+        function = _generate_checked(prompt, fm_code, check)
+    except EditError:
+        return None
+    indent = re.match(r"\s*", signature).group(0)
+    body = [indent + l if l.strip() and not l.startswith(indent) else l for l in function.rstrip().splitlines()]
+    updated = "\n".join(lines[:start] + body + lines[end:])
+    return updated + ("\n" if original.endswith("\n") else "")
 
 
 def _drop_copied(label: str, before: str, text: str, cwd: str) -> str:
@@ -3406,10 +3453,37 @@ class ChatApp(App):
         (seen for real: a new script importing pandas, which wasn't
         installed). Returns ("behavior", argv, output, file) for the first
         failure, else None."""
+        task = getattr(self, "_task_request", "") or ""
+        printed = codework.request_examples(task, {}).get("prints") if task else []
         for rel in self._task_changed:
-            if not rel.endswith(".py") or not os.path.isfile(os.path.join(cwd, rel)):
+            if not rel.endswith((".py", ".js", ".cjs")) or not os.path.isfile(os.path.join(cwd, rel)):
                 continue
             after = codework.read_text(cwd, rel)
+            # What the request itself says the code should do: "'1h30m'
+            # gives 90", "apply_discount(50, 150) gives 0", inputs "like
+            # '1h30m', '45m' or '2h'" that mustn't crash. Measured: with no
+            # test suite, code that ignored the request's own examples
+            # (a slugify keeping the punctuation, a clamp returning 0)
+            # passed every check.
+            changed = codework.changed_functions(rel, self._task_originals.get(rel, ""), after)
+            # A name nothing defines crashes the moment it's reached.
+            undefined = codework.undefined_names(rel, after, set(changed))
+            if undefined:
+                func, name = undefined[0]
+                return ("behavior", [f"a check of the names {rel} uses"],
+                        f"{rel}: {func} uses `{name}`, which isn't defined anywhere in {rel} (not a parameter, a "
+                        f"local variable, an import, or a module-level name) -- calling {func} raises "
+                        f"NameError: name '{name}' is not defined", rel)
+            named = {n for n in codework.defined_names(after) if re.search(rf"(?<![\w$]){re.escape(n)}\s*\(?", task)}
+            params = codework.function_params(rel, after, set(changed) | named)
+            examples = codework.request_examples(task, params) if task and params else None
+            if examples and (examples["calls"] or examples["inputs"]):
+                self.call_from_thread(self._log_progress, f"checking: the request's examples against {rel}…")
+                ok, out = codework.run_examples(cwd, rel, examples)
+                if not ok:
+                    return ("behavior", [f"the request's examples for {rel}"], out, rel)
+            if not rel.endswith(".py"):
+                continue
             names = codework.changed_functions(rel, self._task_originals.get(rel, ""), after)
             script = codework.docstring_examples_script(rel, after, names) if names else None
             if script:
@@ -3423,6 +3497,15 @@ class ChatApp(App):
                 ok, out, origin = codework.run_smoke(cwd, runner, "python")
                 if not ok and origin == rel:
                     return ("behavior", [f"python {rel}"], out, rel)
+        # "...it should print 'Total: $10.80'": the program's output has to.
+        if printed and self._task_changed:
+            for rel in codework.entry_points(cwd, codework.project_files(cwd)):
+                self.call_from_thread(self._log_progress, f"checking: what {rel} prints…")
+                ok, out = codework.run_entry(cwd, rel)
+                missing = [p for p in printed if p not in out]
+                if ok and missing:
+                    return ("behavior", [f"running {rel}"],
+                            f"{rel} printed:\n{out[-800:]}\nbut the request says it should print {missing[0]!r}", rel)
         return None
 
     def _write_smoke_script(self, cwd: str, targets: list[str], task: str) -> tuple[str, str] | None:

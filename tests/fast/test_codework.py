@@ -365,4 +365,52 @@ assert not c.check_not_copied(d, "models.py", models, models + "\n\ndef by_id(us
 shutil.rmtree(d, ignore_errors=True)
 print("pasted-in edits rejected OK")
 
+# the request's own examples, as checks
+ex = c.request_examples("implement parse_duration: strings like '1h30m', '45m' or '2h' give minutes, so '1h30m' gives 90",
+                        {"parse_duration": 1})
+eq(ex["calls"], [("parse_duration('1h30m')", 90)])
+eq(ex["inputs"], ["parse_duration('45m')", "parse_duration('2h')"])
+eq(c.request_examples("so apply_discount(50, 150) gives 0; apply_discount(80, 25) still gives 60",
+                      {"apply_discount": 2})["calls"], [("apply_discount(50, 150)", 0), ("apply_discount(80, 25)", 60)])
+eq(c.request_examples("with its items it should print 'Total: $10.80'", {})["prints"], ["Total: $10.80"])
+eq(c.request_examples("make it faster", {"f": 1}), {"calls": [], "inputs": [], "prints": []})
+d = tempfile.mkdtemp(prefix="fm-pcc-examples-")
+with open(os.path.join(d, "duration.py"), "w") as f:
+    f.write("def parse_duration(text):\n    h, _, m = text.partition('h')\n    return int(h) * 60 + int(m.rstrip('m'))\n")
+ok, out = c.run_examples(d, "duration.py", ex)
+assert not ok and "parse_duration('45m') raised ValueError" in out and "parse_duration('2h') raised" in out, out
+with open(os.path.join(d, "math.js"), "w") as f:
+    f.write("function clamp(n, lo, hi) { return 0; }\nmodule.exports = { clamp };\n")
+ok, out = c.run_examples(d, "math.js", {"calls": [("clamp(5, 0, 10)", 5)], "inputs": [], "prints": []})
+assert not ok and "clamp(5, 0, 10) returned 0, but the request says it should give 5" in out, out
+eq(c.run_examples(d, "math.js", {"calls": [("clamp(0, 0, 10)", 0)], "inputs": [], "prints": []})[0], True)
+shutil.rmtree(d, ignore_errors=True)
+print("request examples OK")
+
+# a placeholder function is written from its signature
+eq(set(c.stub_functions("roman.py", "def to_roman(n):\n    raise NotImplementedError\n\n\ndef real(x):\n    return x\n")),
+   {"to_roman"})
+eq(set(c.stub_functions("fb.js", "function fb(n) {\n  throw new Error('not implemented');\n}\n")), {"fb"})
+d = tempfile.mkdtemp(prefix="fm-pcc-stub-")
+with open(os.path.join(d, "roman.py"), "w") as f:
+    f.write("import math\n\n\ndef to_roman(n):\n    raise NotImplementedError\n")
+asked = []
+with mock.patch.object(m, "fm_code", side_effect=lambda p, g=True: asked.append(p) or "def to_roman(n):\n    return 'I' * n"):
+    out = m.propose_edit("roman.py", "implement to_roman in roman.py", d)
+eq(out["updated"], "import math\n\n\ndef to_roman(n):\n    return 'I' * n\n")
+assert "starting with this line" in asked[0] and "NotImplementedError" not in asked[0], asked[0]
+shutil.rmtree(d, ignore_errors=True)
+print("placeholder functions written OK")
+
+# names a changed function uses that nothing defines
+rates = ("CALLS = []\n\n\ndef fetch_rate(c):\n    return 1\n\n\n"
+         "def get_rate(currency):\n    if currency not in rates.rates:\n        rates.rates[currency] = fetch_rate(currency)\n"
+         "    return rates.rates[currency]\n")
+eq(c.undefined_names("rates.py", rates, {"get_rate"}), [("get_rate", "rates")])
+ok_code = ("import math\n_SEEN = {}\n\n\ndef get_rate(currency, *args, **kw):\n    global X\n    try:\n        pass\n"
+           "    except ValueError as e:\n        print(e)\n    total = sum(x for x in [1])\n    X = len(_SEEN)\n"
+           "    return math.floor(total) + X\n")
+eq(c.undefined_names("rates.py", ok_code, {"get_rate"}), [])
+print("undefined names OK")
+
 print("ALL CODEWORK TESTS PASSED")

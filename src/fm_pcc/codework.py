@@ -1025,6 +1025,220 @@ def check_not_copied(cwd: str, rel: str, before: str, updated: str) -> list[str]
     return []
 
 
+_STUB_BODY_RE = re.compile(
+    r"^\s*(?:raise\s+NotImplementedError\b.*|pass|\.\.\.|#\s*TODO.*|//\s*TODO.*|"
+    r"throw\s+new\s+Error\(\s*['\"`][^'\"`]*(?:not\s+implemented|todo)[^'\"`]*['\"`]\s*\);?|"
+    r"fatalError\(.*\)|return\s+(?:None|null|undefined)?;?|[\"']{3}.*[\"']{3})\s*$",
+    re.IGNORECASE,
+)
+
+
+def stub_functions(rel: str, text: str) -> dict[str, tuple[int, int]]:
+    """Functions whose body is only a placeholder (`raise
+    NotImplementedError`, `pass`, `...`, a TODO, `throw new Error('not
+    implemented')`), as {name: (start, end)} line ranges."""
+    lines = text.splitlines()
+    out = {}
+    for name, start, end in function_blocks(rel, text):
+        body = [l for l in lines[start + 1:end] if l.strip() and l.strip() not in ("}", "};")]
+        if body and all(_STUB_BODY_RE.match(l) for l in body):
+            out[name] = (start, end)
+    return out
+
+
+_LITERAL = r"""(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?|True|False|None|true|false|null|\[[^\[\]]*\]|\{[^{}]*\})"""
+_GIVES = r"(?:gives|returns|should\s+(?:give|return|be)|becomes|is|equals|==|->|=>|→)"
+_CALL_EXAMPLE_RE = re.compile(rf"(?P<call>[A-Za-z_$][\w$]*\([^()]*\))\s+(?:still\s+)?{_GIVES}\s+(?P<want>{_LITERAL})")
+_ARG_EXAMPLE_RE = re.compile(rf"(?<![\w(])(?P<arg>{_LITERAL})\s+{_GIVES}\s+(?P<want>{_LITERAL})")
+_PRINTS_RE = re.compile(r"\b(?:should\s+)?(?:print|output|show|display)s?\s+(?P<want>'[^']+'|\"[^\"]+\")")
+_INPUTS_RE = re.compile(rf"\b(?:like|such\s+as|e\.g\.|for\s+example|inputs?\s+like)\s+(?P<list>{_LITERAL}(?:\s*,\s*(?:or\s+|and\s+)?{_LITERAL}|\s+(?:or|and)\s+{_LITERAL})*)")
+
+
+def _literal(text: str):
+    """A Python value for a literal written in a request (JS spellings
+    too: true/false/null); raises ValueError if it isn't one."""
+    text = {"true": "True", "false": "False", "null": "None"}.get(text, text)
+    return ast.literal_eval(text)
+
+
+def request_examples(request: str, functions: dict[str, int]) -> dict:
+    """What a request says the code should do, in checkable form:
+    - "calls": [(call, expected)] -- "apply_discount(50, 150) gives 0";
+      or, for the one changed function taking one argument, "'1h30m'
+      gives 90" / "1994 is 'MCMXCIV'" -> ("to_roman(1994)", "MCMXCIV");
+    - "inputs": calls that must at least not crash -- "strings like
+      '1h30m', '45m' or '2h'";
+    - "prints": text the program's output must contain -- "it should
+      print 'Total: $10.80'".
+    `functions` maps the changed functions to their parameter counts.
+    Only what the request itself spells out; nothing is guessed."""
+    calls, inputs, prints = [], [], []
+    single = [n for n, k in functions.items() if k == 1]
+    for m in _CALL_EXAMPLE_RE.finditer(request):
+        name = m.group("call").split("(")[0]
+        if name not in functions:
+            continue
+        try:
+            calls.append((m.group("call"), _literal(m.group("want"))))
+        except (ValueError, SyntaxError):
+            continue
+    if len(single) == 1:
+        taken = {m.span() for m in _CALL_EXAMPLE_RE.finditer(request)}
+        for m in _ARG_EXAMPLE_RE.finditer(request):
+            if any(a <= m.start() < b for a, b in taken):
+                continue
+            try:
+                _literal(m.group("arg"))
+                want = _literal(m.group("want"))
+            except (ValueError, SyntaxError):
+                continue
+            calls.append((f"{single[0]}({m.group('arg')})", want))
+        for m in _INPUTS_RE.finditer(request):
+            for lit in re.findall(_LITERAL, m.group("list")):
+                try:
+                    _literal(lit)
+                except (ValueError, SyntaxError):
+                    continue
+                call = f"{single[0]}({lit})"
+                if call not in [c for c, _ in calls]:
+                    inputs.append(call)
+    for m in _PRINTS_RE.finditer(request):
+        prints.append(_literal(m.group("want")))
+    return {"calls": _dedupe(calls), "inputs": list(dict.fromkeys(inputs)), "prints": prints}
+
+
+def _dedupe(pairs):
+    out = []
+    for p in pairs:
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def function_params(rel: str, text: str, names: set[str]) -> dict[str, int]:
+    """{name: number of parameters} for the functions `names` in a file."""
+    out = {}
+    if rel.endswith(".py"):
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return out
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+                out[node.name] = len(node.args.args) - (1 if node.args.args and node.args.args[0].arg == "self" else 0)
+        return out
+    for name in names:
+        m = re.search(rf"(?:function\s+{re.escape(name)}\s*|{re.escape(name)}\s*=\s*(?:async\s*)?(?:function\s*)?)\(([^)]*)\)", text)
+        if m:
+            out[name] = len([p for p in m.group(1).split(",") if p.strip()])
+    return out
+
+
+def examples_script(rel: str, examples: dict) -> tuple[str, str] | None:
+    """(language, script) that runs the request's examples against the
+    module `rel`: prints each mismatch ("parse_duration('2h') raised
+    ValueError: ..., the request says it should give 120") and exits 1.
+    None when there's nothing to run."""
+    if not examples["calls"] and not examples["inputs"]:
+        return None
+    if rel.endswith(".py"):
+        module = os.path.splitext(rel)[0].replace("/", ".")
+        lines = ["import math, sys", f"from {module} import *", "_bad = []",
+                 "def _same(a, b):",
+                 "    if isinstance(a, float) or isinstance(b, float):",
+                 "        try:\n            return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)\n        except TypeError:\n            return False",
+                 "    return a == b"]
+        for call, want in examples["calls"]:
+            lines.append(f"try:\n    _got = {call}\n    if not _same(_got, {want!r}):\n"
+                         f"        _bad.append({call!r} + ' returned ' + repr(_got) + ', but the request says it should give ' + {repr(want)!r})\n"
+                         f"except Exception as _e:\n    _bad.append({call!r} + ' raised ' + type(_e).__name__ + ': ' + str(_e) + "
+                         f"', but the request says it should give ' + {repr(want)!r})")
+        for call in examples["inputs"]:
+            lines.append(f"try:\n    {call}\nexcept Exception as _e:\n"
+                         f"    _bad.append({call!r} + ' raised ' + type(_e).__name__ + ': ' + str(_e) + ', but the request says it takes inputs like that')")
+        lines.append("if _bad:\n    print('\\n'.join(_bad))\n    sys.exit(1)")
+        return "python", "\n".join(lines) + "\n"
+    if rel.endswith((".js", ".cjs")):
+        path = "./" + rel
+        lines = [f"const _m = require({json.dumps(path)});", "const _bad = [];",
+                 "const _same = (a, b) => JSON.stringify(a) === JSON.stringify(b);"]
+        for call, want in examples["calls"]:
+            lines.append(f"try {{ const _got = _m.{call}; if (!_same(_got, {json.dumps(want)})) _bad.push({json.dumps(call)} + "
+                         f"' returned ' + JSON.stringify(_got) + ', but the request says it should give ' + {json.dumps(json.dumps(want))}); }} "
+                         f"catch (_e) {{ _bad.push({json.dumps(call)} + ' threw ' + _e + ', but the request says it should give ' + {json.dumps(json.dumps(want))}); }}")
+        for call in examples["inputs"]:
+            lines.append(f"try {{ _m.{call}; }} catch (_e) {{ _bad.push({json.dumps(call)} + ' threw ' + _e + "
+                         f"', but the request says it takes inputs like that'); }}")
+        lines.append("if (_bad.length) { console.log(_bad.join('\\n')); process.exit(1); }")
+        return "javascript", "\n".join(lines) + "\n"
+    return None
+
+
+def run_examples(cwd: str, rel: str, examples: dict, timeout: float = 20) -> tuple[bool, str]:
+    """Run the request's examples for `rel` on a copy of the project."""
+    made = examples_script(rel, examples)
+    if not made:
+        return True, ""
+    lang, script = made
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="fm-pcc-examples-") as tmp:
+        copy = os.path.join(os.path.realpath(tmp), "project")
+        shutil.copytree(cwd, copy, ignore=shutil.ignore_patterns(*_SKIP_DIRS, ".*"), symlinks=True)
+        name = "_fm_pcc_examples.py" if lang == "python" else "_fm_pcc_examples.js"
+        with open(os.path.join(copy, name), "w") as f:
+            f.write(script)
+        argv = [_python(cwd), name] if lang == "python" else ["node", name]
+        ok, out = run_check(argv, copy, timeout=timeout)
+        for prefix in sorted({copy, copy.replace("/private/", "/", 1)}, key=len, reverse=True):
+            out = out.replace(prefix + os.sep, "").replace(prefix, ".")
+    if out.startswith("timed out"):
+        return False, "the request's examples ran for over 20 seconds without finishing (too slow, or stuck in a loop)"
+    return ok, out
+
+
+def undefined_names(rel: str, text: str, functions: set[str]) -> list[tuple[str, str]]:
+    """(function, name) for names the Python functions `functions` use
+    that nothing in the file defines -- not a parameter, local, import,
+    global, class, or builtin -- so calling them crashes with a NameError.
+    Measured: a cache written as `rates.rates[currency]` inside rates.py
+    passed the syntax check and the smoke run (which never reached it)."""
+    if not rel.endswith(".py"):
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    import builtins
+
+    defined = set(dir(builtins)) | {"__name__", "__file__", "__doc__", "__builtins__", "__spec__"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            defined.add(node.id)
+        elif isinstance(node, ast.arg):
+            defined.add(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any(a.name == "*" for a in node.names):
+                return []        # a star import could define anything
+            defined |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            defined |= set(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            defined.add(node.name)
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in functions:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load) and inner.id not in defined:
+                    if (node.name, inner.id) not in out:
+                        out.append((node.name, inner.id))
+    return out
+
+
 def names_defined_elsewhere(cwd: str, rel: str) -> set[str]:
     """Top-level names defined in other files where a duplicate would
     clash: the same directory for Go (one package), and test functions

@@ -135,6 +135,11 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   the cross-file work, they went from 0/12 (both baseline runs) to
   9/12 (both final runs);
   at least 7 must pass.
+  `test_behavior_real.py` is 13 requests that say what the code must do
+  — by example, by rule, or by expected output — in projects with no
+  tests, each judged by hidden checks: 7/13 in both runs before the
+  request-example checks, 9/13 in all three runs after; at least 8 must
+  pass.
   `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
@@ -389,6 +394,18 @@ against the agentic-coding suite in `tests/slow/`:
   every syntax check while `main.py` crashed. A crash from a missing
   import (`NameError: name 'User' is not defined`, with `User` in
   models.py) is fixed in code, without the model.
+  Your request is checked too, when it says what the code should do:
+  examples it spells out ("`apply_discount(50, 150)` gives 0", "'1h30m'
+  gives 90", "1994 is 'MCMXCIV'") are run against the changed code,
+  inputs it mentions ("strings like '1h30m', '45m' or '2h'") have to at
+  least not crash, and "it should print 'Total: $10.80'" is checked
+  against what the program prints. A wrong result goes to the fix loop as
+  "returned X, but the request says it should give Y". So does a changed
+  Python function using a name nothing defines (it would crash with a
+  NameError the moment it ran). And a function that's only a placeholder
+  (`raise NotImplementedError`, `pass`, `throw new Error('not
+  implemented')`) is written from its signature — shown the stub, the
+  model handed it back unchanged every time.
   Two checks need no model at all: documented examples of the functions
   it changed (doctests, or `'1h30m' -> 90` in a docstring) are run and
   compared, and a new standalone script is run as-is (catching, say, an
@@ -716,19 +733,21 @@ character and a space.
   right (0 before); the misses are the model's own code (an email check that
   rejects `a@b.co`, nested JavaScript template strings that don't parse,
   a Swift protocol requirement its conforming types can't meet).
-- **Logic without tests or examples.** Syntax checks, smoke runs, and
-  documented examples catch code that doesn't compile, crashes, or
-  contradicts its own docstring — but not code that runs and is simply
-  wrong where nothing says what "right" is. The suite's documented case:
-  asked to cache a function's result, the model wrote a cache that's
-  never filled. With tests (or docstring examples) `/task` checks the
-  behavior and repairs it; without them, review the diff.
-- **Some logic it can't write at all.** A duration parser
-  (`"1h30m"` → 90 minutes) came out wrong in every attempt measured —
-  fixing its own try with the failing example shown, explaining the bug
-  first, and writing it fresh from the examples. fm-pcc catches the wrong
-  result and stops without committing it, but can't make the model get
-  it right. The same held for a quoted-field CSV parser.
+- **Logic stated only as a rule.** `/task` checks the examples your
+  request spells out, but a rule with no example ("a dot somewhere after
+  the @", "trim hyphens from both ends") isn't turned into checks, so
+  code that runs and breaks the rule gets through: a slugify that leaves
+  a leading hyphen, `parse_duration('2h')` returning 0 when the request
+  only listed '2h' as an input. Give an example of the tricky case ("'2h'
+  gives 120") and it's checked. And when a check does catch the model's
+  mistake, three fix rounds don't always repair it (a FizzBuzz loop that
+  started at 0) — `/task` then stops without committing.
+- **Some logic it can't write at all.** A quoted-field CSV parser came
+  out wrong in every attempt measured. fm-pcc catches the wrong result
+  and stops without committing it, but can't make the model get it
+  right. (A duration parser used to be on this list; written from its
+  signature and checked against the request's examples, it now comes
+  out right in about three runs of four.)
 - **Wording sensitivity.** Small prompt changes flip right answers to
   wrong ones (one added sentence cost one of six single-function fixes),
   which is why fm-pcc's prompts are measured rather than guessed.
