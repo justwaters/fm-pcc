@@ -144,6 +144,9 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   characters, a digit, and an uppercase letter"), with hidden checks on
   the edge cases the rules decide: 9/10 in both runs; at least 8 must
   pass.
+  `test_web_real.py` asks `/web` 20 questions with known answers against
+  the real web (20/20 measured, the model alone 12/20; at least 17 must
+  be right), and skips if the search service can't be reached.
   `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
@@ -255,6 +258,7 @@ Slash commands, same spirit as `fm chat`:
 | `/run <command>`             | Run a shell command here and show its output           |
 | `/license`                   | Read and agree to Apple's on-device model terms (one-time setup) |
 | `/docs [question]`           | Download language docs (picker), or answer a question from them |
+| `/web <question>`            | Search the web and answer from the pages found, with sources |
 | `/verify [on\|off]`          | Turn `/task`'s automatic checks (tests, syntax) on or off |
 | `/undo`                      | Revert the last file write, folder creation, or move made by `/edit` or `/task` |
 | `/push`                      | Commit and push the current changes to git (publishing a new branch if needed) |
@@ -551,6 +555,32 @@ either way (adding a SwiftUI search field, a MapKit map, a `@Generable`
 type), and two that passed without docs got worse with them — the model
 followed the old `URLSession.dataTask` API it was shown instead of
 `data(from:)`, and fumbled Swift Charts' `.value(_:_:)` labels.
+
+### Web research: `/web`
+
+`/web <question>` searches the web and answers from what it finds:
+fm-pcc searches DuckDuckGo, fetches the top few pages (text and HTML
+only, each capped in size and time), splits them into passages and ranks
+them locally the same way `/docs` does, and the on-device model answers
+from the best ones that fit its window — listing the pages it used.
+
+It's for what the model doesn't know and the downloaded docs don't
+cover: default settings and limits, error messages, library changes,
+command-line tools. On 20 such questions (default ports and settings,
+error messages, API changes, git and npm commands), the model alone got
+12 right; `/web` got all 20, in about 5–15 seconds each. Asked on its
+own how to undo a commit but keep its changes, the model said
+`git reset --hard` — which throws the changes away; `/web` answered
+`git reset --soft HEAD~1`, with sources.
+
+**Only when you type `/web`.** `/web` is the one thing in fm-pcc that
+sends your words off the device (besides the cloud model tiers you opt
+into): your question goes to DuckDuckGo, and the pages it finds are
+fetched. Chat, `/task`, `/ask` and `/docs` never search on their own.
+The answer itself is still written on-device. DuckDuckGo needs no account
+or key; fm-pcc reads its plain HTML results page, which isn't an official
+API — if it refuses a search (too many in a row, or a captcha), `/web`
+says so instead of guessing.
 
 ### Map-reduce: past the 4096-token window
 

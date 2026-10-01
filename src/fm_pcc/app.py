@@ -42,7 +42,7 @@ from textual.reactive import reactive
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__, codework, docs, mapreduce, taskplan
+from . import __version__, codework, docs, mapreduce, taskplan, web
 
 MODEL_LABELS = {
     "on-device": "on-device",
@@ -2927,6 +2927,7 @@ class ChatApp(App):
         "run": "run a shell command in this directory and show its output: /run <command>",
         "license": "read and agree to Apple's on-device model terms (one-time setup)",
         "docs": "download language docs, or ask them: /docs, /docs <question>",
+        "web": "search the web and answer from the pages found: /web <question>",
         "verify": "turn /task's automatic checks (tests, syntax) on or off: /verify [on|off]",
         "resume": "resume a saved conversation, or list saved ones: /resume [name]",
         "undo": "revert the last file write made by /edit or /task",
@@ -3006,6 +3007,12 @@ class ChatApp(App):
             self._handle_license()
         elif name == "docs":
             self._handle_docs(arg)
+        elif name == "web":
+            if not arg.strip():
+                self._add_message(Message("system", "usage: /web <question> -- searches DuckDuckGo and answers from the pages it finds"))
+                return
+            self.query_one(Input).disabled = True
+            self._run_web_question(arg.strip())
         elif name == "run":
             if not arg:
                 self._add_message(Message("system", "usage: /run <command>"))
@@ -3944,6 +3951,49 @@ class ChatApp(App):
             self.call_from_thread(self._log_progress, "stopped")
         except Exception as e:
             self.call_from_thread(self._log_progress, f"error: docs search failed: {e}")
+        finally:
+            self.call_from_thread(self._enable_input)
+
+    @work(thread=True)
+    def _run_web_question(self, question: str) -> None:
+        """/web <question>: search DuckDuckGo, fetch the top pages, rank
+        their passages locally, and answer on-device from the best ones,
+        listing the pages used. Only ever runs when the user types /web."""
+        self._loop_cancel_requested = False
+        try:
+            if not getattr(self, "_web_notice_shown", False):
+                self._web_notice_shown = True
+                self.call_from_thread(self._log_progress, "note: /web sends your question to DuckDuckGo and fetches "
+                                      "the pages it finds -- the answer itself is still written on-device")
+            self.call_from_thread(self._log_progress, "searching the web…")
+            try:
+                results = web.search(question)
+            except web.WebError as e:
+                self.call_from_thread(self._ask_answered, f"Couldn't search the web: {e}")
+                return
+            if not results:
+                self.call_from_thread(self._ask_answered, "The search found nothing for that.")
+                return
+            self.call_from_thread(self._log_progress, f"reading the top pages ({len(results)} results)…")
+            pages = web.fetch_all(results)
+            hits = web.rank(question, pages, results)
+            if not hits:
+                self.call_from_thread(self._ask_answered, "The pages found didn't have anything matching that.")
+                return
+            chosen = self._docs_passages(question, hits)
+            self.call_from_thread(self._log_progress, f"reading the {len(chosen)} most relevant passages…")
+            try:
+                answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+            except EditError:
+                answer, _sources = mapreduce.answer_over(question, chosen, ask_on_device, self._engine())
+            used = hits[: len(chosen)]
+            urls = list(dict.fromkeys(h["url"] for h in used))[:5]
+            links = "\n".join(f"- {u}" for u in urls)
+            self.call_from_thread(self._ask_answered, answer.strip() + (f"\n\nSources:\n{links}" if links else ""))
+        except (GenerationCancelled, InterruptedError):
+            self.call_from_thread(self._log_progress, "stopped")
+        except Exception as e:
+            self.call_from_thread(self._log_progress, f"error: web search failed: {e}")
         finally:
             self.call_from_thread(self._enable_input)
 
