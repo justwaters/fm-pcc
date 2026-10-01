@@ -140,6 +140,10 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   tests, each judged by hidden checks: 7/13 in both runs before the
   request-example checks, 9/13 in all three runs after; at least 8 must
   pass.
+  `test_rules_real.py` is 10 requests stated only as rules ("at least 8
+  characters, a digit, and an uppercase letter"), with hidden checks on
+  the edge cases the rules decide: 9/10 in both runs; at least 8 must
+  pass.
   `test_on_device_capabilities.py` covers
   create/rename/move and the push/branch gating. About 25 minutes in
   total, plus about 6 minutes the first time to download Apple's docs.
@@ -739,9 +743,14 @@ character and a space.
   code that runs and breaks the rule gets through: a slugify that leaves
   a leading hyphen, `parse_duration('2h')` returning 0 when the request
   only listed '2h' as an input. Give an example of the tricky case ("'2h'
-  gives 120") and it's checked. And when a check does catch the model's
-  mistake, three fix rounds don't always repair it (a FizzBuzz loop that
-  started at 0) — `/task` then stops without committing.
+  gives 120") and it's checked. (Having the model turn rules into
+  examples itself was measured and left out: on 10 rule-only requests
+  `/task` already got 9 right, and about 1 in 30 of the examples the
+  model proposed — even after a second, independent answer had to agree
+  — was wrong, which would have "fixed" correct code.) And when a check
+  does catch the model's mistake, three fix rounds don't always repair it
+  (a FizzBuzz loop that started at 0) — `/task` then stops without
+  committing.
 - **Some logic it can't write at all.** A quoted-field CSV parser came
   out wrong in every attempt measured. fm-pcc catches the wrong result
   and stops without committing it, but can't make the model get it
