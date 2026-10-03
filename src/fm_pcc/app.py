@@ -1029,6 +1029,7 @@ TASK_CONFIRM_GATED = {"PUSH", "BRANCH_CREATE", "BRANCH_SWITCH", "PULL", "RUN"}
 # shows the model the output and has it fix the file -- up to this many
 # rounds before giving up and saying so.
 VERIFY_ROUNDS = 3
+HINT_ROUNDS = 2   # extra fix rounds after the user explains what's wrong
 
 _PLAN_SCHEMA = {
     "type": "object", "title": "Plan", "additionalProperties": False,
@@ -3515,6 +3516,35 @@ class ChatApp(App):
             )
         return failing
 
+    def _ask_for_hint(self, label: str, output: str) -> str:
+        """Ask the user, once, how to fix what the checks still catch after
+        the fix rounds; their answer, or "" to stop. Blocks the worker
+        thread until they answer in the input box (Enter alone stops). Off
+        when nobody's there to answer (FM_PCC_NONINTERACTIVE=1)."""
+        if os.environ.get("FM_PCC_NONINTERACTIVE") == "1":
+            return ""
+        import threading
+        failing = codework.errors_only(output).strip().splitlines()
+        shown = "\n".join(failing[:6])[:600]
+        self._hint_event = threading.Event()
+        self._hint_answer = ""
+        self.call_from_thread(self._open_hint_question, label, shown)
+        self._hint_event.wait()
+        self._hint_event = None
+        return self._hint_answer.strip()
+
+    def _open_hint_question(self, label: str, shown: str) -> None:
+        self._add_message(Message(
+            "system",
+            f"The fixes didn't get {label} passing:\n{shown}\n\n"
+            "Can you say how it should work? Type a short explanation and press Enter to try again with it "
+            "-- or press Enter on an empty line to stop.",
+        ))
+        box = self.query_one(Input)
+        box.disabled = False
+        box.placeholder = "explain how it should work, or Enter to stop"
+        box.focus()
+
     def _entries_running(self, cwd: str, steps: list[dict]) -> list[str]:
         """The project's programs (main.py, index.js, main.swift...) that
         run cleanly before this task changes anything; each has to still
@@ -3666,7 +3696,11 @@ class ChatApp(App):
         task = self._task_request
         about_tests = bool(_ABOUT_TESTS_RE.search(task))
         smoke_script: tuple[str, str] | None = None
-        for round_number in range(VERIFY_ROUNDS + 1):
+        self._task_hint = ""
+        last_round = VERIFY_ROUNDS
+        round_number = -1
+        while round_number < last_round:
+            round_number += 1
             smoke_origin: str | None = None
             checks = codework.detect_checks(cwd, self._task_changed, task)
             if not checks:
@@ -3733,13 +3767,26 @@ class ChatApp(App):
                 break
             label, argv, out = failure
             tail = codework.errors_only(out)[-1500:]
-            if round_number == VERIFY_ROUNDS:
-                self.call_from_thread(
-                    self._log_progress,
-                    f"error: {label} still failing after {VERIFY_ROUNDS} fix attempts -- stopping "
-                    f"before anything else (nothing committed). Output:\n{tail}",
-                )
-                return False
+            if round_number == last_round:
+                # Out of fix rounds: before giving up, ask the person who
+                # knows what they meant. Measured on bugs the model never
+                # fixed alone: a one-line explanation took a missing-idea
+                # bug from 2/6 fixes to 4-5/6 (it barely helps when the
+                # model can't write the logic at all).
+                hint = "" if self._task_hint else self._ask_for_hint(label, tail)
+                if hint:
+                    self._task_hint = hint
+                    last_round += HINT_ROUNDS
+                    self.call_from_thread(self._log_progress, f"trying again with your explanation: {hint}")
+                else:
+                    tried = VERIFY_ROUNDS + (HINT_ROUNDS if self._task_hint else 0)
+                    self.call_from_thread(
+                        self._log_progress,
+                        f"error: {label} still failing after {tried} fix attempts"
+                        + (" (including your explanation) -- this may be a part to write yourself" if self._task_hint else "")
+                        + f" -- stopping before anything else (nothing committed). Output:\n{tail}",
+                    )
+                    return False
             all_files = codework.project_files(cwd)
             # A missing import is fixed in code, without the model.
             imported = codework.missing_import_fix(cwd, out, all_files)
@@ -3804,7 +3851,9 @@ class ChatApp(App):
                         target, task, cwd, context=context, task=task, expectations=False, keep=keep,
                         feedback=(
                         f"After the change, running `{' '.join(os.path.basename(a) for a in argv)}` "
-                        f"fails with:\n{tail}\nFix {target} so it passes."
+                        f"fails with:\n{tail}\n"
+                        + (f"The user explained: {self._task_hint}\n" if self._task_hint else "")
+                        + f"Fix {target} so it passes."
                     ) if label != "smoke run" else (
                         f"After the change, calling the code crashes:\n{tail}\nFix {target} so it works."
                     ),
@@ -4836,6 +4885,17 @@ class ChatApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.query_one("#palette", OptionList).display = False
+        pending = getattr(self, "_hint_event", None)
+        if pending is not None and not pending.is_set():
+            # The answer to /task's "how should it work?" question.
+            self._hint_answer = event.value.strip()
+            if self._hint_answer:
+                self._add_message(Message("user", self._hint_answer))
+            event.input.value = ""
+            event.input.placeholder = "Message fm-pcc… (/ for commands)"
+            event.input.disabled = True
+            pending.set()
+            return
         prompt = event.value.strip()
         if not prompt:
             return

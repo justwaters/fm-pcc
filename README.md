@@ -846,7 +846,21 @@ character and a space.
   bugs the model can fix it fixes in most samples (so the sequential
   rounds already get them), and the ones it can't it got wrong in all
   six — with up to six different wrong answers — so the parallel version
-  fixed the same number at three times the wait. When it can't repair
+  fixed the same number at three times the wait.
+
+  **When the fixes run out, it asks you.** Instead of stopping, `/task`
+  shows what's still failing ("`shipping_cost(2.5, False)` returned 8,
+  but the request says it should give 9") and asks how it should work.
+  Type a short explanation and it tries twice more with it; press Enter
+  on an empty line to stop. Measured on bugs the model never fixed alone,
+  an explanation helps most when one idea is missing — where to remember
+  the rates for a cache went from 2 fixes in 6 to 4–5 in 6 — and barely
+  when the model can't write the logic at all (a slug regex, rounding up,
+  quoted CSV: 1–2 in 18, even when told exactly what to write); then
+  `/task` says this may be a part to write yourself. Often the best
+  explanation is the example itself, given up front: with "so
+  `shipping_cost(2.5, False)` gives 9" in the request, the model got that
+  rounding right the first time, in three runs of three. When it can't repair
   the code, `/task` stops without committing.
 - **Some logic it can't write at all.** A quoted-field CSV parser came
   out wrong in every attempt measured. fm-pcc catches the wrong result

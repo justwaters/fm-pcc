@@ -43,6 +43,8 @@ for dir in $dirs; do
         # slow suites a "search the web?" prompt would wait for an answer
         # nobody is there to give.
         export FM_PCC_AUTO_WEB=0
+        # ...and no questions for the user (/task's "how should it work?").
+        export FM_PCC_NONINTERACTIVE=1
         if uv run --quiet --with textual --with rich python3 "$test" >"$log" 2>&1; then
             passed=$((passed + 1))
             echo "  ok    $test ($(( $(date +%s) - start ))s)"

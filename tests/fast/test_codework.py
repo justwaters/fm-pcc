@@ -476,4 +476,70 @@ eq([s["action"] for s in m._cover_touched([t.step("RENAME", "index.htm", "index.
    ["RENAME"])
 print("request commands and placement OK")
 
+# out of fix rounds: ask the user how it should work, then try again with it
+async def hint_checks():
+    import threading
+    os.environ.pop("FM_PCC_NONINTERACTIVE", None)
+    app = m.ChatApp()
+    async with app.run_test() as pilot:
+        box = app.query_one(m.Input)
+        for answer, want in (("part of a kg counts as a whole one", "part of a kg counts as a whole one"), ("", "")):
+            out = []
+            th = threading.Thread(target=lambda: out.append(app._ask_for_hint("tests", "AssertionError: 8 != 9")), daemon=True)
+            th.start()
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if not box.disabled:
+                    break
+            assert any("Can you say how it should work?" in msg.text for msg in app._transcript)
+            box.value = answer
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if not th.is_alive():
+                    break
+            eq(out, [want])
+    os.environ["FM_PCC_NONINTERACTIVE"] = "1"
+    eq(m.ChatApp()._ask_for_hint("tests", "x"), "")          # nobody to answer: never asks
+    print("asking for a hint OK")
+
+
+asyncio.run(hint_checks())
+
+d = project({"stats.py": "def average(xs):\n    return sum(xs) / len(xs)\n",
+             "test_stats.py": "import unittest\nfrom stats import average\n\n\nclass T(unittest.TestCase):\n"
+                              "    def test_empty(self):\n        self.assertEqual(average([]), 0)\n"})
+orig = os.getcwd()
+os.chdir(d)
+prompts = []
+
+
+def model(prompt, greedy=True):
+    prompts.append(prompt)
+    if "The user explained: return 0 when the list is empty" in prompt:
+        return "def average(xs):\n    return sum(xs) / len(xs) if xs else 0\n"
+    return "def average(xs):\n    return sum(xs) / max(len(xs), 1) or None\n"
+
+
+async def loop_with_hint():
+    app = m.ChatApp()
+    log = []
+    async with app.run_test():
+        with mock.patch.object(app, "call_from_thread", side_effect=lambda fn, *a, **k: fn(*a, **k)), \
+             mock.patch.object(app, "_log_progress", side_effect=log.append), mock.patch.object(m, "notify"), \
+             mock.patch.object(m, "fm_code", side_effect=model), \
+             mock.patch.object(app, "_ask_for_hint", return_value="return 0 when the list is empty") as asked:
+            app._run_task.__wrapped__(app, "fix average in stats.py: it should return 0 for an empty list")
+    eq(asked.call_count, 1)
+    assert "else 0" in open("stats.py").read(), (open("stats.py").read(), log[-4:])
+    assert any("trying again with your explanation" in l for l in log), log
+    print("fix loop uses the hint OK")
+
+
+try:
+    asyncio.run(loop_with_hint())
+finally:
+    os.chdir(orig)
+    shutil.rmtree(d, ignore_errors=True)
+
 print("ALL CODEWORK TESTS PASSED")
