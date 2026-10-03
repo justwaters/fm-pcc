@@ -841,7 +841,12 @@ character and a space.
   in the first round; the rest are the same few every time ("each extra
   kilogram or part of one" was never fixed). Rewriting the failing
   function from scratch instead was measured too (38 of 50 against 36 of
-  50, within the run-to-run noise) and left out. When it can't repair
+  50, within the run-to-run noise) and left out, and so was trying three
+  fixes in parallel and keeping one that passes: sampled six times, the
+  bugs the model can fix it fixes in most samples (so the sequential
+  rounds already get them), and the ones it can't it got wrong in all
+  six — with up to six different wrong answers — so the parallel version
+  fixed the same number at three times the wait. When it can't repair
   the code, `/task` stops without committing.
 - **Some logic it can't write at all.** A quoted-field CSV parser came
   out wrong in every attempt measured. fm-pcc catches the wrong result
