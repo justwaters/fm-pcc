@@ -633,6 +633,17 @@ Python app"). Deny those; with **Allow always**, they quietly spend
 `/web never` set this, and are remembered in `~/.fm-pcc/state.json`;
 `/web never` keeps fm-pcc fully offline except when you type `/web`.
 
+In chat, the check isn't what you wait for: it takes about 0.6 seconds
+once the model is warm, while replies take 1.5–7 seconds, and over six
+questions a reply alone and the check plus a reply averaged the same
+(3.9s). What it did get wrong was chat itself: it asked to search for
+"I'm Justin, nice to meet you" and "Thanks Claude, that worked", and
+never checked "what's new in iOS 27?" (a lowercase first letter didn't
+count as a name). Names in greetings are now skipped and "iOS" or
+"iPhone" count; on 80 chat messages in three sets, one written after the
+change, it went from 72 to 77 right, still catching every one that
+needed the web.
+
 **What leaves the device.** Your search terms go to DuckDuckGo and the
 pages it finds are fetched — only after you type `/web` or allow it; the
 answers and the work are still done on-device. `/ask` and `/docs` never

@@ -104,6 +104,11 @@ assert web.names_something("who is the CEO of OpenAI?") and web.names_something(
 assert not web.names_something("build me an html page with a contact form")
 assert not web.names_something("make a landing page for my bakery with a menu section")
 assert not web.names_something("add a multiply function to calc.py")
+assert web.names_something("what's new in iOS 27?") and web.names_something("how much is an iPhone now")
+for social in ("I'm Justin, nice to meet you", "Good morning! My name is Carlos.", "Thanks Claude, that worked",
+               "hey Priya here"):
+    assert not web.names_something(social), social                   # a person's name in a greeting: no check
+assert web.names_something("thanks! who is the CEO of OpenAI?")
 judge = mock.Mock(return_value={"needs_web": True})
 assert not web.needs_web("make the button blue in style.css", judge) and not judge.called   # no model call
 assert web.needs_web("what's the newest version of Python?", judge)

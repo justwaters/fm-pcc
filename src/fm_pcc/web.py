@@ -171,7 +171,9 @@ _TIME_WORDS = re.compile(
     r"yet|so far|anymore|still|20[2-9]\d)\b", re.I)
 _NOT_NAMES = {"I", "A", "An", "The", "In", "On", "For", "To", "Of", "And", "Or", "But", "With", "Make", "Build",
               "Add", "Create", "Write", "Research", "What", "Who", "Which", "When", "How", "Is", "Are", "Does", "Do",
-              "Can", "Please", "List", "Show", "Find", "Update", "Explain", "Use", "Put", "Give", "Tell"}
+              "Can", "Please", "List", "Show", "Find", "Update", "Explain", "Use", "Put", "Give", "Tell",
+              "Hi", "Hey", "Hello", "Thanks", "Thank", "Good", "Great", "Nice", "Ok", "Okay", "Yes", "No", "Sure",
+              "My", "Why", "Where", "Should", "Could", "Would", "Will", "It", "That", "This", "So", "Now", "Then"}
 
 
 def names_something(request: str) -> bool:
@@ -185,10 +187,13 @@ def names_something(request: str) -> bool:
         return True
     text = re.sub(r"(?<![\w])[`'\"][^`'\"]*[`'\"](?![\w])", " ", request)   # quoted text is content
     text = re.sub(r"\b[\w./-]+\.[A-Za-z]{1,5}\b", " ", text)           # file names
+    # names in a greeting or introduction ("I'm Priya", "thanks Claude"):
+    # measured, the judge flagged every one as needing the web
+    text = re.sub(r"\b(?i:I'm|I am|my name is|call me|thanks|thank you|hi|hey|hello)[,!]?\s+[A-Z][a-z]+\b", " ", text)
     for word in re.findall(r"\b[A-Za-z][\w.+-]*", text):
         if word in _NOT_NAMES:
             continue
-        if word[0].isupper() or re.search(r"\d", word):
+        if any(c.isupper() for c in word) or re.search(r"\d", word):     # "iOS", "iPhone" too
             return True
     return bool(re.search(r"\b\d+(?:\.\d+)+\b", text))                 # a version number
 
