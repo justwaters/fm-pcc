@@ -852,12 +852,16 @@ character and a space.
   in the first round; the rest are the same few every time ("each extra
   kilogram or part of one" was never fixed). Rewriting the failing
   function from scratch instead was measured too (38 of 50 against 36 of
-  50, within the run-to-run noise) and left out, and so was trying three
-  fixes in parallel and keeping one that passes: sampled six times, the
-  bugs the model can fix it fixes in most samples (so the sequential
-  rounds already get them), and the ones it can't it got wrong in all
-  six — with up to six different wrong answers — so the parallel version
-  fixed the same number at three times the wait.
+  50, within the run-to-run noise) and left out. So was having the model
+  name the cause before writing the fix ("think first"): 75 of 100
+  against 72 of 100 — no gain overall, though it fixes different bugs (a
+  slugify's trimming and quoted CSV fields more often, a missing cache
+  much less often); asking for the cause in a separate call first did no
+  better (34 of 50). Trying three fixes in parallel and keeping one that
+  passes fixed 41 of 50 against 37 of 50 in the same batch, at a bit over
+  twice the wait — a small gain, not yet worth making every fix slower.
+  (An earlier version of this note said it fixed the same number; that
+  measurement had a bug that showed every fix an empty file.)
 
   **When the fixes run out, it asks you.** Instead of stopping, `/task`
   shows what's still failing ("`shipping_cost(2.5, False)` returned 8,
