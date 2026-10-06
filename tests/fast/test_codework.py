@@ -331,6 +331,12 @@ plan = [t.step("CREATE_FOLDER", "test"), t.step("CREATE_FILE", "test/path.txt")]
 eq([s["action"] for s in m._cover_touched(plan, "x", tempfile.gettempdir(), [])], ["CREATE_FOLDER", "CREATE_FILE"])
 plan = [t.step("RENAME", "hello.py", "greet.py"), t.step("EDIT", "greet.py", details="print hello world")]
 eq([s["action"] for s in m._cover_touched(plan, "x", tempfile.gettempdir(), ["hello.py"])], ["RENAME", "EDIT"])
+# a file created for the whole request isn't then "edited" for it again, and
+# a one-file request gets no "part of this request" (seen: "write it to findings.md")
+lineup = "give me a list of the iphone 18 family lineup with prices, and write it to findings.md"
+steps = m._cover_touched([t.step("CREATE_FILE", "findings.md", details=lineup), t.step("EDIT", "findings.md", details=lineup)],
+                         lineup, tempfile.gettempdir(), [])
+eq([(s["action"], s["details"]) for s in steps], [("CREATE_FILE", lineup)])
 print("plan repairs OK")
 
 # Swift: main.swift's statements pasted into another file are removed

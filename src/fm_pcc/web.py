@@ -175,6 +175,19 @@ _NOT_NAMES = {"I", "A", "An", "The", "In", "On", "For", "To", "Of", "And", "Or",
               "Hi", "Hey", "Hello", "Thanks", "Thank", "Good", "Great", "Nice", "Ok", "Okay", "Yes", "No", "Sure",
               "My", "Why", "Where", "Should", "Could", "Would", "Will", "It", "That", "This", "So", "Now", "Then"}
 
+# Words that come before a plain count or position, not a product's number.
+_NOT_BEFORE_NUMBER = {
+    "the", "and", "for", "with", "than", "from", "into", "about", "under", "over", "after", "before", "between",
+    "top", "first", "last", "next", "every", "only", "just", "least", "most", "all", "give", "make", "write", "add",
+    "list", "show", "find", "get", "use", "using", "take", "takes", "set", "change", "return", "returns", "print",
+    "prints", "gives", "line", "lines", "page", "pages", "step", "steps", "item", "items", "row", "rows", "column",
+    "chapter", "part", "port", "level", "round", "rounds", "times", "minus", "plus", "times", "divided", "number",
+    "length", "size", "width", "height", "age", "aged", "are", "was", "were", "has", "have", "had", "his", "her",
+    "its", "their", "our", "your", "out", "until", "within", "around", "exactly", "nearly", "almost", "approximately",
+    "issue", "ticket", "test", "tests", "day", "days", "week", "weeks", "year", "years", "hour", "hours", "minute",
+    "minutes", "seconds", "second", "dollars", "percent", "cost", "costs", "price", "pay", "need", "want",
+}
+
 
 def names_something(request: str) -> bool:
     """Whether a request refers to something specific in the world -- a
@@ -195,7 +208,74 @@ def names_something(request: str) -> bool:
             continue
         if any(c.isupper() for c in word) or re.search(r"\d", word):     # "iOS", "iPhone" too
             return True
-    return bool(re.search(r"\b\d+(?:\.\d+)+\b", text))                 # a version number
+    if re.search(r"\b\d+(?:\.\d+)+\b", text):                           # a version number
+        return True
+    # a name typed in lowercase with its number: "iphone 18", "windows 11"
+    # -- seen for real, "the iphone 18 family lineup with prices" was
+    # answered with invented prices, never checked
+    return any(w.lower() not in _NOT_BEFORE_NUMBER
+               for w in re.findall(r"\b([A-Za-z][a-z]{2,})\s+\d{1,4}\b(?![.,:/]\d)", text))
+
+
+_FILE_NAME_RE = re.compile(r"\b(?![A-Z][a-z]+\.js\b)[\w./-]+\.(?:md|markdown|txt|html?|css|js|mjs|ts|tsx|jsx|json|py|"
+                           r"csv|ya?ml|toml|swift|xml|rst|ini|cfg|sh|rb|go|rs|java|kt)\b")      # (not "Node.js")
+_OUTPUT_VERB_RE = re.compile(r"^\s*(?:and\s+|then\s+)*(?:put|write|save|store|record|export|build|make|create|add|turn|"
+                             r"format|list)\b", re.I)
+
+
+_LATEST_RE = re.compile(r"\b(?:latest|newest|current|most recent)\s+((?:[\w.+-]+\s+){0,2}?(?:version|release|model|"
+                        r"models|update|os|lineup|generation|edition)s?\b|[\w.+-]+(?:\s+[\w.+-]+)?)", re.I)
+
+
+def asks_for_latest(text: str) -> bool:
+    return bool(re.search(r"\b(?:latest|newest|current|most recent|upcoming|20\d\d)\b", text, re.I))
+
+
+def latest_query(request: str) -> str:
+    """"latest ios version 2026" for a request about "the latest ios
+    version": a short search for what the latest actually is -- seen for
+    real, asked about the camera app in "the latest ios version", the
+    model searched for iOS 18 vs iOS 17."""
+    m = _LATEST_RE.search(request)
+    if not m:
+        return ""
+    import time as _time
+    words = [w for w in m.group(0).split() if w.lower() not in ("and", "or", "the", "a", "with", "for", "of", "in")]
+    return f"{' '.join(words)} {_time.strftime('%Y')}"
+
+
+def search_terms(request: str) -> str:
+    """A search query in the request's own words: without the parts about
+    files and output ("Put your findings in a new findings.md file", "and
+    write it to findings.md", "and build me an html page") or the opening
+    verb ("research", "give me a list of"), with this year added when it
+    asks for the latest of something."""
+    clauses = [c for c in re.split(r"(?<!\d)\.(?=\s|$)|[;!?\n]|,\s*|\s+(?=(?:and|then)\s+(?:put|write|save|store|"
+                                   r"record|export|build|make|create|add|turn|format|list)\b)", request) if c and c.strip()]
+    kept = []
+    for i, c in enumerate(clauses):
+        if re.match(r"\s*(?:like|as|e\.g|for example|such as|so)\b", c, re.I):
+            continue                                   # "like 'Python X.Y'", "as {"lts": N}"
+        if _FILE_NAME_RE.search(c):
+            # what goes in the file: "add a line to README.md saying the
+            # newest stable Python version", "create node.json with ..."
+            about = re.search(r"\b(?:saying|that says|listing|containing|with|about)\s+(.+)", c, re.I)
+            if about and not _FILE_NAME_RE.search(about.group(1)):
+                kept.append(about.group(1))
+            continue
+        if not (i and _OUTPUT_VERB_RE.match(c)):
+            kept.append(c)
+    text = " ".join(kept) or _FILE_NAME_RE.sub(" ", request)
+    text = re.sub(r"^\s*(?:(?:please|can you|could you)\s+)?(?:research|look up|find out|find|search(?: for)?|tell me|"
+                  r"give me|show me|make|build|create|write)\s+(?:(?:me|about)\s+)?(?:(?:a|an)\s+(?:\w+\s+){0,2}?(?:list|"
+                  r"table|summary|page|overview|site|document)\s+(?:of|about|listing|with|on)\s+)?", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" ,.")
+    if not text:
+        return ""
+    if _TIME_WORDS.search(text) and not re.search(r"\b20\d\d\b", text):
+        import time as _time
+        text += f" {_time.strftime('%Y')}"
+    return " ".join(text.split()[:16])
 
 
 _JUDGE_SCHEMA = {"type": "object", "title": "Verdict", "additionalProperties": False,

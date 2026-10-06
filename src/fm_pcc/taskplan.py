@@ -1887,6 +1887,33 @@ def is_direct_action(text: str, files: list[str], folders: list[str]) -> bool:
     return bool(steps) and all(s["action"] != "UNPARSED" for s in steps)
 
 
+_FILE_OUTPUT_RE = re.compile(
+    r"\b(?:put|write|save|store|record|output|export|dump|place|list|add)\b[^.?!\n]{0,80}?\b(?:in|into|to|as)\s+"
+    r"(?:a\s+|the\s+)?(?:new\s+)?(?:file\s+(?:called\s+|named\s+)?)?[`'\"]?[\w./-]+\.[A-Za-z]{1,5}\b",
+    _I,
+)
+
+
+def asks_for_file_output(text: str) -> bool:
+    """"research X. Put your findings in a new findings.md file", "give me
+    a list of ..., and write it to findings.md": the answer is wanted in a
+    file, which only /task can write -- seen for real, chat printed the
+    file's contents and wrote nothing. Not a question about how to do it
+    ("how do I write a list to out.txt in Python?")."""
+    if text.rstrip().endswith("?") or re.search(r"\bhow\s+(?:do|can|would|should|to)\b", text, _I):
+        return False
+    return bool(_FILE_OUTPUT_RE.search(text))
+
+
+def is_vague_followup(text: str) -> bool:
+    """"so change the file", "fix it", "update that": a short request that
+    only makes sense with what was said before it."""
+    words = text.split()
+    return (len(words) <= 10 and not re.search(r"\b[\w./-]+\.[A-Za-z]{1,5}\b", text)
+            and bool(re.search(r"\b(?:it|that|this|them|those|the\s+(?:file|page|list|table|doc|document|code|script|"
+                               r"readme|text|one))\b", text, _I)))
+
+
 def looks_like_action(text: str) -> bool:
     """A chat message that reads like a change request, but that the
     parser couldn't fully read -- worth offering to run it as /task."""

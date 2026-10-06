@@ -15,6 +15,10 @@ from textual.containers import VerticalScroll  # noqa: E402
 from textual.widgets import Input  # noqa: E402
 
 
+def eq(got, want):
+    assert got == want, f"\n got: {got!r}\nwant: {want!r}"
+
+
 def texts(app):
     return [str(w.render()) for w in app.query_one("#log", VerticalScroll).children]
 
@@ -67,6 +71,58 @@ async def main():
                 await say(app, pilot, "yes")
                 assert len(tasks) == 2 and len(chats) == 3, (tasks, chats)
                 print("a second 'yes' with nothing pending is just chat OK")
+
+                # the answer wanted in a file: only /task can write it
+                await say(app, pilot, "give me a list of the iphone 18 family lineup with prices, and write it to findings.md")
+                assert tasks[-1].endswith("write it to findings.md"), tasks
+                await say(app, pilot, "how do I write a list to out.txt in Python?")
+                assert len(tasks) == 3, tasks
+                print("asking for the answer in a file runs as /task OK")
+
+                # a vague follow-up runs with what was said before it
+                await say(app, pilot, "the base iphone 18 doesnt exist")
+                await say(app, pilot, "so change the file")
+                await say(app, pilot, "do it")
+                eq(tasks[-1], 'The user said: "the base iphone 18 doesnt exist". so change the file')
+                print("a vague follow-up keeps the conversation OK")
+
+                # research looks at what was typed, not the folder listing the first turn carries
+            researched = []
+            with mock.patch.object(app, "_research_if_needed", side_effect=lambda r: researched.append(r)), \
+                 mock.patch.object(app.backend, "respond", side_effect=lambda p, model: ("ok", model)):
+                app.turn = 0
+                await say(app, pilot, "what is a closure")
+            eq(researched, ["what is a closure"])
+            print("research gets the typed message OK")
+    finally:
+        os.chdir(orig)
+        shutil.rmtree(cwd, ignore_errors=True)
+
+    # ---- the planner gives up on a follow-up: the one file it can be about ----
+    cwd = tempfile.mkdtemp(prefix="fm-pcc-followup-")
+    os.chdir(cwd)
+    try:
+        with open("findings.md", "w") as f:
+            f.write("- iPhone 18: $999\n- iPhone 18 Pro: $1,199\n")
+        app = m.ChatApp()
+        async with app.run_test():
+            app._message_log += [m.Message("user", "the base iphone 18 doesnt exist"),
+                                 m.Message("user", "so change the file")]
+            request = app._with_conversation("so change the file")
+            eq(app._followup, (request, "findings.md"))
+            log = []
+            gave_up = [m.taskplan.step("UNSUPPORTED", details="work out how to do it")]
+            with mock.patch.object(app, "call_from_thread", side_effect=lambda fn, *a, **k: fn(*a, **k)), \
+                 mock.patch.object(app, "_log_progress", side_effect=log.append), mock.patch.object(m, "notify"), \
+                 mock.patch.object(m, "plan_task", return_value=(gave_up, None)), \
+                 mock.patch.object(m, "propose_edit", return_value={
+                     "path": os.path.join(cwd, "findings.md"), "label": "findings.md",
+                     "original": "- iPhone 18: $999\n- iPhone 18 Pro: $1,199\n", "updated": "- iPhone 18 Pro: $1,199\n",
+                     "summary": "edited findings.md"}):
+                app._run_task.__wrapped__(app, request)
+            assert any(str(l).startswith("plan:\n1. edit findings.md") for l in log), log
+            eq(open("findings.md").read(), "- iPhone 18 Pro: $1,199\n")
+            print("a follow-up the planner can't place edits the one file OK")
     finally:
         os.chdir(orig)
         shutil.rmtree(cwd, ignore_errors=True)

@@ -151,6 +151,12 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   always): four requests needing current facts must come out current (at
   least 3; measured 4 of 4 in two runs), and plain coding requests must
   not search.
+  `test_session_real.py` replays a real chat session through the same
+  input path as typing: two research requests that want a file, and a
+  correction with "so change the file" and "do it". Each result is judged
+  against the real facts (the iPhone 18 lineup and its prices, a Camera
+  app newer than iOS 18). It went from 0 of 3 to 3 and 2 of 3; at least
+  2 must pass.
   `test_build_real.py` builds 8 small projects from one sentence each
   (a to-do CLI, a word-frequency tool with tests, a Python package, a
   three-page site, a Node CSV summary, a Swift program, a bank account
@@ -643,6 +649,47 @@ count as a name). Names in greetings are now skipped and "iOS" or
 "iPhone" count; on 80 chat messages in three sets, one written after the
 change, it went from 72 to 77 right, still catching every one that
 needed the web.
+
+**Research that ends in a file.** A real session went wrong at every
+step, and is now replayed as a test against the real model and the real
+web (`tests/slow/test_session_real.py`):
+
+- *"research the differences in the camera app between the latest ios
+  version and ios version 18.0. Put your findings in a new findings.md
+  file"* was answered in chat, so no file was written. The model searched
+  for "ios 18.0 … vs ios 17.0" (its own idea of "latest") and for a
+  folder path from the listing chat sends on the first message, and
+  concluded there were "no reported differences". Now a request that
+  wants the answer in a file (*put / write / save … in findings.md*) runs
+  as `/task`. Research reads what you typed, not the folder listing. One
+  search always uses your own words, and "the latest X" also gets a search
+  for what the latest is ("latest ios version 2026"); searches that drop
+  "latest" are left out.
+- *"give me a list of the iphone 18 family lineup with prices, and write
+  it to findings.md"* never searched, because "iphone 18" in lowercase
+  didn't count as a name, and invented a base iPhone 18 at $999. The plan
+  then created the file and "edited" it again for the same request, which
+  appended "Add iPhone 18 family lineup with prices". A word followed by
+  its number now counts ("iphone 18", "windows 11", but not "top 10" or
+  "port 8080"), and a file created for the request isn't edited for it
+  again.
+- *"the base iphone 18 doesnt exist"*, *"so change the file"*, *"do it"*
+  ran `/task` with only "so change the file", and nothing changed. A short
+  follow-up like that now runs with the message before it (*The user
+  said: "the base iphone 18 doesnt exist". so change the file*). If the
+  planner still can't place it, it edits the one file it can be about:
+  the file the last `/task` changed, the one the conversation names, or
+  the only file in the folder. On five such corrections the edit is right
+  in 3. The two it misses ("Bob left the team", "I already paid the
+  rent") add a line instead of removing one. Five other ways of wording
+  it did no better, and naming the file in the wording made it worse.
+
+Replayed, the session went from 0 of 3 right to 3 of 3 and 2 of 3 in
+two runs. What still varies is the research itself: on some runs the
+notes say "price not specified" for the iPhone 18 Pro, and the file then
+says so instead of inventing a price. Asked about "the latest iOS",
+search results still lean towards iOS 26 a few weeks after iOS 27 came
+out.
 
 **What leaves the device.** Your search terms go to DuckDuckGo and the
 pages it finds are fetched — only after you type `/web` or allow it; the

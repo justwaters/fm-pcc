@@ -109,6 +109,24 @@ for social in ("I'm Justin, nice to meet you", "Good morning! My name is Carlos.
                "hey Priya here"):
     assert not web.names_something(social), social                   # a person's name in a greeting: no check
 assert web.names_something("thanks! who is the CEO of OpenAI?")
+assert web.names_something("give me a list of the iphone 18 family lineup with prices")      # lowercase name + number
+assert web.names_something("what changed in windows 11")
+for counting in ("give me 5 ideas for a blog", "show the top 10 movies", "run the server on port 8080",
+                 "split the list into chunks of 10"):
+    assert not web.names_something(counting), counting
+# searches in the request's own words, without the parts about files
+eq(web.search_terms("research the differences in the camera app between the latest ios version and ios version 18.0 . "
+                    "Put your findings in a new findings.md file")[:-5],
+   "the differences in the camera app between the latest ios version and ios version 18.0")
+eq(web.search_terms("give me a list of the iphone 18 family lineup with prices, and write it to findings.md"),
+   "the iphone 18 family lineup with prices")
+eq(web.search_terms("add a line to README.md saying the newest stable Python version, like 'Python X.Y'")[:-5],
+   "the newest stable Python version")
+eq(web.search_terms("create node.json with the current Node.js LTS major version, as {\"lts\": N}")[:-5],
+   "the current Node.js LTS major version")
+eq(web.latest_query("the camera app in the latest ios version")[:-5], "latest ios version")
+eq(web.latest_query("the iphone 18 lineup"), "")
+print("search terms OK")
 judge = mock.Mock(return_value={"needs_web": True})
 assert not web.needs_web("make the button blue in style.css", judge) and not judge.called   # no model call
 assert web.needs_web("what's the newest version of Python?", judge)

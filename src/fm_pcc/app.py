@@ -1475,6 +1475,12 @@ def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> 
                 continue
             created.add(s["path"])
         fixed.append(s)
+    # A file created for the whole request and then "edited" for the whole
+    # request again: seen for real, the edit appended the plan's own
+    # description ("Add iPhone 18 family lineup with prices") to the file.
+    created_for = {s["path"]: s.get("details") for s in fixed if s["action"] == "CREATE_FILE"}
+    fixed = [s for s in fixed if not (s["action"] == "EDIT" and s["path"] in created_for
+                                      and s.get("details") in (task, created_for[s["path"]]))]
     # The same file edited twice for the same request: the second comes
     # back unchanged, which used to stop the whole task (seen twice). It
     # stays, as optional -- skipped if there's nothing left to do.
@@ -1498,9 +1504,12 @@ def _cover_touched(steps: list[dict], task: str, cwd: str, files: list[str]) -> 
         ))
     # Each file's part of the request, spelled out: given only the whole
     # request, main.py's edit came back unchanged twice and "main.py
-    # applies 10% before printing" never happened.
+    # applies 10% before printing" never happened. (Not with one file: all
+    # of the request is about it, and its "part" was "write it to
+    # findings.md".)
+    several = len({s["path"] for s in steps if s["action"] in ("EDIT", "CREATE_FILE")}) > 1
     for s in steps:
-        if s["action"] in ("EDIT", "CREATE_FILE") and (s.get("shared") or s.get("optional")) and s.get("details") == task:
+        if several and s["action"] in ("EDIT", "CREATE_FILE") and (s.get("shared") or s.get("optional")) and s.get("details") == task:
             part = codework.request_part_for(task, s["path"], touched.get(s["path"], []))
             if part:
                 s["details"] = f"{task}\n\nThe part of this request about {s['path']}: {part}"
@@ -3221,6 +3230,10 @@ class ChatApp(App):
             )
             if model_used:
                 self._note_planning_fallback(model_used)
+            followup = getattr(self, "_followup", None)
+            if followup and followup[0] == task and (not steps or all(s["action"] == "UNSUPPORTED" for s in steps)):
+                steps = [taskplan.step("EDIT", followup[1], details=task)]
+            self._followup = None
             if not steps:
                 self.call_from_thread(self._log_progress, "nothing to do -- task already satisfied.")
                 return
@@ -4154,7 +4167,20 @@ class ChatApp(App):
         # "latest AI models 2024" and got pages from 2021-2022.
         year = int(time.strftime("%Y"))
         queries = [re.sub(r"\b20[0-9]{2}\b", lambda m: str(year) if int(m.group()) < year else m.group(), q) for q in queries]
-        return queries or [request[:120]]
+        # Not folder paths, and always one search in the request's own
+        # words: seen for real, asked about "the latest ios version", the
+        # model searched "ios 18.0 ... vs ios 17.0" and a folder path.
+        queries = [q for q in queries if " " in q.strip() and not q.lstrip().startswith(("/", "~"))]
+        own = web.search_terms(request)
+        latest = web.latest_query(request)
+        if latest:
+            # The model's own idea of "latest" is stale: keep only its
+            # searches that still ask for the latest, and find out what the
+            # latest is.
+            queries = [q for q in queries if web.asks_for_latest(q)]
+            if not own or not set(latest.lower().split()) <= set(own.lower().split()):
+                queries.insert(0, latest)
+        return list(dict.fromkeys(([own] if own else []) + queries))[:2] or [request[:120]]
 
     def _web_allowed(self, queries: list[str]) -> bool:
         """Ask "Allow agent to search the web?" (Allow once / Allow always /
@@ -4942,7 +4968,7 @@ class ChatApp(App):
             # truncating it.
             self._respond_long(prompt, attachments)
             return
-        self._respond(expanded)
+        self._respond(expanded, prompt)
 
     @work(thread=True)
     def _respond_long(self, prompt: str, attachments: list[str]) -> None:
@@ -4973,6 +4999,38 @@ class ChatApp(App):
         except Exception as e:
             self.call_from_thread(self._finish_turn, None, str(e), None)
 
+    def _with_conversation(self, request: str) -> str:
+        """A vague follow-up ("so change the file") with what was said just
+        before it -- seen for real: "the base iphone 18 doesnt exist", "so
+        change the file", "do it" ran /task with only "so change the file",
+        which changed nothing. Measured on five corrections, three ways of
+        putting it each made 3 of 5; naming the file as well ("(in
+        findings.md)", "so change findings.md") broke the one that had
+        worked, so it isn't named."""
+        said = []
+        for msg in reversed(self._message_log):
+            if msg.role == "system" and msg.text.startswith("running as /task"):
+                break
+            if msg.role == "user" and msg.text.strip() != request.strip() and not taskplan.is_affirmation(msg.text) \
+                    and not msg.text.startswith("/"):
+                said.insert(0, msg.text.strip())
+        said = said[-1:]                     # (two pulled in an unrelated question)
+        composed = f'The user said: "{said[0]}". {request}' if said else request
+        # The one file it can be about, for when the planner can't tell
+        # (it gave up on 'The user said: "...". so change the file'): the
+        # file the last /task changed, the one the conversation names, or
+        # the only file here.
+        cwd = os.getcwd()
+        candidates = list(getattr(self, "_task_originals", {}) or {})
+        if len(candidates) != 1:
+            talk = " ".join(msg.text for msg in self._message_log[-8:])
+            candidates = [f for f in dict.fromkeys(re.findall(r"[\w./-]+\.[A-Za-z]{1,5}\b", talk))
+                          if os.path.isfile(os.path.join(cwd, f))]
+        if len(candidates) != 1:
+            candidates = [f for f in os.listdir(cwd) if os.path.isfile(os.path.join(cwd, f)) and not f.startswith(".")]
+        self._followup = (composed, candidates[0]) if len(candidates) == 1 else None
+        return composed
+
     def _route_chat_to_task(self, prompt: str) -> bool:
         """Chat can't change files or run git -- only /task can -- and the
         chat model will just say "I can't do that". So a plain message
@@ -4984,13 +5042,15 @@ class ChatApp(App):
             request = self._pending_action_request
         else:
             files, folders = gather_task_tree(os.getcwd())
-            if taskplan.is_direct_action(prompt, files, folders):
+            if taskplan.is_direct_action(prompt, files, folders) or taskplan.asks_for_file_output(prompt):
                 request = prompt
         self._pending_action_request = None
         if request is None:
             if taskplan.looks_like_action(prompt):
                 self._pending_action_request = prompt
             return False
+        if taskplan.is_vague_followup(request):
+            request = self._with_conversation(request)
         self._add_message(Message("system", f"running as /task: {request}"))
         self._last_task_description = request
         self.query_one(Input).disabled = True
@@ -4998,10 +5058,12 @@ class ChatApp(App):
         return True
 
     @work(thread=True)
-    def _respond(self, prompt: str) -> None:
+    def _respond(self, prompt: str, typed: str | None = None) -> None:
         model = self.model
         try:
-            research = self._research_if_needed(prompt)
+            # Research what was typed, not the folder listing the first
+            # turn carries: seen for real, a search for a folder path.
+            research = self._research_if_needed(typed or prompt)
             sources = ""
             if research:
                 notes, urls = research
