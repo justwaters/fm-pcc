@@ -77,6 +77,8 @@ async def main():
                 assert tasks[-1].endswith("write it to findings.md"), tasks
                 await say(app, pilot, "how do I write a list to out.txt in Python?")
                 assert len(tasks) == 3, tasks
+                await say(app, pilot, "list the scripts in app.js")      # a question about a file that exists
+                assert len(tasks) == 3, tasks
                 print("asking for the answer in a file runs as /task OK")
 
                 # a vague follow-up runs with what was said before it
@@ -94,6 +96,29 @@ async def main():
                 await say(app, pilot, "what is a closure")
             eq(researched, ["what is a closure"])
             print("research gets the typed message OK")
+    finally:
+        os.chdir(orig)
+        shutil.rmtree(cwd, ignore_errors=True)
+
+    # ---- after /task changes a file, chat's next message carries what it says now ----
+    cwd = tempfile.mkdtemp(prefix="fm-pcc-file-news-")
+    os.chdir(cwd)
+    try:
+        with open("server.md", "w") as f:
+            f.write("Port: 3000\n")
+        app = m.ChatApp()
+        async with app.run_test() as pilot:
+            app._note_changed_files(cwd, ["server.md", "gone.txt"])
+            prompts = []
+            with mock.patch.object(app.backend, "respond", side_effect=lambda p, model: (prompts.append(p) or "3000", model)):
+                app.turn = 1
+                await say(app, pilot, "which port does it use now?")
+                await say(app, pilot, "thanks")
+            assert "just changed by /task" in prompts[0] and "--- server.md ---\nPort: 3000" in prompts[0], prompts[0]
+            assert "--- gone.txt --- (deleted)" in prompts[0], prompts[0]
+            assert prompts[0].endswith("which port does it use now?"), prompts[0]
+            eq(prompts[1], "thanks")                              # once, not on every message
+            print("chat hears what /task changed OK")
     finally:
         os.chdir(orig)
         shutil.rmtree(cwd, ignore_errors=True)

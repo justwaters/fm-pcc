@@ -1894,7 +1894,7 @@ _FILE_OUTPUT_RE = re.compile(
 )
 
 
-def asks_for_file_output(text: str) -> bool:
+def asks_for_file_output(text: str, existing: list[str] = ()) -> bool:
     """"research X. Put your findings in a new findings.md file", "give me
     a list of ..., and write it to findings.md": the answer is wanted in a
     file, which only /task can write -- seen for real, chat printed the
@@ -1902,7 +1902,14 @@ def asks_for_file_output(text: str) -> bool:
     ("how do I write a list to out.txt in Python?")."""
     if text.rstrip().endswith("?") or re.search(r"\bhow\s+(?:do|can|would|should|to)\b", text, _I):
         return False
-    return bool(_FILE_OUTPUT_RE.search(text))
+    m = _FILE_OUTPUT_RE.search(text)
+    if m and re.match(r"list\b", m.group(0), _I) and not re.search(
+            r"\b(?:put|write|save|store|record|output|export|dump|place|add)\b", m.group(0), _I):
+        # "list the models in findings.md" asks what an existing file says
+        named = re.findall(r"[\w./-]+\.[A-Za-z]{1,5}\b", m.group(0))
+        if named and any(n in existing or os.path.basename(n) in existing for n in named):
+            return False
+    return bool(m)
 
 
 def is_vague_followup(text: str) -> bool:

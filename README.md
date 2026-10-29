@@ -157,6 +157,9 @@ Tests live in two suites, run with `tests/run.sh [fast|slow|all]`:
   against the real facts (the iPhone 18 lineup and its prices, a Camera
   app newer than iOS 18). It went from 0 of 3 to 3 and 2 of 3; at least
   2 must pass.
+  `test_chat_after_task_real.py` asks chat about a file, has `/task`
+  change it, and asks again: 0 of 6 right in both baseline runs, 9 of 9
+  after (including 3 cases written afterwards); at least 6 must pass.
   `test_build_real.py` builds 8 small projects from one sentence each
   (a to-do CLI, a word-frequency tool with tests, a Python package, a
   three-page site, a Node CSV summary, a Swift program, a bank account
@@ -649,6 +652,17 @@ count as a name). Names in greetings are now skipped and "iOS" or
 "iPhone" count; on 80 chat messages in three sets, one written after the
 change, it went from 72 to 77 right, still catching every one that
 needed the web.
+
+**Chat knows what `/task` changed.** Chat answers from the
+conversation, so after `/task` changed a file it went on repeating what
+the file used to say. In that same session, chat kept showing its own
+table with a base iPhone 18 after `/task` had removed it. Now chat's next
+message after a `/task` starts with what the changed files say now (up to
+2,000 characters, once), marked as newer than anything said about them
+earlier. On 9 cases (ask about a file, have `/task` change it, ask
+again), chat answered from the old contents in all of them before, in
+both runs, and from the new contents in all 9 after. Three of the 9 were
+written after the change, as a check.
 
 **Research that ends in a file.** A real session went wrong at every
 step, and is now replayed as a test against the real model and the real

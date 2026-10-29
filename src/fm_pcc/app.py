@@ -265,6 +265,7 @@ PROSE_EXTS = {".md", ".markdown", ".txt", ".rst", ".cfg", ".ini", ".env", ".yml"
 GENERATION_TIMEOUT_SECONDS = 75
 CONTEXT_BUDGET_ON_DEVICE = 3000   # characters of other files shown alongside an edit
 CONTEXT_BUDGET_CLOUD = 16000
+CHAT_FILE_NEWS_CHARS = 2000      # what files /task changed say now, ahead of chat's next message
 
 
 _FENCE_LANGS = {
@@ -3309,9 +3310,43 @@ class ChatApp(App):
             self.call_from_thread(self._log_progress, f"error: task failed: {e}")
         finally:
             self._loop_running = False
+            self._note_changed_files(cwd, self._task_changed)
             self.call_from_thread(self._enable_input)
             if time.monotonic() - start_time >= NOTIFY_MIN_SECONDS:
                 notify("fm-pcc", f"/task finished: {task}")
+
+    def _note_changed_files(self, cwd: str, changed: list[str]) -> None:
+        """Remember what files /task changed now say, for chat's next
+        message: chat answers from the conversation, and seen for real,
+        after /task fixed findings.md chat went on repeating its own
+        earlier table."""
+        news = getattr(self, "_chat_file_news", {})
+        for rel in changed:
+            full = os.path.join(cwd, rel)
+            try:
+                with open(full, errors="replace") as f:
+                    news[rel] = f.read()
+            except OSError:
+                news[rel] = None                  # removed
+        self._chat_file_news = news
+
+    def _with_file_news(self, prompt: str) -> str:
+        """`prompt` with what the files /task changed since chat's last
+        reply say now, ahead of it (once)."""
+        news = getattr(self, "_chat_file_news", None)
+        if not news:
+            return prompt
+        self._chat_file_news = {}
+        parts, budget = [], CHAT_FILE_NEWS_CHARS
+        for rel, text in news.items():
+            if text is None:
+                parts.append(f"--- {rel} --- (deleted)")
+                continue
+            shown = text if len(text) <= budget else text[: max(0, budget)] + "\n(… the rest of the file isn't shown)"
+            budget -= len(shown)
+            parts.append(f"--- {rel} ---\n{shown.rstrip()}")
+        return ("These files were just changed by /task. This is what they say now -- answer from this, not from "
+                "what was said about them earlier in the conversation:\n\n" + "\n\n".join(parts) + f"\n\n{prompt}")
 
     def _execute_task_step(self, s: dict, cwd: str, summaries: list[str]) -> str:
         """Carry out one planned, non-gated step. Returns a one-line summary
@@ -5042,7 +5077,7 @@ class ChatApp(App):
             request = self._pending_action_request
         else:
             files, folders = gather_task_tree(os.getcwd())
-            if taskplan.is_direct_action(prompt, files, folders) or taskplan.asks_for_file_output(prompt):
+            if taskplan.is_direct_action(prompt, files, folders) or taskplan.asks_for_file_output(prompt, files):
                 request = prompt
         self._pending_action_request = None
         if request is None:
@@ -5064,6 +5099,7 @@ class ChatApp(App):
             # Research what was typed, not the folder listing the first
             # turn carries: seen for real, a search for a folder path.
             research = self._research_if_needed(typed or prompt)
+            prompt = self._with_file_news(prompt)
             sources = ""
             if research:
                 notes, urls = research
