@@ -1,0 +1,23 @@
+# Eve reviews pull requests here. The review logic lives in justwaters/eve (a reusable workflow), pinned to a commit because it
+# runs with this repository's secrets. Eve is advisory only: do not make its checks required.
+# Set the repository variable AI_REVIEW_ENABLED=false to turn it off.
+name: Eve
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  eve:
+    uses: justwaters/eve/.github/workflows/review.yml@eee45f0e0f0a9a1c33598a56883163f93543a3bb
+    secrets:
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      AI_REVIEW_APP_PRIVATE_KEY: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
